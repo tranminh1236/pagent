@@ -1,0 +1,555 @@
+#!/usr/bin/env bash
+# pagent — orchestrator dùng claude CLI làm backend
+# Flow feature: orchestrator → coder → reviewer (loop) → tester → workflow extractor
+# Flow hotfix:  orchestrator → coder → reviewer (loop) → tester regression
+# Reports:      $PAGENT_REPORT_DIR/<project>/{features,bugs}/<date>-<taskid>.md
+# Tokens:       $PAGENT_REPORT_DIR/<project>/tokens/<date>.jsonl
+set -euo pipefail
+
+#─────────────────────────────────────────────
+# Locate kit
+#─────────────────────────────────────────────
+_src="${BASH_SOURCE[0]}"; while [[ -L "$_src" ]]; do _src="$(readlink "$_src")"; done
+SCRIPT_DIR="$(cd "$(dirname "$_src")" && pwd)"
+KIT_DIR="${PAGENT_KIT_DIR:-$SCRIPT_DIR/kit}"
+
+#─────────────────────────────────────────────
+# Auto-load .env.pagent từ cwd hoặc parents
+#─────────────────────────────────────────────
+load_env() {
+  local d="$PWD"
+  while [[ "$d" != "/" ]]; do
+    if [[ -f "$d/.env.pagent" ]]; then
+      set -a && . "$d/.env.pagent" && set +a
+      return
+    fi
+    d="$(dirname "$d")"
+  done
+}
+load_env
+
+# Auto-detect source folder (ưu tiên git toplevel, fallback $PWD)
+detect_source() {
+  local root
+  if root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "$root"
+  else
+    echo "$PWD"
+  fi
+}
+PAGENT_SOURCE="${PAGENT_SOURCE:-$(detect_source)}"
+PAGENT_PROJECT="${PAGENT_PROJECT:-$(basename "$PAGENT_SOURCE")}"
+PAGENT_REPORT_DIR="${PAGENT_REPORT_DIR:-$HOME/.pagent-reports}"
+PAGENT_MODEL="${PAGENT_MODEL:-claude-sonnet-4-6}"
+PAGENT_CLAUDE_BIN="${PAGENT_CLAUDE_BIN:-claude}"
+PAGENT_MAX_REVIEW_ROUND="${PAGENT_MAX_REVIEW_ROUND:-2}"
+
+#─────────────────────────────────────────────
+# Utils
+#─────────────────────────────────────────────
+c_dim()   { printf '\033[90m%s\033[0m' "$*"; }
+c_cyan()  { printf '\033[36m%s\033[0m' "$*"; }
+c_green() { printf '\033[32m%s\033[0m' "$*"; }
+c_yellow(){ printf '\033[33m%s\033[0m' "$*"; }
+c_red()   { printf '\033[31m%s\033[0m' "$*"; }
+log()  { printf '%s %s\n' "$(c_cyan '›')" "$*" >&2; }
+warn() { printf '%s %s\n' "$(c_yellow '⚠')" "$*" >&2; }
+die()  { printf '%s %s\n' "$(c_red 'error:')" "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "thiếu công cụ: $1"; }
+need jq
+need "$PAGENT_CLAUDE_BIN"
+
+# YAML frontmatter parse
+md_body() {
+  awk 'BEGIN{p=0} /^---$/{p++; next} p>=2 || (p==0 && NR>1){print}' "$1"
+}
+md_meta() {
+  awk -v k="$2" '
+    /^---$/{p++; next}
+    p==1 && $1==k":" { sub("^[^:]+:[[:space:]]*",""); print; exit }
+  ' "$1"
+}
+
+new_task_id() { printf '%s-%s' "$(date -u +%Y%m%dT%H%M%S)" "$(jot -r 1 1000 9999 2>/dev/null || echo $RANDOM)"; }
+
+#─────────────────────────────────────────────
+# Gọi 1 agent qua claude CLI
+# stdin: prompt text
+# args: $1=agent_name (resolves to kit/agents/<name>.md hoặc kit/skills/<name>.md)
+# env:  PAGENT_RUN_DIR, PAGENT_TASK_ID, PAGENT_MODE, PAGENT_AGENT (auto-set)
+# stdout: .result text từ claude
+# side:  ghi JSON đầy đủ vào $PAGENT_RUN_DIR/<agent>.json
+#─────────────────────────────────────────────
+call_agent() {
+  local agent="$1"; shift
+  local prompt; prompt="$(cat)"
+
+  # Resolve agent md — project-local override global
+  local md=""
+  for cand in \
+    "$PAGENT_SOURCE/.pagent/skills/$agent.md" \
+    "$PAGENT_SOURCE/.pagent/agents/$agent.md" \
+    "$KIT_DIR/skills/$agent.md" \
+    "$KIT_DIR/agents/$agent.md"; do
+    [[ -f "$cand" ]] && { md="$cand"; break; }
+  done
+  [[ -n "$md" ]] || die "không tìm thấy agent/skill: $agent (đã check .pagent/ + kit/)"
+
+  local system_prompt; system_prompt="$(md_body "$md")"
+  local allowed; allowed="$(md_meta "$md" allowed_tools)"
+  local model;   model="$(md_meta "$md" model)"
+  model="${model:-$PAGENT_MODEL}"
+
+  local resp_file="$PAGENT_RUN_DIR/$agent.json"
+  local out_file="$PAGENT_RUN_DIR/$agent.txt"
+
+  # Pre-hook
+  export PAGENT_AGENT="$agent"
+  [[ -x "$KIT_DIR/hooks/pre.sh" ]] && "$KIT_DIR/hooks/pre.sh" "$prompt" || true
+
+  # Build claude args. Đẩy prompt qua stdin để tránh xung đột với --allowed-tools variadic.
+  local args=(-p --output-format json --model "$model" --append-system-prompt "$system_prompt")
+  [[ -n "$allowed" ]] && args+=(--allowed-tools "$allowed")
+
+  # Run từ thư mục source để claude có cwd đúng
+  (
+    cd "$PAGENT_SOURCE"
+    printf '%s' "$prompt" | "$PAGENT_CLAUDE_BIN" "${args[@]}"
+  ) >"$resp_file" 2>"$PAGENT_RUN_DIR/$agent.err"
+
+  if ! jq -e '.result' "$resp_file" >/dev/null 2>&1; then
+    warn "agent $agent fail — xem $PAGENT_RUN_DIR/$agent.err"
+    tail -20 "$resp_file" >&2
+    return 1
+  fi
+  jq -r '.result' "$resp_file" >"$out_file"
+
+  # Post-hook
+  [[ -x "$KIT_DIR/hooks/post.sh" ]] && "$KIT_DIR/hooks/post.sh" "$resp_file" || true
+
+  cat "$out_file"
+}
+
+#─────────────────────────────────────────────
+# git diff snapshot
+#─────────────────────────────────────────────
+git_diff_summary() {
+  ( cd "$PAGENT_SOURCE" && git diff --stat 2>/dev/null || true )
+}
+git_diff_full() {
+  ( cd "$PAGENT_SOURCE" && git diff 2>/dev/null || true )
+}
+
+#─────────────────────────────────────────────
+# Build report cuối
+#─────────────────────────────────────────────
+write_report() {
+  local report_path="$1" title="$2" task="$3" risk="$4" affected="$5"
+  local date_str; date_str="$(date -u +%Y-%m-%d)"
+
+  # Tính tổng cost từ token log
+  local log_file="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/tokens/$date_str.jsonl"
+  local in_tok=0 out_tok=0 cache_r=0 cost="0.0000"
+  if [[ -s "$log_file" ]]; then
+    read -r in_tok out_tok cache_r cost <<<"$(
+      jq -s --arg tid "$PAGENT_TASK_ID" '
+        [.[] | select(.task_id==$tid and .event=="end")] |
+        [
+          (map(.input_tokens)    | add // 0),
+          (map(.output_tokens)   | add // 0),
+          (map(.cache_read)      | add // 0),
+          (map(.cost_usd)        | add // 0)
+        ] | @tsv
+      ' "$log_file" | tr -d '"'
+    )"
+  fi
+
+  local plan coder reviewer tester
+  plan="$(cat "$PAGENT_RUN_DIR/orchestrator.txt" 2>/dev/null || echo '(none)')"
+  coder="$(cat "$PAGENT_RUN_DIR/coder.txt" 2>/dev/null || echo '(none)')"
+  reviewer="$(cat "$PAGENT_RUN_DIR/reviewer.txt" 2>/dev/null || echo '(none)')"
+  tester="$(cat "$PAGENT_RUN_DIR/tester.txt" 2>/dev/null || echo '(skipped)')"
+
+  local diffstat; diffstat="$(git_diff_summary)"
+  [[ -z "$diffstat" ]] && diffstat="(no git diff)"
+
+  awk -v T="$title" -v P="$PAGENT_PROJECT" -v M="$PAGENT_MODE" -v TI="$PAGENT_TASK_ID" \
+      -v D="$date_str" -v R="$risk" -v C="$cost" -v IN="$in_tok" -v OUT="$out_tok" -v CR="$cache_r" \
+      -v TASK="$task" -v PLAN="$plan" -v CODER="$coder" -v REVIEWER="$reviewer" \
+      -v TESTER="$tester" -v AFF="$affected" -v DS="$diffstat" '
+    {
+      gsub(/\{\{TITLE\}\}/,T); gsub(/\{\{PROJECT\}\}/,P); gsub(/\{\{MODE\}\}/,M);
+      gsub(/\{\{TASK_ID\}\}/,TI); gsub(/\{\{DATE\}\}/,D); gsub(/\{\{RISK\}\}/,R);
+      gsub(/\{\{COST\}\}/,C); gsub(/\{\{IN_TOKENS\}\}/,IN); gsub(/\{\{OUT_TOKENS\}\}/,OUT);
+      gsub(/\{\{CACHE_READ\}\}/,CR);
+      gsub(/\{\{TASK\}\}/,TASK); gsub(/\{\{PLAN\}\}/,PLAN); gsub(/\{\{CODER\}\}/,CODER);
+      gsub(/\{\{REVIEWER\}\}/,REVIEWER); gsub(/\{\{TESTER\}\}/,TESTER);
+      gsub(/\{\{AFFECTED\}\}/,AFF); gsub(/\{\{DIFFSTAT\}\}/,DS);
+      print
+    }
+  ' "$KIT_DIR/templates/report.md" >"$report_path"
+}
+
+#─────────────────────────────────────────────
+# Sub-commands
+#─────────────────────────────────────────────
+cmd_init() {
+  log "Quét source: $PAGENT_SOURCE"
+  mkdir -p "$PAGENT_SOURCE/.pagent"
+  PAGENT_TASK_ID="$(new_task_id)"
+  PAGENT_MODE="init"
+  PAGENT_RUN_DIR="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/runs/$PAGENT_TASK_ID"
+  mkdir -p "$PAGENT_RUN_DIR"
+  export PAGENT_TASK_ID PAGENT_MODE PAGENT_RUN_DIR PAGENT_PROJECT PAGENT_REPORT_DIR
+
+  local out_path="$PAGENT_SOURCE/.pagent/source-summary.md"
+  local response
+  response="$(echo "Quét folder $PAGENT_SOURCE và trả về markdown summary theo skill source-summary." \
+    | call_agent source-summary)" || die "agent fail"
+
+  # Strip code fence bao ngoài nếu agent vẫn cố bọc
+  printf '%s\n' "$response" | sed -E '1{/^```/d;}; ${/^```$/d;}' >"$out_path"
+
+  if [[ -s "$out_path" ]]; then
+    log "$(c_green 'OK') — wrote $out_path ($(wc -c <"$out_path") bytes)"
+    head -10 "$out_path" >&2
+  else
+    warn "Response rỗng. Xem $PAGENT_RUN_DIR/source-summary.txt"
+  fi
+}
+
+cmd_pipeline() {
+  local mode="$1" task="$2"
+  [[ "$mode" =~ ^(feature|hotfix)$ ]] || die "mode phải là feature hoặc hotfix"
+  [[ -n "$task" ]] || die "thiếu task"
+
+  PAGENT_MODE="$mode"
+  PAGENT_TASK_ID="$(new_task_id)"
+  PAGENT_RUN_DIR="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/runs/$PAGENT_TASK_ID"
+  mkdir -p "$PAGENT_RUN_DIR"
+  export PAGENT_TASK_ID PAGENT_MODE PAGENT_RUN_DIR PAGENT_PROJECT PAGENT_REPORT_DIR
+
+  log "project=$PAGENT_PROJECT mode=$mode task_id=$PAGENT_TASK_ID"
+  log "source=$PAGENT_SOURCE"
+  echo "$task" >"$PAGENT_RUN_DIR/task.txt"
+
+  # Đảm bảo có source-summary
+  if [[ ! -f "$PAGENT_SOURCE/.pagent/source-summary.md" ]]; then
+    warn "chưa có .pagent/source-summary.md → chạy: pagent init"
+  fi
+
+  #────── 1. Orchestrator ──────
+  log "$(c_cyan '[1/4]') orchestrator → lập plan"
+  local plan_text
+  plan_text="$( {
+    echo "## MODE"; echo "$mode"; echo
+    echo "## SOURCE_SUMMARY_PATH"; echo ".pagent/source-summary.md"; echo
+    echo "## TASK"; echo "$task"
+  } | call_agent orchestrator )" || die "orchestrator fail"
+
+  local plan_json
+  plan_json="$(echo "$plan_text" | sed -n '/^{/,/^}/p')"
+  [[ -z "$plan_json" ]] && plan_json="$plan_text"
+  if ! jq -e '.title' <<<"$plan_json" >/dev/null 2>&1; then
+    warn "plan JSON không parse được — dùng plan rỗng, vẫn tiếp tục"
+    plan_json='{"title":"(no-title)","summary":"","coder_task":"'"$(echo "$task" | sed 's/"/\\"/g')"'","reviewer_focus":"","tester_task":"","risk":"medium","affected_paths":[]}'
+  fi
+
+  local title coder_task reviewer_focus tester_task risk affected
+  title="$(jq -r '.title' <<<"$plan_json")"
+  coder_task="$(jq -r '.coder_task' <<<"$plan_json")"
+  reviewer_focus="$(jq -r '.reviewer_focus' <<<"$plan_json")"
+  tester_task="$(jq -r '.tester_task // ""' <<<"$plan_json")"
+  risk="$(jq -r '.risk // "medium"' <<<"$plan_json")"
+  affected="$(jq -r '.affected_paths // [] | join(", ")' <<<"$plan_json")"
+
+  log "  title: $(c_green "$title")  risk=$risk"
+
+  #────── 2. Coder ↔ Reviewer loop ──────
+  local round=1 verdict="CHANGES_REQUESTED" coder_input="$coder_task"
+  while (( round <= PAGENT_MAX_REVIEW_ROUND )) && [[ "$verdict" != "APPROVED" ]]; do
+    log "$(c_cyan "[2/4]") coder round $round"
+    {
+      echo "## TASK"; echo "$coder_input"; echo
+      if (( round > 1 )); then
+        echo "## PREVIOUS_REVIEW"; cat "$PAGENT_RUN_DIR/reviewer.txt"; echo
+        echo "## INSTRUCTION"; echo "Fix các điểm BLOCKING/MAJOR ở review trên rồi xuất CHANGES mới."
+      fi
+    } | call_agent coder >/dev/null || die "coder fail"
+
+    log "$(c_cyan "[3/4]") reviewer (focus: $reviewer_focus)"
+    {
+      echo "## ORIGINAL_TASK"; echo "$task"; echo
+      echo "## REVIEWER_FOCUS"; echo "$reviewer_focus"; echo
+      echo "## CODER_OUTPUT"; cat "$PAGENT_RUN_DIR/coder.txt"; echo
+      echo "## GIT_DIFF"; git_diff_full | head -500
+    } | call_agent reviewer >/dev/null || die "reviewer fail"
+
+    verdict="$(grep -oE 'APPROVED|CHANGES_REQUESTED' "$PAGENT_RUN_DIR/reviewer.txt" | head -1 || echo CHANGES_REQUESTED)"
+    log "  verdict round $round: $(c_yellow "$verdict")"
+    coder_input="$coder_task"  # giữ task gốc, review sẽ được inject
+    round=$((round+1))
+  done
+
+  if [[ "$verdict" != "APPROVED" ]] && (( PAGENT_MAX_REVIEW_ROUND > 0 )); then
+    warn "reviewer chưa APPROVE sau $((round-1)) vòng — vẫn tiếp tục để tester verify"
+  fi
+
+  #────── 4. Tester ──────
+  if [[ -n "$tester_task" ]] || [[ "$mode" == "feature" ]]; then
+    log "$(c_cyan '[4/4]') tester"
+    local tt="${tester_task:-Sinh test phù hợp cho thay đổi vừa rồi.}"
+    {
+      echo "## ORIGINAL_TASK"; echo "$task"; echo
+      echo "## TESTER_TASK"; echo "$tt"; echo
+      echo "## CODER_CHANGES"; cat "$PAGENT_RUN_DIR/coder.txt"
+    } | call_agent tester >/dev/null || warn "tester fail (tiếp tục)"
+  else
+    log "$(c_dim 'tester skipped (hotfix không cần)')"
+  fi
+
+  #────── 5. Workflow extractor (feature only) ──────
+  if [[ "$mode" == "feature" && -f "$PAGENT_RUN_DIR/tester.txt" ]]; then
+    log "$(c_cyan '[+]') workflow extractor → workflow.md"
+    local wf="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/workflow.md"
+    mkdir -p "$(dirname "$wf")"
+    [[ -f "$wf" ]] || printf '# Workflow Log — %s\n\n' "$PAGENT_PROJECT" >"$wf"
+
+    {
+      echo "## FEATURE_TITLE"; echo "$title"; echo
+      echo "## TASK"; echo "$task"; echo
+      echo "## CODER_CHANGES"; cat "$PAGENT_RUN_DIR/coder.txt"; echo
+      echo "## TESTS_ADDED"; cat "$PAGENT_RUN_DIR/tester.txt"; echo
+      echo "## EXISTING_WORKFLOW_PATH"; echo "$wf"
+    } | call_agent workflow-extractor >/dev/null || warn "workflow extractor fail"
+  fi
+
+  #────── 6. Báo cáo + auto compact ──────
+  local report_subdir="features"
+  [[ "$mode" == "hotfix" ]] && report_subdir="bugs"
+  local report_dir="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/$report_subdir"
+  mkdir -p "$report_dir"
+  local date_str; date_str="$(date -u +%Y-%m-%d)"
+  local report_file="$report_dir/$date_str-$PAGENT_TASK_ID.md"
+
+  write_report "$report_file" "$title" "$task" "$risk" "$affected"
+  log "$(c_green 'Report:') $report_file"
+
+  # Auto-compact: gộp tóm tắt vào CHANGELOG-style, giữ run_dir nhưng nén
+  ( cd "$PAGENT_RUN_DIR" && tar czf bundle.tar.gz ./*.json ./*.txt ./*.err 2>/dev/null && \
+    find . -maxdepth 1 -type f \( -name '*.json' -o -name '*.err' \) -delete ) || true
+  log "$(c_dim "compacted: $PAGENT_RUN_DIR/bundle.tar.gz")"
+
+  # Summary
+  printf '\n%s\n' "$(c_green '═══ DONE ═══')"
+  printf '  title:   %s\n' "$title"
+  printf '  verdict: %s\n' "$verdict"
+  printf '  affected: %s\n' "$affected"
+  printf '  report:  %s\n' "$report_file"
+}
+
+cmd_report() {
+  local proj="${1:-$PAGENT_PROJECT}"
+  local root="$PAGENT_REPORT_DIR/$proj"
+  [[ -d "$root" ]] || die "chưa có report cho project: $proj"
+
+  printf '%s\n' "$(c_green "═══ $proj ═══")"
+  for sub in features bugs; do
+    local d="$root/$sub"
+    [[ -d "$d" ]] || continue
+    printf '\n%s:\n' "$(c_cyan "$sub")"
+    ls -1t "$d"/*.md 2>/dev/null | head -20 | while read -r f; do
+      local title; title="$(head -1 "$f" | sed 's/^# //')"
+      printf '  %s  %s\n' "$(basename "$f" .md)" "$title"
+    done
+  done
+
+  printf '\n%s:\n' "$(c_cyan 'cost by date')"
+  for f in "$root/tokens/"*.jsonl; do
+    [[ -f "$f" ]] || continue
+    local d; d="$(basename "$f" .jsonl)"
+    local total; total="$(jq -s '[.[]|select(.event=="end")|.cost_usd]|add // 0' "$f")"
+    printf '  %s  $%.4f\n' "$d" "$total"
+  done
+
+  printf '\n%s:\n' "$(c_cyan 'cost by task (today)')"
+  local today; today="$(date -u +%Y-%m-%d)"
+  if [[ -f "$root/tokens/$today.jsonl" ]]; then
+    jq -s --arg t "$today" '
+      [.[]|select(.event=="end")] | group_by(.task_id) | map({
+        task_id: .[0].task_id,
+        mode: .[0].mode,
+        agents: (length),
+        cost: (map(.cost_usd)|add)
+      }) | .[] | "  \(.task_id)  \(.mode)  agents=\(.agents)  $\(.cost)"
+    ' -r "$root/tokens/$today.jsonl"
+  else
+    echo "  (chưa có hoạt động hôm nay)"
+  fi
+}
+
+cmd_skills() {
+  printf '%s\n' "$(c_green '═══ Project-local ═══') ($PAGENT_SOURCE/.pagent/)"
+  for sub in skills agents; do
+    local d="$PAGENT_SOURCE/.pagent/$sub"
+    [[ -d "$d" ]] || continue
+    for f in "$d"/*.md; do
+      [[ -f "$f" ]] || continue
+      local n; n="$(md_meta "$f" name)"; [[ -z "$n" ]] && n="$(basename "$f" .md)"
+      printf '  %-8s %-20s %s\n' "$sub" "$n" "$(md_meta "$f" description)"
+    done
+  done
+  printf '\n%s\n' "$(c_green '═══ Global (kit/) ═══') ($KIT_DIR)"
+  for sub in skills agents; do
+    for f in "$KIT_DIR/$sub/"*.md; do
+      [[ -f "$f" ]] || continue
+      local n; n="$(md_meta "$f" name)"; [[ -z "$n" ]] && n="$(basename "$f" .md)"
+      local overridden=""
+      [[ -f "$PAGENT_SOURCE/.pagent/$sub/$(basename "$f")" ]] && overridden=" $(c_dim '(overridden)')"
+      printf '  %-8s %-20s %s%s\n' "$sub" "$n" "$(md_meta "$f" description)" "$overridden"
+    done
+  done
+}
+
+cmd_skill_new() {
+  local kind="${1:-skill}" name="${2:-}"
+  [[ "$kind" =~ ^(skill|agent)$ ]] || die "kind phải là 'skill' hoặc 'agent'"
+  [[ -n "$name" ]] || die "thiếu tên. Ví dụ: pagent skill new skill my-flow"
+  local sub="${kind}s"
+  local dir="$PAGENT_SOURCE/.pagent/$sub"
+  mkdir -p "$dir"
+  local file="$dir/$name.md"
+  [[ -e "$file" ]] && die "đã tồn tại: $file"
+  cat >"$file" <<EOF
+---
+name: $name
+description: TODO mô tả 1 dòng — sẽ hiện trong \`pagent skills\`
+allowed_tools: Read,Grep,Glob,Bash
+model: $PAGENT_MODEL
+---
+
+# $name
+
+TODO: viết role / quy trình ở đây. Markdown body sẽ được dùng làm
+\`--append-system-prompt\` khi agent này được spawn.
+EOF
+  log "$(c_green 'created:') $file"
+  log "edit xong → dùng: pagent run -a $name \"task...\" (hoặc reference trong skill flow)"
+}
+
+cmd_workflow() {
+  local f="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/workflow.md"
+  [[ -f "$f" ]] || die "chưa có $f. Chạy 1 feature trước."
+  cat "$f"
+}
+
+cmd_env() {
+  cat <<EOF
+kit:           $KIT_DIR
+PAGENT_SOURCE:        $PAGENT_SOURCE
+PAGENT_PROJECT:       $PAGENT_PROJECT
+PAGENT_REPORT_DIR:    $PAGENT_REPORT_DIR
+PAGENT_MODEL:         $PAGENT_MODEL
+PAGENT_MODE:          ${PAGENT_MODE:-(per-command)}
+PAGENT_CLAUDE_BIN:    $PAGENT_CLAUDE_BIN
+PAGENT_MAX_REVIEW_ROUND: $PAGENT_MAX_REVIEW_ROUND
+claude version:       $("$PAGENT_CLAUDE_BIN" --version 2>/dev/null | head -1)
+EOF
+}
+
+cmd_help() {
+  cat <<'EOF'
+pagent — claude-cli orchestrator (coder + reviewer + tester)
+
+USAGE
+  pagent init                          Quét source folder, sinh .pagent/source-summary.md
+  pagent feature "task..."             Build feature: orchestrator→coder→reviewer→tester→workflow
+  pagent fix     "task..."             Hotfix bug:   orchestrator→coder→reviewer→tester regression
+  pagent report  [project]             Tóm tắt features/bugs + cost theo ngày
+  pagent workflow                      In workflow.md hiện tại
+  pagent skills                        Liệt kê skills/agents project-local + global
+  pagent skill new <name>              Scaffold skill mới trong .pagent/skills/
+  pagent env                           In biến môi trường đang dùng
+  pagent gain [-w|--watch]             Xem rtk savings cho project hiện tại (-w = live)
+  pagent help                          Trợ giúp
+
+SKILL RESOLUTION (project-local override global)
+  1. $PAGENT_SOURCE/.pagent/skills/<name>.md   ← project-local
+  2. $PAGENT_SOURCE/.pagent/agents/<name>.md
+  3. $KIT_DIR/skills/<name>.md                  ← fallback global
+  4. $KIT_DIR/agents/<name>.md
+  Mỗi project có thể override coder/reviewer/feature/... cho stack riêng.
+
+ENVIRONMENT (đặt trong .env.pagent hoặc shell)
+  PAGENT_SOURCE             folder source code (mặc định $PWD)
+  PAGENT_PROJECT            tên project (mặc định basename của SOURCE)
+  PAGENT_REPORT_DIR         nơi lưu report (mặc định ~/.pagent-reports)
+  PAGENT_MODEL              claude model (mặc định claude-sonnet-4-6)
+  PAGENT_MODE               feature | hotfix (override subcommand)
+  PAGENT_CLAUDE_BIN         path tới claude CLI (mặc định "claude")
+  PAGENT_MAX_REVIEW_ROUND   số vòng coder↔reviewer (mặc định 2)
+  PAGENT_KIT_DIR            override kit/ folder
+
+PIPELINE
+  1. orchestrator → JSON plan (title, coder_task, reviewer_focus, tester_task, risk)
+  2. coder → edit code thật trong $PAGENT_SOURCE, xuất CHANGES block
+  3. reviewer (read-only) → APPROVED hoặc CHANGES_REQUESTED (loop tối đa N vòng)
+  4. tester → viết test + chạy
+  5. workflow-extractor (chỉ feature) → append section vào workflow.md
+  6. Pre/post hook → ghi token+cost vào tokens/<date>.jsonl
+  7. Auto-compact run dir → bundle.tar.gz
+
+OUTPUT TREE
+  $PAGENT_REPORT_DIR/<project>/
+    ├── features/<date>-<taskid>.md
+    ├── bugs/<date>-<taskid>.md
+    ├── workflow.md
+    ├── tokens/<date>.jsonl
+    └── runs/<taskid>/bundle.tar.gz
+EOF
+}
+
+#─────────────────────────────────────────────
+# Dispatch
+#─────────────────────────────────────────────
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  init)      cmd_init ;;
+  feature)   cmd_pipeline feature "${*:-}" ;;
+  fix|bug|hotfix) cmd_pipeline hotfix "${*:-}" ;;
+  report)    cmd_report "${1:-}" ;;
+  workflow)  cmd_workflow ;;
+  env)       cmd_env ;;
+  gain)
+    if ! command -v rtk >/dev/null; then die "rtk chưa cài"; fi
+    if [[ "${1:-}" == "-w" || "${1:-}" == "--watch" ]]; then
+      cmd="rtk gain --project; echo; rtk gain -H | head -10"
+      if command -v watch >/dev/null; then watch -n 3 "$cmd"
+      else while true; do clear; eval "$cmd"; sleep 3; done; fi
+    else
+      rtk gain --project
+    fi
+    ;;
+  skills|agents) cmd_skills ;;
+  skill)
+    case "${1:-}" in
+      new) shift; cmd_skill_new skill "$@" ;;
+      *)   cmd_skills ;;
+    esac
+    ;;
+  agent)
+    case "${1:-}" in
+      new) shift; cmd_skill_new agent "$@" ;;
+      *)   cmd_skills ;;
+    esac
+    ;;
+  -h|--help|help|"") cmd_help ;;
+  *)
+    # Fallback theo $PAGENT_MODE
+    if [[ -n "${PAGENT_MODE:-}" ]]; then
+      cmd_pipeline "$PAGENT_MODE" "$cmd $*"
+    else
+      die "lệnh không biết: $cmd  (chạy: pagent help)"
+    fi
+    ;;
+esac
