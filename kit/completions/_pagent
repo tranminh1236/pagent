@@ -1,0 +1,83 @@
+#compdef pagent
+# zsh completion cho pagent. install.sh tự symlink + thêm fpath vào ~/.zshrc.
+
+_pagent_skills() {
+  local -a list
+  local src kit
+  src="${PAGENT_SOURCE:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+  kit="${PAGENT_KIT_DIR:-$(dirname "$(readlink "$(command -v pagent)")")/kit}"
+  for d in "$src/.pagent/skills" "$src/.pagent/agents" "$kit/skills" "$kit/agents"; do
+    [[ -d "$d" ]] || continue
+    for f in "$d"/*.md(N); do list+=("${f:t:r}"); done
+  done
+  _values 'skill/agent' $list
+}
+
+_pagent_workflows() {
+  local f="${PAGENT_REPORT_DIR:-$HOME/.pagent-reports}/${PAGENT_PROJECT:-$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")}/workflow.md"
+  [[ -f "$f" ]] || return
+  local -a titles
+  while IFS=$'\t' read -r _ t; do titles+=("$t"); done < <(awk '/^## /{ sub("^## ",""); printf "%d\t%s\n", ++n, $0 }' "$f")
+  _values 'workflow' $titles
+}
+
+_pagent_projects() {
+  local root="${PAGENT_REPORT_DIR:-$HOME/.pagent-reports}"
+  [[ -d "$root" ]] || return
+  local -a projs
+  for d in "$root"/*(N/); do projs+=("${d:t}"); done
+  _values 'project' $projs
+}
+
+_pagent() {
+  local -a top
+  top=(
+    'init:Quét source folder → .pagent/source-summary.md'
+    'feature:Build feature mới qua orchestrator+coder+reviewer+tester'
+    'fix:Hotfix bug (alias: bug, hotfix)'
+    'report:Tóm tắt features/bugs + cost'
+    'workflow:Quản lý workflow.md'
+    'skills:Liệt kê skills/agents (project-local + global)'
+    'skill:Tạo skill mới — pagent skill new <name>'
+    'agent:Tạo agent mới — pagent agent new <name>'
+    'env:In biến môi trường đang dùng'
+    'gain:Xem rtk token savings (-w để live)'
+    'help:Trợ giúp'
+  )
+
+  if (( CURRENT == 2 )); then
+    _describe 'command' top
+    return
+  fi
+
+  case "${words[2]}" in
+    feature|fix|bug|hotfix)
+      _arguments \
+        '-a[chỉ định agent]:agent:_pagent_skills' \
+        '-s[chỉ định skill]:skill:_pagent_skills' \
+        '*:task:'
+      ;;
+    workflow)
+      if (( CURRENT == 3 )); then
+        local -a wf_actions
+        wf_actions=('show:In' 'list:Liệt kê sections' 'run:Chạy smoke test cmd' 'new:Append section mới' 'file:Path tới workflow.md')
+        _describe 'workflow action' wf_actions
+      else
+        case "${words[3]}" in
+          show|run) _pagent_workflows ;;
+        esac
+      fi
+      ;;
+    skill|agent)
+      if (( CURRENT == 3 )); then _values 'op' new ; fi
+      ;;
+    report)
+      _pagent_projects
+      ;;
+    gain)
+      _values 'opt' '-w[live watch]'
+      ;;
+  esac
+}
+
+_pagent "$@"

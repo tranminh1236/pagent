@@ -72,6 +72,61 @@ md_meta() {
 
 new_task_id() { printf '%s-%s' "$(date -u +%Y%m%dT%H%M%S)" "$(jot -r 1 1000 9999 2>/dev/null || echo $RANDOM)"; }
 
+# Trích JSON object đầu tiên hợp lệ từ text bất kỳ (xử lý fence, preamble, postamble).
+# Stdin: text thô. Stdout: JSON. Exit 0 nếu thành công.
+extract_json() {
+  python3 -c '
+import sys, re, json
+t = sys.stdin.read()
+try: json.loads(t); print(t); sys.exit(0)
+except Exception: pass
+s = re.sub(r"^```\w*\s*", "", t.strip(), flags=re.M)
+s = re.sub(r"\s*```$", "", s, flags=re.M)
+try: json.loads(s); print(s); sys.exit(0)
+except Exception: pass
+def fb(s):
+    i = s.find("{")
+    while i >= 0:
+        d=0; ins=False; esc=False
+        for j in range(i, len(s)):
+            c = s[j]
+            if esc: esc=False; continue
+            if c=="\\": esc=True; continue
+            if c==chr(34): ins=not ins; continue
+            if ins: continue
+            if c=="{": d+=1
+            elif c=="}":
+                d-=1
+                if d==0: return s[i:j+1]
+        i = s.find("{", i+1)
+    return None
+c = fb(t)
+if c:
+    try: json.loads(c); print(c); sys.exit(0)
+    except Exception: pass
+sys.exit(1)
+'
+}
+
+# Spinner: chạy nền trong khi đợi $1=pid, in "$2" làm label. Tự đếm thời gian.
+spinner() {
+  local pid="$1" label="$2"
+  local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  local i=0 start; start="$(date +%s)"
+  # Tắt nếu stderr không phải tty
+  [[ ! -t 2 ]] && { wait "$pid" 2>/dev/null; return; }
+  trap 'printf "\r\033[K" >&2' EXIT
+  while kill -0 "$pid" 2>/dev/null; do
+    local elapsed=$(( $(date +%s) - start ))
+    printf '\r\033[36m%s\033[0m %s \033[90m%ds\033[0m' \
+      "${frames[i % ${#frames[@]}]}" "$label" "$elapsed" >&2
+    i=$((i+1))
+    sleep 0.1
+  done
+  printf '\r\033[K' >&2
+  trap - EXIT
+}
+
 #─────────────────────────────────────────────
 # Gọi 1 agent qua claude CLI
 # stdin: prompt text
@@ -95,10 +150,14 @@ call_agent() {
   done
   [[ -n "$md" ]] || die "không tìm thấy agent/skill: $agent (đã check .pagent/ + kit/)"
 
-  local system_prompt; system_prompt="$(md_body "$md")"
-  local allowed; allowed="$(md_meta "$md" allowed_tools)"
-  local model;   model="$(md_meta "$md" model)"
+  local system_prompt;      system_prompt="$(md_body "$md")"
+  local allowed;            allowed="$(md_meta "$md" allowed_tools)"
+  local disallowed;         disallowed="$(md_meta "$md" disallowed_tools)"
+  local sp_mode;            sp_mode="$(md_meta "$md" system_prompt_mode)"   # append | replace
+  local max_turns;          max_turns="$(md_meta "$md" max_turns)"
+  local model;              model="$(md_meta "$md" model)"
   model="${model:-$PAGENT_MODEL}"
+  sp_mode="${sp_mode:-append}"
 
   local resp_file="$PAGENT_RUN_DIR/$agent.json"
   local out_file="$PAGENT_RUN_DIR/$agent.txt"
@@ -108,14 +167,24 @@ call_agent() {
   [[ -x "$KIT_DIR/hooks/pre.sh" ]] && "$KIT_DIR/hooks/pre.sh" "$prompt" || true
 
   # Build claude args. Đẩy prompt qua stdin để tránh xung đột với --allowed-tools variadic.
-  local args=(-p --output-format json --model "$model" --append-system-prompt "$system_prompt")
+  local args=(-p --output-format json --model "$model")
+  if [[ "$sp_mode" == "replace" ]]; then
+    args+=(--system-prompt "$system_prompt")
+  else
+    args+=(--append-system-prompt "$system_prompt")
+  fi
   [[ -n "$allowed" ]] && args+=(--allowed-tools "$allowed")
+  [[ -n "$disallowed" ]] && args+=(--disallowed-tools "$disallowed")
+  [[ -n "$max_turns" ]] && args+=(--max-turns "$max_turns")
 
-  # Run từ thư mục source để claude có cwd đúng
+  # Run từ thư mục source để claude có cwd đúng. Spawn nền + spinner.
   (
     cd "$PAGENT_SOURCE"
     printf '%s' "$prompt" | "$PAGENT_CLAUDE_BIN" "${args[@]}"
-  ) >"$resp_file" 2>"$PAGENT_RUN_DIR/$agent.err"
+  ) >"$resp_file" 2>"$PAGENT_RUN_DIR/$agent.err" &
+  local claude_pid=$!
+  spinner "$claude_pid" "$(c_cyan "[$agent]") thinking…"
+  wait "$claude_pid" || true
 
   if ! jq -e '.result' "$resp_file" >/dev/null 2>&1; then
     warn "agent $agent fail — xem $PAGENT_RUN_DIR/$agent.err"
@@ -248,11 +317,20 @@ cmd_pipeline() {
   } | call_agent orchestrator )" || die "orchestrator fail"
 
   local plan_json
-  plan_json="$(echo "$plan_text" | sed -n '/^{/,/^}/p')"
-  [[ -z "$plan_json" ]] && plan_json="$plan_text"
+  plan_json="$(echo "$plan_text" | extract_json 2>/dev/null || true)"
   if ! jq -e '.title' <<<"$plan_json" >/dev/null 2>&1; then
-    warn "plan JSON không parse được — dùng plan rỗng, vẫn tiếp tục"
-    plan_json='{"title":"(no-title)","summary":"","coder_task":"'"$(echo "$task" | sed 's/"/\\"/g')"'","reviewer_focus":"","tester_task":"","risk":"medium","affected_paths":[]}'
+    warn "plan JSON không parse được — fallback plan tối thiểu"
+    warn "raw output ở: $PAGENT_RUN_DIR/orchestrator.txt (đầu 40 dòng):"
+    head -40 "$PAGENT_RUN_DIR/orchestrator.txt" >&2
+    plan_json="$(jq -n --arg task "$task" '{
+      title: "(orchestrator JSON parse fail)",
+      summary: "fallback — coder làm task trực tiếp",
+      coder_task: $task,
+      reviewer_focus: "general correctness",
+      tester_task: "",
+      risk: "medium",
+      affected_paths: []
+    }')"
   fi
 
   local title coder_task reviewer_focus tester_task risk affected
@@ -437,10 +515,93 @@ EOF
   log "edit xong → dùng: pagent run -a $name \"task...\" (hoặc reference trong skill flow)"
 }
 
+workflow_file() { echo "$PAGENT_REPORT_DIR/$PAGENT_PROJECT/workflow.md"; }
+
+# Parse các section "## <title>" trong workflow.md → in "<index>\t<title>"
+workflow_list_titles() {
+  local f="$1"
+  awk '/^## /{ sub("^## ",""); printf "%d\t%s\n", ++n, $0 }' "$f"
+}
+
+# Extract body của 1 section theo index hoặc title fuzzy match
+workflow_section() {
+  local f="$1" key="$2"
+  awk -v key="$key" '
+    /^## / {
+      in_sec=0
+      title=$0; sub("^## ","",title)
+      n++
+      if (key+0==n || tolower(title) ~ tolower(key)) { in_sec=1; print; next }
+    }
+    in_sec { if (/^## /) exit; print }
+  ' "$f"
+}
+
 cmd_workflow() {
-  local f="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/workflow.md"
-  [[ -f "$f" ]] || die "chưa có $f. Chạy 1 feature trước."
-  cat "$f"
+  local action="${1:-show}"; [[ "$#" -gt 0 ]] && shift
+  local f; f="$(workflow_file)"
+
+  case "$action" in
+    show)
+      [[ -f "$f" ]] || die "chưa có $f. Chạy 1 feature trước, hoặc: pagent workflow new <title>"
+      if [[ -z "${1:-}" ]]; then
+        cat "$f"
+      else
+        local out; out="$(workflow_section "$f" "$1")"
+        [[ -n "$out" ]] || die "không tìm thấy section: $1"
+        echo "$out"
+      fi
+      ;;
+    list|ls)
+      [[ -f "$f" ]] || die "chưa có $f"
+      printf '%s\n' "$(c_green "Workflows in $f:")"
+      workflow_list_titles "$f" | awk -F'\t' '{ printf "  [%s] %s\n", $1, $2 }'
+      ;;
+    run)
+      local key="${1:?usage: pagent workflow run <index|title>}"
+      [[ -f "$f" ]] || die "chưa có $f"
+      local sec cmd
+      sec="$(workflow_section "$f" "$key")"
+      [[ -n "$sec" ]] || die "không tìm thấy section: $key"
+      cmd="$(echo "$sec" | sed -nE 's/^\*\*Smoke test command:\*\*[[:space:]]*`(.+)`[[:space:]]*$/\1/p' | head -1)"
+      [[ -n "$cmd" ]] || die "section không có \"Smoke test command\""
+      log "$(c_cyan '▶') $cmd"
+      ( cd "$PAGENT_SOURCE" && eval "$cmd" )
+      ;;
+    new)
+      local title="${1:?usage: pagent workflow new <title>}"
+      mkdir -p "$(dirname "$f")"
+      [[ -f "$f" ]] || printf '# Workflow Log — %s\n\n' "$PAGENT_PROJECT" >"$f"
+      cat >>"$f" <<EOF
+
+## $title
+
+**Trigger:** TODO
+**Preconditions:** TODO
+**Flow:**
+1. TODO
+**Expected outcome:** TODO
+**Smoke test command:** \`echo TODO replace with real cmd\`
+**Related files:** TODO
+**Added:** $(date -u +%Y-%m-%d) (manual)
+EOF
+      log "$(c_green 'appended:') $f → ## $title"
+      log "edit:  \$EDITOR $f"
+      ;;
+    file)
+      echo "$f"
+      ;;
+    *)
+      cat <<'HELP'
+pagent workflow <action>
+  show [name]      In toàn bộ workflow.md, hoặc 1 section nếu pass tên
+  list             Liệt kê các section (index + title)
+  run <name>       Chạy "Smoke test command" của section đó (index hoặc fuzzy title)
+  new <title>      Append section template mới để edit thủ công
+  file             In đường dẫn workflow.md
+HELP
+      ;;
+  esac
 }
 
 cmd_env() {
@@ -466,7 +627,7 @@ USAGE
   pagent feature "task..."             Build feature: orchestrator→coder→reviewer→tester→workflow
   pagent fix     "task..."             Hotfix bug:   orchestrator→coder→reviewer→tester regression
   pagent report  [project]             Tóm tắt features/bugs + cost theo ngày
-  pagent workflow                      In workflow.md hiện tại
+  pagent workflow [show|list|run|new|file]   Quản lý workflow.md (xem 'pagent workflow' để biết)
   pagent skills                        Liệt kê skills/agents project-local + global
   pagent skill new <name>              Scaffold skill mới trong .pagent/skills/
   pagent env                           In biến môi trường đang dùng
@@ -518,7 +679,7 @@ case "$cmd" in
   feature)   cmd_pipeline feature "${*:-}" ;;
   fix|bug|hotfix) cmd_pipeline hotfix "${*:-}" ;;
   report)    cmd_report "${1:-}" ;;
-  workflow)  cmd_workflow ;;
+  workflow)  cmd_workflow "$@" ;;
   env)       cmd_env ;;
   gain)
     if ! command -v rtk >/dev/null; then die "rtk chưa cài"; fi

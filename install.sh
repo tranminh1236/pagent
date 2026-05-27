@@ -5,24 +5,29 @@ PREFIX="${PREFIX:-$HOME/.local/bin}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHELL_RC="${SHELL_RC:-$HOME/.zshrc}"
 
-mkdir -p "$PREFIX"
+COMPDIR="${COMPDIR:-$HOME/.zsh/completions}"
+mkdir -p "$PREFIX" "$COMPDIR"
 chmod +x "$SRC_DIR/pagent" "$SRC_DIR/kit/hooks/"*.sh
 ln -sfn "$SRC_DIR/pagent" "$PREFIX/pagent"
 echo "✓ symlink $PREFIX/pagent → $SRC_DIR/pagent"
+ln -sfn "$SRC_DIR/kit/completions/_pagent" "$COMPDIR/_pagent"
+echo "✓ symlink $COMPDIR/_pagent (zsh completion)"
 
 if ! grep -q "# pagent CLI" "$SHELL_RC" 2>/dev/null; then
   cat >>"$SHELL_RC" <<EOF
 
 # pagent CLI
 export PATH="$PREFIX:\$PATH"
-# Có thể set mặc định ở đây, hoặc override bằng .env.pagent trong project:
+fpath=($COMPDIR \$fpath)
+autoload -Uz compinit && compinit -i
+# Override mặc định bằng .env.pagent trong project:
 # export PAGENT_REPORT_DIR="\$HOME/.pagent-reports"
 # export PAGENT_MODEL="claude-sonnet-4-6"
 EOF
-  echo "✓ thêm pagent vào $SHELL_RC"
+  echo "✓ thêm pagent + completion vào $SHELL_RC"
   echo "  Mở terminal mới hoặc:  source $SHELL_RC"
 else
-  echo "✓ $SHELL_RC đã có pagent"
+  echo "✓ $SHELL_RC đã có pagent (kiểm tra fpath có $COMPDIR chưa)"
 fi
 
 cat <<EOF
