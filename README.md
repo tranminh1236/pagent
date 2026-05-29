@@ -11,21 +11,11 @@ pipelineAgent/
 ├── install.sh
 ├── .env.pagent.example     ← template env vars
 └── kit/                    ← md templates dùng chung mọi project
-    ├── agents/
-    │   ├── orchestrator.md   # lập plan JSON, không tự code
-    │   ├── coder.md          # implement, edit code thật
-    │   ├── reviewer.md       # read-only, APPROVED/CHANGES_REQUESTED
-    │   └── tester.md         # viết test + chạy
-    ├── skills/
-    │   ├── feature.md
-    │   ├── hotfix.md
-    │   ├── source-summary.md       # cho `pagent init`
-    │   └── workflow-extractor.md   # update workflow.md sau feature
-    ├── hooks/
-    │   ├── pre.sh            # log start event
-    │   └── post.sh           # parse claude JSON → token+cost JSONL
-    └── templates/
-        └── report.md         # template report cuối
+    ├── agents/             # orchestrator | coder | reviewer | tester
+    ├── skills/             # feature | hotfix | source-summary | workflow-extractor
+    ├── hooks/              # pre.sh (start log) | post.sh (cost+token JSONL)
+    ├── completions/        # _pagent — zsh autocomplete
+    └── web/                # server.py + index.html + app.js + style.css (dashboard)
 ```
 
 ## Cài
@@ -135,6 +125,70 @@ pagent skill new mobile-feat  # tạo .pagent/skills/mobile-feat.md
 pagent skills                 # liệt kê, đánh dấu (overridden)
 ```
 
+## Backend providers — claude CLI và OpenRouter (fallback)
+
+Mặc định mỗi agent gọi qua `claude` CLI local. Khi Claude bị rate-limit / down,
+hoặc muốn so chi phí với model khác (GPT, Gemini, DeepSeek), bật **OpenRouter**
+qua frontmatter hoặc env.
+
+### Setup 1 lần
+
+```bash
+# Trong ~/.zshrc hoặc .env.pagent của project
+export PAGENT_OPENROUTER_KEY="sk-or-v1-..."   # lấy ở openrouter.ai/keys
+```
+
+### Cách 1 — per-agent (recommended)
+
+Mỗi agent md có thể tự chọn provider + model. Bỏ Claude cho 1 agent cụ thể:
+
+```markdown
+---
+name: reviewer
+provider: openrouter
+model: openai/gpt-4o-mini
+caveman: full
+allowed_tools: Read,Grep,Glob,Bash
+---
+```
+
+Models hay dùng (OpenRouter slug):
+
+| Slug | Giá | Khi dùng |
+|---|---|---|
+| `openai/gpt-4o-mini` | $$ rẻ | reviewer free-text |
+| `openai/gpt-4o` | $$$ | task khó |
+| `google/gemini-2.0-flash-001` | $ siêu rẻ | source-summary, workflow-extractor |
+| `deepseek/deepseek-chat` | $ rẻ | coder fallback (text-only) |
+| `anthropic/claude-sonnet-4` | $$$$ | "Claude qua OpenRouter" khi CLI hỏng |
+
+### Cách 2 — ép toàn pipeline
+
+Khi local Claude CLI chết hoàn toàn:
+
+```bash
+PAGENT_PROVIDER=openrouter PAGENT_MODEL="anthropic/claude-sonnet-4" \
+  pagent feature "..."
+```
+
+### Lưu ý quan trọng
+
+OpenRouter dùng OpenAI chat format → **không support tools** kiểu claude
+(Read/Write/Edit/Bash). Hệ quả:
+
+- ✅ Phù hợp: `orchestrator` (JSON plan), `reviewer` (read-only, diff inject qua prompt), `workflow-extractor` (markdown gen).
+- ❌ Không phù hợp: `coder` (cần Write/Edit), `tester` (cần Bash chạy test), `source-summary` (cần Read/Glob).
+
+Đối với 2 agent này nếu Claude die mà vẫn muốn chạy: dùng `anthropic/claude-sonnet-4`
+qua OpenRouter — model là Claude nhưng đường truyền khác, tránh được local CLI bug,
+**nhưng vẫn không có tools** (chỉ text gen). Coi như fallback giảm nhẹ thôi.
+
+### Cost tracking sau khi switch
+
+Pre/post hook tự ghi `provider`, `model`, `cost_usd` (từ OpenRouter), `input_tokens`,
+`output_tokens` vào `tokens/<date>.jsonl` cùng format như Claude. `pagent report`
+và web dashboard hiển thị đúng.
+
 ## Custom global kit
 
 Sửa md trong `kit/` để đổi behavior toàn cục — không cần rebuild:
@@ -143,4 +197,27 @@ Sửa md trong `kit/` để đổi behavior toàn cục — không cần rebuild
 - `kit/agents/reviewer.md` — severity rubric
 - `kit/skills/feature.md` — flow steps
 - `kit/hooks/post.sh` — alert nếu cost vượt ngưỡng, ping Slack, v.v.
-- `kit/templates/report.md` — format report
+
+## Token optimization (RTK + Caveman)
+
+Đã có 2 tầng compress:
+
+1. **RTK** — compress output Bash commands (`ls`/`git`/`test`/...) trước khi vào
+   context window. Cài qua claude code: `rtk init --global`. Verify bằng `rtk gain`.
+2. **Caveman** — compress agent response: drop articles/filler/pleasantries.
+   Set qua frontmatter `caveman: off|lite|full|ultra`. Reviewer dùng `full`,
+   coder/tester dùng `lite`, orchestrator/source-summary `off` (cần format chuẩn).
+   Override toàn pipeline qua `PAGENT_CAVEMAN=full`.
+
+`pagent gain` để xem RTK savings, `pagent gain -w` live watch.
+
+## Web dashboard
+
+```bash
+pagent web                          # http://127.0.0.1:8765
+pagent web 8080 0.0.0.0             # bind ra LAN
+```
+
+4 panel: Live (đang chạy) · Agents (stats per agent) · History (features+bugs +
+cost + duration) · Modal mỗi task (pipeline timeline DAG + report). Auto-refresh
+3s, không dep ngoài stdlib Python.
