@@ -23,12 +23,13 @@ if ! parsed="$(jq -r '
     (.modelUsage // {} | keys | first   // "unknown"),
     .session_id                          // "",
     .terminal_reason                     // "",
-    (.is_error // false | tostring)
+    (.is_error // false | tostring),
+    (.provider                           // "claude")
   ] | @tsv
 ' "$resp_file" 2>/dev/null)"; then
-  parsed=$'0\t0\t0\t0\t0\t0\tunknown\t\tparse_fail\ttrue'
+  parsed=$'0\t0\t0\t0\t0\t0\tunknown\t\tparse_fail\ttrue\tclaude'
 fi
-read -r in_tok out_tok cache_r cache_c cost dur_ms model sid term_reason is_err <<<"$parsed"
+read -r in_tok out_tok cache_r cache_c cost dur_ms model sid term_reason is_err provider <<<"$parsed"
 
 jq -nc \
   --arg ts        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -46,9 +47,10 @@ jq -nc \
   --argjson cost  "${cost:-0}" \
   --argjson durms "${dur_ms:-0}" \
   --arg term      "${term_reason:-}" \
-  --arg err       "${is_err:-false}" '
+  --arg err       "${is_err:-false}" \
+  --arg prov      "${provider:-claude}" '
   {ts:$ts, event:$event, project:$project, mode:$mode, task_id:$task_id, agent:$agent,
-   model:$model, session_id:$sid,
+   provider:$prov, model:$model, session_id:$sid,
    input_tokens:$in, output_tokens:$out, cache_read:$cr, cache_creation:$cc,
    cost_usd:$cost, duration_ms:$durms,
    terminal_reason:$term, is_error:($err=="true")}

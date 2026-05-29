@@ -118,10 +118,8 @@ def task_detail(proj, task_filename):
 def _task_timeline(proj, task_id):
     """Trả về sequence agent steps cho 1 task_id (orchestrator → coder → reviewer → ...)."""
     evs = _read_tokens(proj)
-    # group theo (task_id, agent) pair, pick start+end
     steps = []
-    pending = {}  # agent -> start_ts
-    seen_keys = set()
+    pending = {}  # agent -> list of start events
     for e in evs:
         if e.get("task_id") != task_id: continue
         ag = e.get("agent")
@@ -129,25 +127,30 @@ def _task_timeline(proj, task_id):
         if e.get("event") == "start":
             pending[ag] = pending.get(ag, []) + [e]
         elif e.get("event") == "end":
-            # match với start gần nhất chưa kết thúc
             starts = pending.get(ag, [])
-            start_ts = starts.pop(0)["ts"] if starts else None
+            start_ev = starts.pop(0) if starts else {}
             pending[ag] = starts
             steps.append({
                 "agent": ag,
-                "start": start_ts,
+                "start": start_ev.get("ts"),
                 "end": e.get("ts"),
                 "duration_ms": e.get("duration_ms", 0),
                 "cost_usd": e.get("cost_usd", 0),
                 "input_tokens": e.get("input_tokens", 0),
                 "output_tokens": e.get("output_tokens", 0),
-                "model": e.get("model", ""),
+                # provider/model: ưu tiên end event (đầy đủ), fallback start (lúc post.sh chưa chạy)
+                "model": e.get("model") or start_ev.get("model", ""),
+                "provider": e.get("provider") or start_ev.get("provider", "claude"),
+                "terminal_reason": e.get("terminal_reason", ""),
+                "is_error": e.get("is_error", False),
             })
     # in-flight (start chưa end)
     for ag, starts in pending.items():
         for s in starts:
-            steps.append({"agent": ag, "start": s["ts"], "end": None, "duration_ms": 0,
-                          "cost_usd": 0, "input_tokens": 0, "output_tokens": 0, "model": "", "running": True})
+            steps.append({"agent": ag, "start": s.get("ts"), "end": None,
+                          "duration_ms": 0, "cost_usd": 0, "input_tokens": 0, "output_tokens": 0,
+                          "model": s.get("model", ""), "provider": s.get("provider", "claude"),
+                          "running": True})
     steps.sort(key=lambda s: s.get("start") or "")
     return steps
 
@@ -160,7 +163,7 @@ def live_tasks(proj):
     Start cũ hơn = orphan (pagent crash hoặc Ctrl+C trước khi post.sh chạy), bỏ qua."""
     evs = _read_tokens(proj)
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=LIVE_WINDOW_MIN)
-    last_start = {}  # (tid, agent) -> ts của start gần nhất
+    last_start = {}  # (tid, agent) -> {ts, provider, model} của start gần nhất
     end_count = {}   # (tid, agent) -> số end gặp
     start_count = {} # (tid, agent) -> số start gặp
     meta = {}
@@ -174,42 +177,59 @@ def live_tasks(proj):
         key = (tid, ag)
         if e.get("event") == "start":
             start_count[key] = start_count.get(key, 0) + 1
-            last_start[key] = e.get("ts")
+            last_start[key] = {"ts": e.get("ts"),
+                                "provider": e.get("provider", "claude"),
+                                "model": e.get("model", "")}
         elif e.get("event") == "end":
             end_count[key] = end_count.get(key, 0) + 1
     live = {}
     for key, sc in start_count.items():
         ec = end_count.get(key, 0)
-        if sc <= ec: continue  # tất cả start đã có end
-        ts = _parse_ts(last_start.get(key))
-        if not ts or ts < cutoff: continue  # orphan, ngoài cửa sổ live
+        if sc <= ec: continue
+        info = last_start.get(key, {})
+        ts = _parse_ts(info.get("ts"))
+        if not ts or ts < cutoff: continue
         tid, ag = key
-        live.setdefault(tid, []).append(ag)
+        live.setdefault(tid, []).append({
+            "agent": ag, "provider": info.get("provider", "claude"),
+            "model": info.get("model", ""), "started": info.get("ts"),
+        })
     return [
-        {"task_id": tid, "active_agents": ags, "task": meta[tid]["task"],
-         "mode": meta[tid]["mode"], "last_ts": meta[tid]["ts"]}
+        {"task_id": tid, "active": ags, "task": meta[tid]["task"],
+         "mode": meta[tid]["mode"], "last_ts": meta[tid]["ts"],
+         "timeline": _task_timeline(proj, tid)}
         for tid, ags in sorted(live.items(), key=lambda x: meta[x[0]]["ts"], reverse=True)
     ]
 
 def agent_stats(proj):
-    """Per-agent: count, total cost, avg duration."""
+    """Per-agent: count, total cost, avg duration, breakdown theo provider/model."""
     evs = _read_tokens(proj)
     stats = {}
     for e in evs:
         if e.get("event") != "end": continue
         ag = e.get("agent");
         if not ag: continue
-        s = stats.setdefault(ag, {"runs": 0, "cost": 0.0, "duration_ms": 0, "tokens_out": 0})
+        s = stats.setdefault(ag, {"runs": 0, "cost": 0.0, "duration_ms": 0,
+                                   "tokens_out": 0, "by_model": {}})
         s["runs"] += 1
         s["cost"] += e.get("cost_usd", 0) or 0
         s["duration_ms"] += e.get("duration_ms", 0) or 0
         s["tokens_out"] += e.get("output_tokens", 0) or 0
+        key = f"{e.get('provider', 'claude')}/{e.get('model', 'unknown')}"
+        m = s["by_model"].setdefault(key, {"runs": 0, "cost": 0.0})
+        m["runs"] += 1
+        m["cost"] += e.get("cost_usd", 0) or 0
     out = []
     for ag, s in sorted(stats.items(), key=lambda x: -x[1]["cost"]):
+        by_model = sorted(
+            [{"key": k, "runs": v["runs"], "cost_usd": round(v["cost"], 4)}
+             for k, v in s["by_model"].items()],
+            key=lambda x: -x["cost_usd"])
         out.append({"agent": ag, "runs": s["runs"],
                     "cost_usd": round(s["cost"], 4),
                     "avg_duration_ms": s["duration_ms"] // max(s["runs"], 1),
-                    "total_tokens_out": s["tokens_out"]})
+                    "total_tokens_out": s["tokens_out"],
+                    "by_model": by_model})
     return out
 
 # ───────── HTTP handler ─────────

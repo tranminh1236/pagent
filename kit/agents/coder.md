@@ -1,6 +1,7 @@
 ---
 name: coder
 description: Implement feature hoặc fix bug — edit code thật trong source folder
+model: claude-opus-4-8
 allowed_tools: Read,Write,Edit,Bash,Grep,Glob
 caveman: lite
 ---

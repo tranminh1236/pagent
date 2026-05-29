@@ -40,17 +40,32 @@ async function refresh() {
   $('#refresh-info').textContent = `↻ ${new Date().toLocaleTimeString()}`;
 }
 
+function shortModel(m) {
+  if (!m) return '';
+  // claude-sonnet-4-6[1m] → sonnet-4-6; openai/gpt-4o-mini → gpt-4o-mini
+  return String(m).replace(/^claude-/, '').replace(/\[.*\]$/, '').replace(/^[^/]+\//, '');
+}
+function providerClass(p) { return 'prov-' + String(p || 'claude').toLowerCase().replace(/[^a-z]/g, ''); }
+
+function renderProviderPill(provider, model) {
+  if (!model && !provider) return '';
+  return `<span class="model-pill ${providerClass(provider)}"
+    title="${esc(provider || 'claude')} · ${esc(model || '')}">
+    ${esc(provider || 'claude')}<span class="dim">·</span>${esc(shortModel(model))}
+  </span>`;
+}
+
 function renderLive(live) {
   $('#live-dot').classList.toggle('active', live.length > 0);
   $('#live-count').textContent = live.length ? `${live.length} running` : 'idle';
   $('#live-list').innerHTML = live.length
     ? live.map(t => `
         <div class="live-item">
-          <div class="live-task-id">${esc(t.task_id)} · ${esc(t.mode)} · ${esc(fmtAgo(t.last_ts))}</div>
-          <div class="live-task-text">${esc(t.task || '(no task text)')}</div>
-          <div class="agent-pills">
-            ${t.active_agents.map(a => `<span class="agent-pill running">⠿ ${esc(a)}</span>`).join('')}
+          <div class="live-head">
+            <div class="live-task-id">${esc(t.task_id)} · ${esc(t.mode)} · ${esc(fmtAgo(t.last_ts))}</div>
+            <div class="live-task-text">${esc(t.task || '(no task text)')}</div>
           </div>
+          <div class="live-dag">${renderTimeline(t.timeline || [])}</div>
         </div>
       `).join('')
     : '<div class="idle-msg">No active tasks. Run <code>pagent feature "..."</code> trong terminal.</div>';
@@ -58,15 +73,25 @@ function renderLive(live) {
 
 function renderAgents(agents) {
   $('#agent-grid').innerHTML = agents.length
-    ? agents.map(a => `
-        <div class="agent-card">
-          <div class="name">${esc(a.agent)}</div>
-          <div class="stats">
-            ${a.runs} runs · ${fmtCost(a.cost_usd)}<br>
-            avg ${fmtMs(a.avg_duration_ms)} · ${fmtNum(a.total_tokens_out)} tok out
+    ? agents.map(a => {
+        const models = (a.by_model || []).map(m => {
+          const [prov, ...rest] = m.key.split('/');
+          return `<div class="model-line">
+            ${renderProviderPill(prov, rest.join('/'))}
+            <span class="dim">${m.runs}× · ${fmtCost(m.cost_usd)}</span>
+          </div>`;
+        }).join('');
+        return `
+          <div class="agent-card">
+            <div class="name">${esc(a.agent)}</div>
+            <div class="stats">
+              ${a.runs} runs · ${fmtCost(a.cost_usd)}<br>
+              avg ${fmtMs(a.avg_duration_ms)} · ${fmtNum(a.total_tokens_out)} tok out
+            </div>
+            <div class="model-list">${models}</div>
           </div>
-        </div>
-      `).join('')
+        `;
+      }).join('')
     : '<div class="idle-msg">Chưa có hoạt động nào.</div>';
 }
 
@@ -106,12 +131,16 @@ function renderTimeline(steps) {
   steps.forEach((s, i) => {
     if (i > 0) parts.push('<div class="timeline-arrow">→</div>');
     const running = s.running ? ' running' : '';
+    const errored = s.is_error ? ' errored' : '';
     parts.push(`
-      <div class="timeline-step${running}">
+      <div class="timeline-step${running}${errored}">
         <div class="step-agent">${esc(s.agent)}${s.running ? ' ⠿' : ''}</div>
+        <div class="step-pill">${renderProviderPill(s.provider, s.model)}</div>
         <div class="step-meta">
           ${fmtMs(s.duration_ms)} · ${fmtCost(s.cost_usd)}<br>
           in ${fmtNum(s.input_tokens)} / out ${fmtNum(s.output_tokens)}
+          ${s.terminal_reason && s.terminal_reason !== 'completed'
+            ? `<br><span class="dim">${esc(s.terminal_reason)}</span>` : ''}
         </div>
       </div>
     `);

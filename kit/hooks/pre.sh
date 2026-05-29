@@ -20,6 +20,9 @@ jq -nc \
   --arg mode      "${PAGENT_MODE:-}" \
   --arg task_id   "$PAGENT_TASK_ID" \
   --arg agent     "$PAGENT_AGENT" \
-  --arg task      "${task:0:200}" \
-  '{ts:$ts, event:$event, project:$project, mode:$mode, task_id:$task_id, agent:$agent, task:$task}' \
+  --arg provider  "${PAGENT_AGENT_PROVIDER:-claude}" \
+  --arg model     "${PAGENT_AGENT_MODEL:-}" \
+  --arg task      "${task:0:200}" '
+  {ts:$ts, event:$event, project:$project, mode:$mode, task_id:$task_id,
+   agent:$agent, provider:$provider, model:$model, task:$task}' \
   >>"$log_file"

@@ -228,7 +228,7 @@ $system_prompt" ;;
   local out_file="$PAGENT_RUN_DIR/$agent.txt"
 
   # Pre-hook
-  export PAGENT_AGENT="$agent"
+  export PAGENT_AGENT="$agent" PAGENT_AGENT_PROVIDER="$provider" PAGENT_AGENT_MODEL="$model"
   [[ -x "$KIT_DIR/hooks/pre.sh" ]] && "$KIT_DIR/hooks/pre.sh" "$prompt" || true
 
   # Build claude args. Đẩy prompt qua stdin để tránh xung đột với --allowed-tools variadic.

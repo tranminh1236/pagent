@@ -54,8 +54,12 @@ section h2 {
 @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.4 } }
 .badge { background: var(--panel-2); padding: 2px 8px; border-radius: 10px; font-size: 11px; color: var(--dim); }
 .live-item { background: var(--panel-2); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: 10px 14px; margin-bottom: 8px; }
+.live-head { margin-bottom: 10px; }
 .live-task-id { font-family: var(--mono); font-size: 11px; color: var(--dim); }
 .live-task-text { margin: 4px 0; font-size: 13px; }
+.live-dag { overflow-x: auto; }
+.live-dag .timeline-step { min-width: 130px; padding: 6px 10px; }
+.live-dag .timeline-step .step-meta { font-size: 10px; }
 .agent-pills { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 .agent-pill { padding: 2px 8px; border-radius: 4px; font-size: 11px; background: var(--panel); border: 1px solid var(--border); font-family: var(--mono); }
 .agent-pill.running { background: #1e3a8a; border-color: #3b6dd0; color: #93c5fd; animation: pulse 1.5s ease-in-out infinite; }
@@ -95,5 +99,25 @@ tr.row:hover { background: var(--panel-2); }
 .timeline-step { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; min-width: 140px; flex-shrink: 0; }
 .timeline-step.running { border-color: var(--accent); background: #1a2540; animation: pulse 1.5s ease-in-out infinite; }
 .timeline-step .step-agent { font-family: var(--mono); font-weight: 600; font-size: 12px; color: var(--text); }
+.timeline-step .step-pill { margin: 4px 0; }
 .timeline-step .step-meta { font-size: 11px; color: var(--dim); margin-top: 4px; line-height: 1.6; }
+.timeline-step.errored { border-color: var(--bad); background: #2d1a1a; }
 .timeline-arrow { display: flex; align-items: center; color: var(--dim); font-size: 14px; }
+
+/* ── provider/model pill ── */
+.model-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 7px; border-radius: 4px;
+  font-family: var(--mono); font-size: 10px; font-weight: 500;
+  border: 1px solid var(--border); background: var(--panel-2);
+  letter-spacing: 0.2px; vertical-align: middle;
+}
+.model-pill .dim { color: var(--dim); margin: 0 1px; }
+.model-pill.prov-claude     { background: #1a2540; border-color: #2a4570; color: #93c5fd; }
+.model-pill.prov-openrouter { background: #2d1a3d; border-color: #5b2a82; color: #d8b4fe; }
+.model-pill.prov-unknown    { background: var(--panel-2); color: var(--dim); }
+
+/* model breakdown trong agent-card */
+.model-list { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
+.model-line { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 11px; }
+.model-line .dim { color: var(--dim); font-size: 10px; }
