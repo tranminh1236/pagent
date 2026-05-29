@@ -43,6 +43,8 @@ PAGENT_REPORT_DIR="${PAGENT_REPORT_DIR:-$HOME/.pagent-reports}"
 PAGENT_MODEL="${PAGENT_MODEL:-claude-sonnet-4-6}"
 PAGENT_CLAUDE_BIN="${PAGENT_CLAUDE_BIN:-claude}"
 PAGENT_MAX_REVIEW_ROUND="${PAGENT_MAX_REVIEW_ROUND:-2}"
+PAGENT_OPENROUTER_BASE="${PAGENT_OPENROUTER_BASE:-https://openrouter.ai/api/v1}"
+PAGENT_OPENROUTER_KEY="${PAGENT_OPENROUTER_KEY:-${OPENROUTER_API_KEY:-}}"
 
 #─────────────────────────────────────────────
 # Utils
@@ -71,6 +73,53 @@ md_meta() {
 }
 
 new_task_id() { printf '%s-%s' "$(date -u +%Y%m%dT%H%M%S)" "$(jot -r 1 1000 9999 2>/dev/null || echo $RANDOM)"; }
+
+# Gọi OpenRouter /chat/completions, transform response → format giống claude CLI JSON
+# Stdin: user prompt. Args: $1=model $2=system_prompt $3=resp_file
+call_openrouter() {
+  local model="$1" system_prompt="$2" resp_file="$3"
+  local prompt; prompt="$(cat)"
+  [[ -n "$PAGENT_OPENROUTER_KEY" ]] || { echo "OPENROUTER_API_KEY required" >&2; return 1; }
+
+  local body t_start t_end dur_ms raw
+  body="$(jq -n --arg sp "$system_prompt" --arg up "$prompt" --arg m "$model" \
+    --argjson usage_acc 'true' '{
+      model: $m,
+      messages: [{role:"system",content:$sp},{role:"user",content:$up}],
+      usage: {include: true}
+    }')"
+  t_start="$(python3 -c 'import time;print(int(time.time()*1000))')"
+  raw="$(curl -sS -X POST "$PAGENT_OPENROUTER_BASE/chat/completions" \
+    -H "Authorization: Bearer $PAGENT_OPENROUTER_KEY" \
+    -H "HTTP-Referer: https://github.com/local/pagent" \
+    -H "X-Title: pagent" \
+    -H "Content-Type: application/json" \
+    --data-binary @- <<<"$body")"
+  t_end="$(python3 -c 'import time;print(int(time.time()*1000))')"
+  dur_ms=$((t_end - t_start))
+
+  # Transform: OpenRouter chat completion → claude CLI shape (cho post.sh)
+  jq -n --argjson r "$raw" --arg dur "$dur_ms" --arg m "$model" '
+    {
+      type: "result",
+      subtype: (if $r.error then "error" else "success" end),
+      is_error: ($r.error != null),
+      result:   ($r.choices[0].message.content // ""),
+      session_id: ($r.id // ""),
+      duration_ms: ($dur | tonumber),
+      total_cost_usd: ($r.usage.cost // 0),
+      usage: {
+        input_tokens:                ($r.usage.prompt_tokens // 0),
+        output_tokens:               ($r.usage.completion_tokens // 0),
+        cache_read_input_tokens:     ($r.usage.prompt_tokens_details.cached_tokens // 0),
+        cache_creation_input_tokens: 0
+      },
+      modelUsage: { ($r.model // $m): {} },
+      terminal_reason: (if $r.error then ($r.error.message // "error") else "completed" end),
+      provider: "openrouter"
+    }
+  ' >"$resp_file"
+}
 
 # Trích JSON object đầu tiên hợp lệ từ text bất kỳ (xử lý fence, preamble, postamble).
 # Stdin: text thô. Stdout: JSON. Exit 0 nếu thành công.
@@ -156,6 +205,8 @@ call_agent() {
   local sp_mode;            sp_mode="$(md_meta "$md" system_prompt_mode)"   # append | replace
   local max_turns;          max_turns="$(md_meta "$md" max_turns)"
   local caveman;            caveman="$(md_meta "$md" caveman)"               # off | lite | full | ultra
+  local provider;           provider="$(md_meta "$md" provider)"             # claude | openrouter
+  provider="${provider:-${PAGENT_PROVIDER:-claude}}"
   local model;              model="$(md_meta "$md" model)"
   model="${model:-$PAGENT_MODEL}"
   sp_mode="${sp_mode:-append}"
@@ -181,24 +232,31 @@ $system_prompt" ;;
   [[ -x "$KIT_DIR/hooks/pre.sh" ]] && "$KIT_DIR/hooks/pre.sh" "$prompt" || true
 
   # Build claude args. Đẩy prompt qua stdin để tránh xung đột với --allowed-tools variadic.
-  local args=(-p --output-format json --model "$model")
-  if [[ "$sp_mode" == "replace" ]]; then
-    args+=(--system-prompt "$system_prompt")
+  local backend_pid label
+  label="$(c_cyan "[$agent]") thinking…"
+  if [[ "$provider" == "openrouter" ]]; then
+    label="$(c_cyan "[$agent]") via openrouter ($model)…"
+    ( cd "$PAGENT_SOURCE"
+      printf '%s' "$prompt" | call_openrouter "$model" "$system_prompt" "$resp_file"
+    ) 2>"$PAGENT_RUN_DIR/$agent.err" &
+    backend_pid=$!
   else
-    args+=(--append-system-prompt "$system_prompt")
+    local args=(-p --output-format json --model "$model")
+    if [[ "$sp_mode" == "replace" ]]; then
+      args+=(--system-prompt "$system_prompt")
+    else
+      args+=(--append-system-prompt "$system_prompt")
+    fi
+    [[ -n "$allowed" ]] && args+=(--allowed-tools "$allowed")
+    [[ -n "$disallowed" ]] && args+=(--disallowed-tools "$disallowed")
+    [[ -n "$max_turns" ]] && args+=(--max-turns "$max_turns")
+    ( cd "$PAGENT_SOURCE"
+      printf '%s' "$prompt" | "$PAGENT_CLAUDE_BIN" "${args[@]}"
+    ) >"$resp_file" 2>"$PAGENT_RUN_DIR/$agent.err" &
+    backend_pid=$!
   fi
-  [[ -n "$allowed" ]] && args+=(--allowed-tools "$allowed")
-  [[ -n "$disallowed" ]] && args+=(--disallowed-tools "$disallowed")
-  [[ -n "$max_turns" ]] && args+=(--max-turns "$max_turns")
-
-  # Run từ thư mục source để claude có cwd đúng. Spawn nền + spinner.
-  (
-    cd "$PAGENT_SOURCE"
-    printf '%s' "$prompt" | "$PAGENT_CLAUDE_BIN" "${args[@]}"
-  ) >"$resp_file" 2>"$PAGENT_RUN_DIR/$agent.err" &
-  local claude_pid=$!
-  spinner "$claude_pid" "$(c_cyan "[$agent]") thinking…"
-  wait "$claude_pid" || true
+  spinner "$backend_pid" "$label"
+  wait "$backend_pid" || true
 
   # Post-hook LUÔN chạy (kể cả khi agent fail) — tránh orphan start event trong tokens log
   [[ -x "$KIT_DIR/hooks/post.sh" ]] && "$KIT_DIR/hooks/post.sh" "$resp_file" || true
@@ -668,6 +726,9 @@ ENVIRONMENT (đặt trong .env.pagent hoặc shell)
   PAGENT_CLAUDE_BIN         path tới claude CLI (mặc định "claude")
   PAGENT_MAX_REVIEW_ROUND   số vòng coder↔reviewer (mặc định 2)
   PAGENT_CAVEMAN            off|lite|full|ultra — token compress mode (override md frontmatter)
+  PAGENT_OPENROUTER_KEY     OpenRouter API key (sk-or-v1-…) cho fallback khi Claude down
+  PAGENT_OPENROUTER_BASE    default: https://openrouter.ai/api/v1
+  PAGENT_PROVIDER           claude|openrouter — ép provider toàn pipeline
   PAGENT_KIT_DIR            override kit/ folder
 
 PIPELINE

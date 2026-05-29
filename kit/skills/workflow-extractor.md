@@ -1,6 +1,7 @@
 ---
 name: workflow-extractor
 description: Đọc CHANGES + TESTS_ADDED, cập nhật workflow.md với scenario test cho lần sau
+model: claude-haiku-4-5
 allowed_tools: Read,Write,Edit,Grep,Glob
 ---
 
