@@ -155,9 +155,23 @@ call_agent() {
   local disallowed;         disallowed="$(md_meta "$md" disallowed_tools)"
   local sp_mode;            sp_mode="$(md_meta "$md" system_prompt_mode)"   # append | replace
   local max_turns;          max_turns="$(md_meta "$md" max_turns)"
+  local caveman;            caveman="$(md_meta "$md" caveman)"               # off | lite | full | ultra
   local model;              model="$(md_meta "$md" model)"
   model="${model:-$PAGENT_MODEL}"
   sp_mode="${sp_mode:-append}"
+  caveman="${caveman:-${PAGENT_CAVEMAN:-off}}"
+
+  # Inject caveman directive vào HEAD của system_prompt
+  case "$caveman" in
+    lite)  system_prompt="CAVEMAN MODE LITE — drop pleasantries, hedging, filler. Keep code/paths/errors EXACT.
+$system_prompt" ;;
+    full)  system_prompt="CAVEMAN MODE FULL — drop articles (a/an/the), filler (just/really/basically/actually), pleasantries. Telegraphic prose OK. Keep code/paths/errors EXACT. Lists > paragraphs.
+$system_prompt" ;;
+    ultra) system_prompt="CAVEMAN MODE ULTRA — bare tokens. drop articles, copula, fillers, transitions. SVO only. fragments fine. code/paths/errors exact. lists not prose. no preamble. no postamble.
+$system_prompt" ;;
+    off|"")  : ;;
+    *) warn "caveman value lạ: $caveman (dùng off|lite|full|ultra)" ;;
+  esac
 
   local resp_file="$PAGENT_RUN_DIR/$agent.json"
   local out_file="$PAGENT_RUN_DIR/$agent.txt"
@@ -186,16 +200,16 @@ call_agent() {
   spinner "$claude_pid" "$(c_cyan "[$agent]") thinking…"
   wait "$claude_pid" || true
 
+  # Post-hook LUÔN chạy (kể cả khi agent fail) — tránh orphan start event trong tokens log
+  [[ -x "$KIT_DIR/hooks/post.sh" ]] && "$KIT_DIR/hooks/post.sh" "$resp_file" || true
+
   if ! jq -e '.result' "$resp_file" >/dev/null 2>&1; then
-    warn "agent $agent fail — xem $PAGENT_RUN_DIR/$agent.err"
+    local reason; reason="$(jq -r '.terminal_reason // .error // "unknown"' "$resp_file" 2>/dev/null)"
+    warn "agent $agent fail (reason=$reason) — xem $PAGENT_RUN_DIR/$agent.err"
     tail -20 "$resp_file" >&2
     return 1
   fi
   jq -r '.result' "$resp_file" >"$out_file"
-
-  # Post-hook
-  [[ -x "$KIT_DIR/hooks/post.sh" ]] && "$KIT_DIR/hooks/post.sh" "$resp_file" || true
-
   cat "$out_file"
 }
 
@@ -233,30 +247,33 @@ write_report() {
     )"
   fi
 
-  local plan coder reviewer tester
-  plan="$(cat "$PAGENT_RUN_DIR/orchestrator.txt" 2>/dev/null || echo '(none)')"
-  coder="$(cat "$PAGENT_RUN_DIR/coder.txt" 2>/dev/null || echo '(none)')"
-  reviewer="$(cat "$PAGENT_RUN_DIR/reviewer.txt" 2>/dev/null || echo '(none)')"
-  tester="$(cat "$PAGENT_RUN_DIR/tester.txt" 2>/dev/null || echo '(skipped)')"
-
+  local plan_f="$PAGENT_RUN_DIR/orchestrator.txt"
+  local coder_f="$PAGENT_RUN_DIR/coder.txt"
+  local reviewer_f="$PAGENT_RUN_DIR/reviewer.txt"
+  local tester_f="$PAGENT_RUN_DIR/tester.txt"
   local diffstat; diffstat="$(git_diff_summary)"
   [[ -z "$diffstat" ]] && diffstat="(no git diff)"
 
-  awk -v T="$title" -v P="$PAGENT_PROJECT" -v M="$PAGENT_MODE" -v TI="$PAGENT_TASK_ID" \
-      -v D="$date_str" -v R="$risk" -v C="$cost" -v IN="$in_tok" -v OUT="$out_tok" -v CR="$cache_r" \
-      -v TASK="$task" -v PLAN="$plan" -v CODER="$coder" -v REVIEWER="$reviewer" \
-      -v TESTER="$tester" -v AFF="$affected" -v DS="$diffstat" '
-    {
-      gsub(/\{\{TITLE\}\}/,T); gsub(/\{\{PROJECT\}\}/,P); gsub(/\{\{MODE\}\}/,M);
-      gsub(/\{\{TASK_ID\}\}/,TI); gsub(/\{\{DATE\}\}/,D); gsub(/\{\{RISK\}\}/,R);
-      gsub(/\{\{COST\}\}/,C); gsub(/\{\{IN_TOKENS\}\}/,IN); gsub(/\{\{OUT_TOKENS\}\}/,OUT);
-      gsub(/\{\{CACHE_READ\}\}/,CR);
-      gsub(/\{\{TASK\}\}/,TASK); gsub(/\{\{PLAN\}\}/,PLAN); gsub(/\{\{CODER\}\}/,CODER);
-      gsub(/\{\{REVIEWER\}\}/,REVIEWER); gsub(/\{\{TESTER\}\}/,TESTER);
-      gsub(/\{\{AFFECTED\}\}/,AFF); gsub(/\{\{DIFFSTAT\}\}/,DS);
-      print
-    }
-  ' "$KIT_DIR/templates/report.md" >"$report_path"
+  {
+    printf '# %s\n\n' "$title"
+    printf '**Project:** %s\n' "$PAGENT_PROJECT"
+    printf '**Mode:** %s\n' "$PAGENT_MODE"
+    printf '**Task ID:** %s\n' "$PAGENT_TASK_ID"
+    printf '**Date:** %s\n' "$date_str"
+    printf '**Risk:** %s\n' "$risk"
+    printf '**Total cost:** $%s (%s in / %s out, cache read %s)\n\n' "$cost" "$in_tok" "$out_tok" "$cache_r"
+    printf '## Task\n%s\n\n' "$task"
+    printf '## Plan (orchestrator)\n'
+    [[ -s "$plan_f" ]] && cat "$plan_f" || echo '(none)'
+    printf '\n## Code changes (coder)\n'
+    [[ -s "$coder_f" ]] && cat "$coder_f" || echo '(none)'
+    printf '\n## Review (reviewer)\n'
+    [[ -s "$reviewer_f" ]] && cat "$reviewer_f" || echo '(none)'
+    printf '\n## Tests (tester)\n'
+    [[ -s "$tester_f" ]] && cat "$tester_f" || echo '(skipped)'
+    printf '\n## Affected files\n%s\n\n' "$affected"
+    printf '## Git diff stat\n```\n%s\n```\n' "$diffstat"
+  } >"$report_path"
 }
 
 #─────────────────────────────────────────────
@@ -632,6 +649,7 @@ USAGE
   pagent skill new <name>              Scaffold skill mới trong .pagent/skills/
   pagent env                           In biến môi trường đang dùng
   pagent gain [-w|--watch]             Xem rtk savings cho project hiện tại (-w = live)
+  pagent web [port] [host]             Bật web dashboard (mặc định http://127.0.0.1:8765)
   pagent help                          Trợ giúp
 
 SKILL RESOLUTION (project-local override global)
@@ -649,6 +667,7 @@ ENVIRONMENT (đặt trong .env.pagent hoặc shell)
   PAGENT_MODE               feature | hotfix (override subcommand)
   PAGENT_CLAUDE_BIN         path tới claude CLI (mặc định "claude")
   PAGENT_MAX_REVIEW_ROUND   số vòng coder↔reviewer (mặc định 2)
+  PAGENT_CAVEMAN            off|lite|full|ultra — token compress mode (override md frontmatter)
   PAGENT_KIT_DIR            override kit/ folder
 
 PIPELINE
@@ -681,6 +700,14 @@ case "$cmd" in
   report)    cmd_report "${1:-}" ;;
   workflow)  cmd_workflow "$@" ;;
   env)       cmd_env ;;
+  web)
+    port="${1:-8765}"; host="${2:-127.0.0.1}"
+    [[ -f "$KIT_DIR/web/server.py" ]] || die "kit/web/server.py missing"
+    need python3
+    log "$(c_cyan 'dashboard:') http://$host:$port  (reports: $PAGENT_REPORT_DIR)"
+    PORT="$port" HOST="$host" PAGENT_REPORT_DIR="$PAGENT_REPORT_DIR" \
+      exec python3 "$KIT_DIR/web/server.py"
+    ;;
   gain)
     if ! command -v rtk >/dev/null; then die "rtk chưa cài"; fi
     if [[ "${1:-}" == "-w" || "${1:-}" == "--watch" ]]; then

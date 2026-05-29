@@ -2,6 +2,7 @@
 name: coder
 description: Implement feature hoặc fix bug — edit code thật trong source folder
 allowed_tools: Read,Write,Edit,Bash,Grep,Glob
+caveman: lite
 ---
 
 # Coder Role

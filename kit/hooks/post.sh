@@ -11,8 +11,8 @@ log_dir="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/tokens"
 mkdir -p "$log_dir"
 log_file="$log_dir/$date_str.jsonl"
 
-# Extract usage từ claude CLI JSON
-read -r in_tok out_tok cache_r cache_c cost dur_ms model sid <<<"$(jq -r '
+# Extract usage từ claude CLI JSON. Fallback 0/empty nếu response không parse được.
+if ! parsed="$(jq -r '
   [
     .usage.input_tokens                  // 0,
     .usage.output_tokens                 // 0,
@@ -20,10 +20,15 @@ read -r in_tok out_tok cache_r cache_c cost dur_ms model sid <<<"$(jq -r '
     .usage.cache_creation_input_tokens   // 0,
     .total_cost_usd                      // 0,
     .duration_ms                         // 0,
-    (.modelUsage | keys | first         // "unknown"),
-    .session_id                          // ""
+    (.modelUsage // {} | keys | first   // "unknown"),
+    .session_id                          // "",
+    .terminal_reason                     // "",
+    (.is_error // false | tostring)
   ] | @tsv
-' "$resp_file")"
+' "$resp_file" 2>/dev/null)"; then
+  parsed=$'0\t0\t0\t0\t0\t0\tunknown\t\tparse_fail\ttrue'
+fi
+read -r in_tok out_tok cache_r cache_c cost dur_ms model sid term_reason is_err <<<"$parsed"
 
 jq -nc \
   --arg ts        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -39,11 +44,14 @@ jq -nc \
   --argjson cr    "${cache_r:-0}" \
   --argjson cc    "${cache_c:-0}" \
   --argjson cost  "${cost:-0}" \
-  --argjson durms "${dur_ms:-0}" '
+  --argjson durms "${dur_ms:-0}" \
+  --arg term      "${term_reason:-}" \
+  --arg err       "${is_err:-false}" '
   {ts:$ts, event:$event, project:$project, mode:$mode, task_id:$task_id, agent:$agent,
    model:$model, session_id:$sid,
    input_tokens:$in, output_tokens:$out, cache_read:$cr, cache_creation:$cc,
-   cost_usd:$cost, duration_ms:$durms}
+   cost_usd:$cost, duration_ms:$durms,
+   terminal_reason:$term, is_error:($err=="true")}
   ' >>"$log_file"
 
 # Echo 1 dòng ngắn cho user thấy

@@ -42,6 +42,7 @@ _pagent() {
     'agent:Tạo agent mới — pagent agent new <name>'
     'env:In biến môi trường đang dùng'
     'gain:Xem rtk token savings (-w để live)'
+    'web:Bật web dashboard'
     'help:Trợ giúp'
   )
 

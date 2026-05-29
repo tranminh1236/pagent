@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>pagent dashboard</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="logo">▦</span>
+    <span class="title">pagent</span>
+    <span class="subtitle">dashboard</span>
+  </div>
+  <div class="controls">
+    <label>Project</label>
+    <select id="project"></select>
+    <button id="refresh-btn" title="Refresh ngay">↻</button>
+    <span id="refresh-info" class="dim"></span>
+  </div>
+</header>
+
+<main>
+  <section id="live-section">
+    <div class="section-head">
+      <h2><span class="dot" id="live-dot"></span>Live</h2>
+      <span id="live-count" class="badge"></span>
+    </div>
+    <div id="live-list"></div>
+  </section>
+
+  <section id="agent-section">
+    <h2>Agents</h2>
+    <div id="agent-grid"></div>
+  </section>
+
+  <section id="history-section">
+    <h2>History <small class="dim" id="history-count"></small></h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>When</th>
+            <th>Kind</th>
+            <th>Title</th>
+            <th>Agents used</th>
+            <th class="num">Cost</th>
+            <th class="num">Duration</th>
+            <th class="num">Tokens out</th>
+          </tr>
+        </thead>
+        <tbody id="history-tbody"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<div id="modal" class="hidden" aria-hidden="true">
+  <div class="modal-shell">
+    <button id="modal-close" title="Đóng">×</button>
+    <div id="modal-meta"></div>
+    <h3 class="modal-section-title">Pipeline timeline</h3>
+    <div id="modal-timeline"></div>
+    <h3 class="modal-section-title">Report</h3>
+    <pre id="modal-report"></pre>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

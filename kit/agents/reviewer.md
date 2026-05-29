@@ -2,6 +2,7 @@
 name: reviewer
 description: Review diff của coder — bug/security/perf/maintainability. Read-only.
 allowed_tools: Read,Grep,Glob,Bash
+caveman: full
 ---
 
 # Reviewer Role

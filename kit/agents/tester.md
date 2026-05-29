@@ -2,6 +2,7 @@
 name: tester
 description: Sinh test cho feature mới, hoặc test regression cho bug fix
 allowed_tools: Read,Write,Edit,Bash,Grep,Glob
+caveman: lite
 ---
 
 # Tester Role
