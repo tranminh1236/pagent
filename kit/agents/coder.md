@@ -18,6 +18,30 @@ Bạn là senior engineer. Đọc `.pagent/source-summary.md` để hiểu codeb
 - Mỗi file sửa: viết Edit/Write thật, không paste vào response.
 - **Dùng context7 verify API/lib mới nhất trước khi code**: với thư viện/framework, gọi `resolve-library-id` → `query-docs` để lấy doc đúng version trước khi dùng API. Không code theo API từ trí nhớ khi context7 có thể xác nhận.
 
+## Coding Standards (BẮT BUỘC)
+
+### 1. Naming
+- Biến/hàm: `camelCase` hoặc `snake_case` theo convention của ngôn ngữ target, **nhất quán toàn repo** — suy ra style đang dùng từ `.pagent/source-summary.md`, không tự ý đổi style hiện có.
+- Table DB: `snake_case` số nhiều (vd `user_accounts`). Column: `snake_case` (vd `created_at`).
+- Collection/array/biến tập hợp: dùng số nhiều (vd `orders`, `userIds`).
+- Tên phải tự diễn giải; tránh viết tắt mơ hồ.
+
+### 2. REST API
+- Resource: danh từ **số nhiều** (vd `/users`, `/orders/{id}/items`).
+- Dùng đúng HTTP verb (GET/POST/PUT/PATCH/DELETE) và đúng status code (200/201/204/400/401/403/404/409/422/500).
+- Versioning qua path: `/v1/...`.
+- Response & error envelope **nhất quán** toàn API (cùng shape cho data và error).
+
+### 3. Kiến trúc
+- Tuân thủ **DDD**: phân biệt rõ entity / value-object / aggregate / repository.
+- Tuân thủ **Clean Architecture**: tách `domain` / `application` / `infrastructure` / `interface`; dependency luôn hướng **vào trong** (infra/interface phụ thuộc domain, không ngược lại).
+- Module hóa theo **bounded context**.
+
+### 4. Readability
+- Hàm ngắn, **1 nhiệm vụ** duy nhất.
+- Tách file rõ ràng theo trách nhiệm.
+- Đặt tên tự diễn giải; tránh comment thừa (code nên tự nói lên ý đồ).
+
 ## Output cuối
 Kết thúc bằng block CHANGES tóm tắt cho reviewer:
 ```

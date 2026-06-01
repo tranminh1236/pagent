@@ -13,6 +13,9 @@ _src="${BASH_SOURCE[0]}"; while [[ -L "$_src" ]]; do _src="$(readlink "$_src")";
 SCRIPT_DIR="$(cd "$(dirname "$_src")" && pwd)"
 KIT_DIR="${PAGENT_KIT_DIR:-$SCRIPT_DIR/kit}"
 
+# Portable file lock (flock/mkdir) — chống interleave khi chạy song song
+if [[ -f "$KIT_DIR/lib/lock.sh" ]]; then . "$KIT_DIR/lib/lock.sh"; else with_lock() { shift; "$@"; }; fi
+
 #─────────────────────────────────────────────
 # Auto-load .env.pagent từ cwd hoặc parents
 #─────────────────────────────────────────────
@@ -72,7 +75,9 @@ md_meta() {
   ' "$1"
 }
 
-new_task_id() { printf '%s-%s' "$(date -u +%Y%m%dT%H%M%S)" "$(jot -r 1 1000 9999 2>/dev/null || echo $RANDOM)"; }
+# date giây + PID + random → tách biệt tuyệt đối giữa các run song song
+# ($$ loại bỏ xác suất trùng khi 2 process khởi tạo trong cùng 1 giây trùng random)
+new_task_id() { printf '%s-%s-%s' "$(date -u +%Y%m%dT%H%M%S)" "$$" "$(jot -r 1 1000 9999 2>/dev/null || echo $RANDOM)"; }
 
 # Gọi OpenRouter /chat/completions, transform response → format giống claude CLI JSON
 # Stdin: user prompt. Args: $1=model $2=system_prompt $3=resp_file
@@ -164,6 +169,8 @@ spinner() {
   local i=0 start; start="$(date +%s)"
   # Tắt nếu stderr không phải tty
   [[ ! -t 2 ]] && { wait "$pid" 2>/dev/null; return; }
+  # Lưu trap EXIT hiện có (vd release_run_lock) để KHÔI PHỤC, không xoá trắng.
+  local _old_exit_trap; _old_exit_trap="$(trap -p EXIT)"
   trap 'printf "\r\033[K" >&2' EXIT
   while kill -0 "$pid" 2>/dev/null; do
     local elapsed=$(( $(date +%s) - start ))
@@ -173,7 +180,7 @@ spinner() {
     sleep 0.1
   done
   printf '\r\033[K' >&2
-  trap - EXIT
+  eval "${_old_exit_trap:-trap - EXIT}"
 }
 
 #─────────────────────────────────────────────
@@ -209,12 +216,22 @@ call_agent() {
   local provider;           provider="$(md_meta "$md" provider)"             # claude | openrouter
   provider="${provider:-${PAGENT_PROVIDER:-claude}}"
 
-  # MCP config: nạp context7 khi PAGENT_CONTEXT7 bật VÀ agent khai báo dùng
-  # (mcp_servers chứa "context7" hoặc allowed_tools tham chiếu tool context7).
-  local mcp_config=""
+  # MCP config: nạp config server cho từng MCP mà agent khai báo dùng
+  # (mcp_servers chứa tên server, hoặc allowed_tools tham chiếu tool server đó).
+  # Nhiều server → truyền --mcp-config nhiều lần. context7 gate qua PAGENT_CONTEXT7;
+  # figma/canvas (design) gate qua PAGENT_DESIGN.
+  local mcp_configs=()
   if [[ "${PAGENT_CONTEXT7:-0}" == "1" || "${PAGENT_CONTEXT7:-}" == "true" ]]; then
     if [[ "$mcp_servers" == *context7* || "$allowed" == *context7* ]]; then
-      [[ -f "$KIT_DIR/mcp/context7.json" ]] && mcp_config="$KIT_DIR/mcp/context7.json"
+      [[ -f "$KIT_DIR/mcp/context7.json" ]] && mcp_configs+=("$KIT_DIR/mcp/context7.json")
+    fi
+  fi
+  if [[ "${PAGENT_DESIGN:-0}" == "1" || "${PAGENT_DESIGN:-}" == "true" ]]; then
+    if [[ "$mcp_servers" == *figma* || "$allowed" == *figma* ]]; then
+      [[ -f "$KIT_DIR/mcp/figma.json" ]] && mcp_configs+=("$KIT_DIR/mcp/figma.json")
+    fi
+    if [[ "$mcp_servers" == *canvas* || "$allowed" == *canvas* ]]; then
+      [[ -f "$KIT_DIR/mcp/canvas.json" ]] && mcp_configs+=("$KIT_DIR/mcp/canvas.json")
     fi
   fi
   local model;              model="$(md_meta "$md" model)"
@@ -260,7 +277,10 @@ $system_prompt" ;;
     [[ -n "$allowed" ]] && args+=(--allowed-tools "$allowed")
     [[ -n "$disallowed" ]] && args+=(--disallowed-tools "$disallowed")
     [[ -n "$max_turns" ]] && args+=(--max-turns "$max_turns")
-    [[ -n "$mcp_config" ]] && args+=(--mcp-config "$mcp_config")
+    local mc
+    if [[ ${#mcp_configs[@]} -gt 0 ]]; then
+      for mc in "${mcp_configs[@]}"; do args+=(--mcp-config "$mc"); done
+    fi
     ( cd "$PAGENT_SOURCE"
       printf '%s' "$prompt" | "$PAGENT_CLAUDE_BIN" "${args[@]}"
     ) >"$resp_file" 2>"$PAGENT_RUN_DIR/$agent.err" &
@@ -293,6 +313,34 @@ git_diff_full() {
 }
 
 #─────────────────────────────────────────────
+# Run-lock theo project: cảnh báo khi có run khác đang active trên cùng
+# $PAGENT_SOURCE. Coder ghi file thật + git diff sẽ LẪN thay đổi của 2 task
+# chạy song song. Warn-only (không block) — lock-file dùng để phát hiện.
+#─────────────────────────────────────────────
+acquire_run_lock() {
+  local lock="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/.run.lock"
+  mkdir -p "$(dirname "$lock")"
+  if [[ -f "$lock" ]]; then
+    local other_pid other_task
+    read -r other_pid other_task <"$lock" 2>/dev/null || true
+    if [[ -n "${other_pid:-}" ]] && kill -0 "$other_pid" 2>/dev/null; then
+      warn "đang có run khác active trên project '$PAGENT_PROJECT' (pid=$other_pid task=${other_task:-?})"
+      warn "  coder ghi file thật + git diff CÓ THỂ LẪN thay đổi của 2 task — cân nhắc đợi run kia xong"
+    fi
+  fi
+  printf '%s %s\n' "$$" "$PAGENT_TASK_ID" >"$lock"
+  PAGENT_RUN_LOCK="$lock"
+  trap 'release_run_lock' EXIT
+}
+release_run_lock() {
+  [[ -n "${PAGENT_RUN_LOCK:-}" && -f "$PAGENT_RUN_LOCK" ]] || return 0
+  # Chỉ xoá nếu lock vẫn của ta (tránh xoá lock của run giành sau cảnh báo)
+  local lp; read -r lp _ <"$PAGENT_RUN_LOCK" 2>/dev/null || true
+  [[ "${lp:-}" == "$$" ]] && rm -f "$PAGENT_RUN_LOCK"
+  return 0
+}
+
+#─────────────────────────────────────────────
 # Build report cuối
 #─────────────────────────────────────────────
 write_report() {
@@ -303,7 +351,7 @@ write_report() {
   local log_file="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/tokens/$date_str.jsonl"
   local in_tok=0 out_tok=0 cache_r=0 cost="0.0000"
   if [[ -s "$log_file" ]]; then
-    read -r in_tok out_tok cache_r cost <<<"$(
+    _sum_tokens() {
       jq -s --arg tid "$PAGENT_TASK_ID" '
         [.[] | select(.task_id==$tid and .event=="end")] |
         [
@@ -313,10 +361,12 @@ write_report() {
           (map(.cost_usd)        | add // 0)
         ] | @tsv
       ' "$log_file" | tr -d '"'
-    )"
+    }
+    read -r in_tok out_tok cache_r cost <<<"$(with_lock "$log_file" _sum_tokens)"
   fi
 
   local plan_f="$PAGENT_RUN_DIR/orchestrator.txt"
+  local designer_f="$PAGENT_RUN_DIR/designer.txt"
   local coder_f="$PAGENT_RUN_DIR/coder.txt"
   local reviewer_f="$PAGENT_RUN_DIR/reviewer.txt"
   local tester_f="$PAGENT_RUN_DIR/tester.txt"
@@ -338,6 +388,10 @@ write_report() {
     fi
     printf '## Plan (orchestrator)\n'
     [[ -s "$plan_f" ]] && cat "$plan_f" || echo '(none)'
+    if [[ -s "$designer_f" ]]; then
+      printf '\n## Design spec (designer)\n'
+      cat "$designer_f"
+    fi
     printf '\n## Code changes (coder)\n'
     [[ -s "$coder_f" ]] && cat "$coder_f" || echo '(none)'
     printf '\n## Review (reviewer)\n'
@@ -388,6 +442,8 @@ cmd_pipeline() {
   mkdir -p "$PAGENT_RUN_DIR"
   export PAGENT_TASK_ID PAGENT_MODE PAGENT_RUN_DIR PAGENT_PROJECT PAGENT_REPORT_DIR
 
+  acquire_run_lock
+
   log "project=$PAGENT_PROJECT mode=$mode task_id=$PAGENT_TASK_ID"
   log "source=$PAGENT_SOURCE"
   echo "$task" >"$PAGENT_RUN_DIR/task.txt"
@@ -433,12 +489,42 @@ cmd_pipeline() {
 
   log "  title: $(c_green "$title")  risk=$risk"
 
+  #────── 1b. Designer (feature, khi task động đến UI) ──────
+  local design_spec=""
+  if [[ "$mode" == "feature" ]] && \
+     printf '%s\n%s\n%s' "$task" "$coder_task" "$affected" \
+       | grep -qiE 'ui|giao diện|screen|màn hình|component|layout|button|form|page|frontend|design|css|style|màu|theme|icon|responsive'; then
+    log "$(c_cyan '[+]') designer → design spec"
+    local designer_text
+    designer_text="$( {
+      echo "## MODE"; echo "$mode"; echo
+      echo "## TASK"; echo "$task"; echo
+      echo "## PLAN"; cat "$PAGENT_RUN_DIR/orchestrator.txt"; echo
+      echo "## CODER_TASK"; echo "$coder_task"
+    } | call_agent designer )" || warn "designer fail (tiếp tục không có design spec)"
+    if [[ -n "$designer_text" ]]; then
+      design_spec="$(echo "$designer_text" | extract_json 2>/dev/null || true)"
+      if jq -e . >/dev/null 2>&1 <<<"$design_spec"; then
+        printf '%s\n' "$design_spec" >"$PAGENT_RUN_DIR/designer.txt"
+        log "  design spec: $(c_green "$(jq -r '.title // "(design spec)"' <<<"$design_spec" 2>/dev/null)")"
+      else
+        warn "design spec JSON không parse được — bỏ qua"
+        design_spec=""
+      fi
+    fi
+  fi
+
   #────── 2. Coder ↔ Reviewer loop ──────
   local round=1 verdict="CHANGES_REQUESTED" coder_input="$coder_task"
   while (( round <= PAGENT_MAX_REVIEW_ROUND )) && [[ "$verdict" != "APPROVED" ]]; do
     log "$(c_cyan "[2/4]") coder round $round"
     {
       echo "## TASK"; echo "$coder_input"; echo
+      if [[ -n "$design_spec" ]]; then
+        echo "## DESIGN_SPEC"
+        echo "Tuân thủ design spec JSON dưới (design tokens, component, layout, accessibility). Dùng token thay vì hardcode màu/spacing."
+        echo "$design_spec"; echo
+      fi
       if (( round > 1 )); then
         echo "## PREVIOUS_REVIEW"; cat "$PAGENT_RUN_DIR/reviewer.txt"; echo
         echo "## INSTRUCTION"; echo "Fix các điểm BLOCKING/MAJOR ở review trên rồi xuất CHANGES mới."
@@ -507,7 +593,8 @@ cmd_pipeline() {
     log "$(c_cyan '[+]') workflow extractor → workflow.md"
     local wf="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/workflow.md"
     mkdir -p "$(dirname "$wf")"
-    [[ -f "$wf" ]] || printf '# Workflow Log — %s\n\n' "$PAGENT_PROJECT" >"$wf"
+    _init_wf() { [[ -f "$wf" ]] || printf '# Workflow Log — %s\n\n' "$PAGENT_PROJECT" >"$wf"; }
+    with_lock "$wf" _init_wf
 
     {
       echo "## FEATURE_TITLE"; echo "$title"; echo
@@ -741,7 +828,7 @@ pagent — claude-cli orchestrator (coder + reviewer + tester)
 
 USAGE
   pagent init                          Quét source folder, sinh .pagent/source-summary.md
-  pagent feature "task..."             Build feature: orchestrator→coder→reviewer→tester→workflow
+  pagent feature "task..."             Build feature (alias: feat): orchestrator→coder→reviewer→tester→workflow
   pagent fix     "task..."             Hotfix bug:   orchestrator→coder→reviewer→tester regression
   pagent report  [project]             Tóm tắt features/bugs + cost theo ngày
   pagent workflow [show|list|run|new|file]   Quản lý workflow.md (xem 'pagent workflow' để biết)
@@ -798,7 +885,7 @@ EOF
 cmd="${1:-help}"; shift || true
 case "$cmd" in
   init)      cmd_init ;;
-  feature)   cmd_pipeline feature "${*:-}" ;;
+  feat|feature)   cmd_pipeline feature "${*:-}" ;;
   fix|bug|hotfix) cmd_pipeline hotfix "${*:-}" ;;
   report)    cmd_report "${1:-}" ;;
   workflow)  cmd_workflow "$@" ;;

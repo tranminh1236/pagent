@@ -3,6 +3,11 @@
 # Env: PAGENT_PROJECT, PAGENT_MODE, PAGENT_TASK_ID, PAGENT_AGENT, PAGENT_REPORT_DIR, PAGENT_RUN_DIR
 # Args: $1 = task text
 set -euo pipefail
+
+# Portable file lock — append jsonl không bị interleave khi 2 agent chạy song song
+_lock_lib="$(dirname "${BASH_SOURCE[0]}")/../lib/lock.sh"
+if [[ -f "$_lock_lib" ]]; then . "$_lock_lib"; else with_lock() { shift; "$@"; }; fi
+
 task="${1:-}"
 ts_start="$(date -u +%s)"
 echo "$ts_start" >"$PAGENT_RUN_DIR/started.$PAGENT_AGENT"
@@ -13,7 +18,7 @@ log_dir="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/tokens"
 mkdir -p "$log_dir"
 log_file="$log_dir/$date_str.jsonl"
 
-jq -nc \
+line="$(jq -nc \
   --arg ts        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg event     "start" \
   --arg project   "$PAGENT_PROJECT" \
@@ -24,5 +29,6 @@ jq -nc \
   --arg model     "${PAGENT_AGENT_MODEL:-}" \
   --arg task      "${task:0:200}" '
   {ts:$ts, event:$event, project:$project, mode:$mode, task_id:$task_id,
-   agent:$agent, provider:$provider, model:$model, task:$task}' \
-  >>"$log_file"
+   agent:$agent, provider:$provider, model:$model, task:$task}')"
+_append() { printf '%s\n' "$line" >>"$log_file"; }
+with_lock "$log_file" _append

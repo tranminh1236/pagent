@@ -34,6 +34,7 @@ _pagent() {
   top=(
     'init:Quét source folder → .pagent/source-summary.md'
     'feature:Build feature mới qua orchestrator+coder+reviewer+tester'
+    'feat:Build feature mới qua orchestrator+coder+reviewer+tester'
     'fix:Hotfix bug (alias: bug, hotfix)'
     'report:Tóm tắt features/bugs + cost'
     'workflow:Quản lý workflow.md'
@@ -52,7 +53,7 @@ _pagent() {
   fi
 
   case "${words[2]}" in
-    feature|fix|bug|hotfix)
+    feat|feature|fix|bug|hotfix)
       _arguments \
         '-a[chỉ định agent]:agent:_pagent_skills' \
         '-s[chỉ định skill]:skill:_pagent_skills' \

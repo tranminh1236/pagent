@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "canvas": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@canva/cli", "mcp", "--stdio"],
+      "env": {
+        "CANVAS_API_TOKEN": "${CANVAS_API_TOKEN}"
+      }
+    }
+  }
+}

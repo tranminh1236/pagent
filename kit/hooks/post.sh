@@ -3,6 +3,11 @@
 # Env: PAGENT_PROJECT, PAGENT_MODE, PAGENT_TASK_ID, PAGENT_AGENT, PAGENT_REPORT_DIR, PAGENT_RUN_DIR
 # Args: $1 = path to claude JSON response file
 set -euo pipefail
+
+# Portable file lock — append jsonl không bị interleave khi 2 agent chạy song song
+_lock_lib="$(dirname "${BASH_SOURCE[0]}")/../lib/lock.sh"
+if [[ -f "$_lock_lib" ]]; then . "$_lock_lib"; else with_lock() { shift; "$@"; }; fi
+
 resp_file="${1:-}"
 [[ -s "$resp_file" ]] || { echo "post.sh: empty response file" >&2; exit 0; }
 
@@ -31,7 +36,7 @@ if ! parsed="$(jq -r '
 fi
 read -r in_tok out_tok cache_r cache_c cost dur_ms model sid term_reason is_err provider <<<"$parsed"
 
-jq -nc \
+line="$(jq -nc \
   --arg ts        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg event     "end" \
   --arg project   "$PAGENT_PROJECT" \
@@ -54,7 +59,9 @@ jq -nc \
    input_tokens:$in, output_tokens:$out, cache_read:$cr, cache_creation:$cc,
    cost_usd:$cost, duration_ms:$durms,
    terminal_reason:$term, is_error:($err=="true")}
-  ' >>"$log_file"
+  ')"
+_append() { printf '%s\n' "$line" >>"$log_file"; }
+with_lock "$log_file" _append
 
 # Echo 1 dòng ngắn cho user thấy
 printf '  [%s] in=%s out=%s cache=r%s/c%s cost=$%.4f %dms\n' \
