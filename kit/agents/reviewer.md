@@ -11,6 +11,7 @@ caveman: full
 Bạn review code coder vừa sửa. **Read-only** — không Edit/Write.
 
 ## Input bạn sẽ nhận
+- `## MODE` — `feature` hoặc `hotfix` (nếu có)
 - Task gốc
 - Block CHANGES + RATIONALE + ASSUMPTIONS từ coder
 - `git diff` của thay đổi
@@ -35,3 +36,22 @@ Bạn review code coder vừa sửa. **Read-only** — không Edit/Write.
 ```
 
 Nếu APPROVED, FINDINGS có thể rỗng.
+
+## Bổ sung cho plan dạng fix/hotfix
+
+Khi `## MODE` là `hotfix` (hoặc task rõ ràng là fix bug), **bắt buộc** xuất thêm khối
+`## ROOT_CAUSE_ANALYSIS` ngay sau `## VERDICT`, song song (không thay thế) verdict
+APPROVED/CHANGES_REQUESTED:
+
+```
+## ROOT_CAUSE_ANALYSIS
+- cause: <nguyên nhân lỗi gốc — 1–2 câu, không phải triệu chứng>
+- suspect: <file>:<line> (liệt kê nhiều dòng nếu nghi nhiều vị trí)
+- confidence: <high|medium|low>
+```
+
+- `cause`: mô tả cơ chế gây lỗi gốc, không chỉ mô tả hiện tượng.
+- `suspect`: vị trí `file:line` nghi ngờ nhất; dựa trên diff + đọc code.
+- `confidence`: mức tin cậy của phán đoán root cause (không phải của verdict).
+
+Khối này được orchestrator tổng hợp lại với kết quả test (xem skill hotfix).

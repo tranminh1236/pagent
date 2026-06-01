@@ -27,6 +27,16 @@ Quy trình:
 2. Plan ngắn: locate → root cause hypothesis → fix → test regression.
 3. Skip tester sinh test mới nếu fix đã có test regression.
 
+### Bước tổng hợp (hotfix, chạy lại cuối pipeline)
+Khi được gọi lại với input chứa `## REVIEWER_OUTPUT` (có khối `ROOT_CAUSE_ANALYSIS`)
+và `## TESTER_OUTPUT` (kết quả chạy test regression):
+1. Lấy root cause reviewer đề xuất, đối chiếu với kết quả test (test pass/fail có
+   xác nhận giả thuyết không).
+2. Hợp nhất thành **một** câu mô tả nguyên nhân cuối cùng ĐÃ được xác nhận qua
+   review + test, kèm vị trí `file:line` nếu chắc.
+3. Output JSON theo schema có thêm field `root_cause_summary`. Giữ nguyên các field
+   plan ban đầu (lấy lại từ `## PREVIOUS_PLAN` nếu được cung cấp).
+
 ## Output BẮT BUỘC
 
 Response của bạn phải là MỘT JSON OBJECT duy nhất, không gì khác.
@@ -46,5 +56,9 @@ Schema:
   "reviewer_focus": "reviewer nên focus vào điểm gì",
   "tester_task": "tester cần verify gì (chuỗi rỗng \"\" nếu hotfix không cần test mới)",
   "risk": "low|medium|high",
-  "affected_paths": ["src/...", "..."]
+  "affected_paths": ["src/...", "..."],
+  "root_cause_summary": "CHỈ ở bước tổng hợp hotfix — nguyên nhân cuối đã xác nhận qua review+test; bỏ field này ở plan ban đầu"
 }
+
+`root_cause_summary` chỉ xuất hiện ở **bước tổng hợp** mode=hotfix (khi nhận
+`## REVIEWER_OUTPUT` + `## TESTER_OUTPUT`). Plan ban đầu KHÔNG có field này.

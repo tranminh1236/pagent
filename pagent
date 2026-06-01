@@ -320,6 +320,7 @@ write_report() {
   local coder_f="$PAGENT_RUN_DIR/coder.txt"
   local reviewer_f="$PAGENT_RUN_DIR/reviewer.txt"
   local tester_f="$PAGENT_RUN_DIR/tester.txt"
+  local rootcause_f="$PAGENT_RUN_DIR/root_cause.txt"
   local diffstat; diffstat="$(git_diff_summary)"
   [[ -z "$diffstat" ]] && diffstat="(no git diff)"
 
@@ -332,6 +333,9 @@ write_report() {
     printf '**Risk:** %s\n' "$risk"
     printf '**Total cost:** $%s (%s in / %s out, cache read %s)\n\n' "$cost" "$in_tok" "$out_tok" "$cache_r"
     printf '## Task\n%s\n\n' "$task"
+    if [[ -s "$rootcause_f" ]]; then
+      printf '## Root cause (review + test, đã xác nhận)\n%s\n\n' "$(cat "$rootcause_f")"
+    fi
     printf '## Plan (orchestrator)\n'
     [[ -s "$plan_f" ]] && cat "$plan_f" || echo '(none)'
     printf '\n## Code changes (coder)\n'
@@ -443,6 +447,7 @@ cmd_pipeline() {
 
     log "$(c_cyan "[3/4]") reviewer (focus: $reviewer_focus)"
     {
+      echo "## MODE"; echo "$mode"; echo
       echo "## ORIGINAL_TASK"; echo "$task"; echo
       echo "## REVIEWER_FOCUS"; echo "$reviewer_focus"; echo
       echo "## CODER_OUTPUT"; cat "$PAGENT_RUN_DIR/coder.txt"; echo
@@ -470,6 +475,31 @@ cmd_pipeline() {
     } | call_agent tester >/dev/null || warn "tester fail (tiếp tục)"
   else
     log "$(c_dim 'tester skipped (hotfix không cần)')"
+  fi
+
+  #────── 4b. Orchestrator tổng hợp root cause (hotfix only) ──────
+  if [[ "$mode" == "hotfix" && -s "$PAGENT_RUN_DIR/reviewer.txt" ]]; then
+    log "$(c_cyan '[+]') orchestrator → tổng hợp root cause"
+    cp "$PAGENT_RUN_DIR/orchestrator.txt" "$PAGENT_RUN_DIR/orchestrator.plan.txt"  # giữ plan gốc cho report
+    local agg_text agg_json root_cause_summary
+    agg_text="$( {
+      echo "## MODE"; echo "hotfix"; echo
+      echo "## INSTRUCTION"
+      echo "Đây là bước TỔNG HỢP. Hợp nhất root cause reviewer đề xuất với kết quả test → field root_cause_summary trong JSON output. Giữ nguyên các field plan từ PREVIOUS_PLAN."; echo
+      echo "## PREVIOUS_PLAN"; cat "$PAGENT_RUN_DIR/orchestrator.plan.txt"; echo
+      echo "## REVIEWER_OUTPUT"; cat "$PAGENT_RUN_DIR/reviewer.txt"; echo
+      echo "## TESTER_OUTPUT"
+      [[ -s "$PAGENT_RUN_DIR/tester.txt" ]] && cat "$PAGENT_RUN_DIR/tester.txt" || echo "(no tester run)"
+    } | call_agent orchestrator )" || warn "orchestrator tổng hợp fail (tiếp tục)"
+    cp "$PAGENT_RUN_DIR/orchestrator.plan.txt" "$PAGENT_RUN_DIR/orchestrator.txt"  # khôi phục plan gốc
+    agg_json="$(echo "$agg_text" | extract_json 2>/dev/null || true)"
+    root_cause_summary="$(jq -r '.root_cause_summary // ""' <<<"$agg_json" 2>/dev/null || true)"
+    if [[ -n "$root_cause_summary" ]]; then
+      printf '%s\n' "$root_cause_summary" >"$PAGENT_RUN_DIR/root_cause.txt"
+      log "  root cause: $(c_green "$root_cause_summary")"
+    else
+      warn "không trích được root_cause_summary từ orchestrator tổng hợp"
+    fi
   fi
 
   #────── 5. Workflow extractor (feature only) ──────
@@ -508,6 +538,7 @@ cmd_pipeline() {
   printf '\n%s\n' "$(c_green '═══ DONE ═══')"
   printf '  title:   %s\n' "$title"
   printf '  verdict: %s\n' "$verdict"
+  [[ -s "$PAGENT_RUN_DIR/root_cause.txt" ]] && printf '  root cause: %s\n' "$(cat "$PAGENT_RUN_DIR/root_cause.txt")"
   printf '  affected: %s\n' "$affected"
   printf '  report:  %s\n' "$report_file"
 }
