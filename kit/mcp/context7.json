@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "plugin_context7_context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp"
+    }
+  }
+}

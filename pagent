@@ -205,8 +205,18 @@ call_agent() {
   local sp_mode;            sp_mode="$(md_meta "$md" system_prompt_mode)"   # append | replace
   local max_turns;          max_turns="$(md_meta "$md" max_turns)"
   local caveman;            caveman="$(md_meta "$md" caveman)"               # off | lite | full | ultra
+  local mcp_servers;        mcp_servers="$(md_meta "$md" mcp_servers)"        # vd: context7
   local provider;           provider="$(md_meta "$md" provider)"             # claude | openrouter
   provider="${provider:-${PAGENT_PROVIDER:-claude}}"
+
+  # MCP config: nạp context7 khi PAGENT_CONTEXT7 bật VÀ agent khai báo dùng
+  # (mcp_servers chứa "context7" hoặc allowed_tools tham chiếu tool context7).
+  local mcp_config=""
+  if [[ "${PAGENT_CONTEXT7:-0}" == "1" || "${PAGENT_CONTEXT7:-}" == "true" ]]; then
+    if [[ "$mcp_servers" == *context7* || "$allowed" == *context7* ]]; then
+      [[ -f "$KIT_DIR/mcp/context7.json" ]] && mcp_config="$KIT_DIR/mcp/context7.json"
+    fi
+  fi
   local model;              model="$(md_meta "$md" model)"
   model="${model:-$PAGENT_MODEL}"
   sp_mode="${sp_mode:-append}"
@@ -250,6 +260,7 @@ $system_prompt" ;;
     [[ -n "$allowed" ]] && args+=(--allowed-tools "$allowed")
     [[ -n "$disallowed" ]] && args+=(--disallowed-tools "$disallowed")
     [[ -n "$max_turns" ]] && args+=(--max-turns "$max_turns")
+    [[ -n "$mcp_config" ]] && args+=(--mcp-config "$mcp_config")
     ( cd "$PAGENT_SOURCE"
       printf '%s' "$prompt" | "$PAGENT_CLAUDE_BIN" "${args[@]}"
     ) >"$resp_file" 2>"$PAGENT_RUN_DIR/$agent.err" &

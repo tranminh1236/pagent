@@ -1,7 +1,7 @@
 ---
 name: source-summary
 description: Scan source folder, sinh markdown summary để các agent hiểu codebase
-model: claude-sonet-4-6
+model: claude-sonnet-4-6
 allowed_tools: Read Glob Grep Bash(ls *) Bash(find *) Bash(cat *) Bash(head *) Bash(wc *) Bash(file *) Bash(tree *)
 disallowed_tools: Write,Edit,MultiEdit,NotebookEdit
 system_prompt_mode: replace
