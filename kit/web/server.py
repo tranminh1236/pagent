@@ -317,6 +317,14 @@ class H(BaseHTTPRequestHandler):
         self.send_response(status); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
+    def _safe_error(self, exc):
+        """Luôn cố trả JSON 500 khi handler ném exception ngoài dự kiến —
+        tránh để stdlib phát trang HTML (gây 'Unexpected token <' phía client)."""
+        try:
+            self._j({"error": f"lỗi server: {exc}"}, 500)
+        except Exception:
+            pass  # response đã gửi dở — không thể ghi đè
+
     def _f(self, name, mime):
         try:
             with open(os.path.join(HERE, name), "rb") as f: body = f.read()
@@ -337,16 +345,19 @@ class H(BaseHTTPRequestHandler):
         return self.rfile.read(n)
 
     def do_POST(self):
-        path = urlparse(self.path).path
-        m = re.match(r"^/api/projects/([^/]+)/(chat|upload)$", path)
-        if not m:
-            return self._j({"error": "not found"}, 404)
-        proj = unquote(m.group(1))
-        if not _valid_proj(proj):
-            return self._j({"error": "invalid or unknown project"}, 400)
-        if m.group(2) == "chat":
-            return self._chat(proj)
-        return self._upload(proj)
+        try:
+            path = urlparse(self.path).path
+            m = re.match(r"^/api/projects/([^/]+)/(chat|upload)$", path)
+            if not m:
+                return self._j({"error": "not found"}, 404)
+            proj = unquote(m.group(1))
+            if not _valid_proj(proj):
+                return self._j({"error": "invalid or unknown project"}, 400)
+            if m.group(2) == "chat":
+                return self._chat(proj)
+            return self._upload(proj)
+        except Exception as e:
+            self._safe_error(e)
 
     def _chat(self, proj):
         raw = self._read_body()
@@ -450,29 +461,32 @@ class H(BaseHTTPRequestHandler):
                         "is_image": _is_image(dest), "size": len(filepart["data"])})
 
     def do_GET(self):
-        path = urlparse(self.path).path
-        if path == "/":               return self._f("index.html", "text/html; charset=utf-8")
-        if path == "/app.js":         return self._f("app.js", "application/javascript")
-        if path == "/style.css":      return self._f("style.css", "text/css")
-        if path == "/api/projects":   return self._j(list_projects())
+        try:
+            path = urlparse(self.path).path
+            if path == "/":               return self._f("index.html", "text/html; charset=utf-8")
+            if path == "/app.js":         return self._f("app.js", "application/javascript")
+            if path == "/style.css":      return self._f("style.css", "text/css")
+            if path == "/api/projects":   return self._j(list_projects())
 
-        def with_proj(handler):
-            m = re.match(rf"^/api/projects/([^/]+){suffix}$", path)
-            if not m: return False
-            proj = unquote(m.group(1))
-            if not _valid_proj(proj):
-                self._j({"error": "invalid or unknown project"}, 400); return True
-            extras = [unquote(g) for g in m.groups()[1:]]
-            handler(proj, *extras); return True
+            def with_proj(handler):
+                m = re.match(rf"^/api/projects/([^/]+){suffix}$", path)
+                if not m: return False
+                proj = unquote(m.group(1))
+                if not _valid_proj(proj):
+                    self._j({"error": "invalid or unknown project"}, 400); return True
+                extras = [unquote(g) for g in m.groups()[1:]]
+                handler(proj, *extras); return True
 
-        for suffix, fn in (
-            (r"/tasks",        lambda p:    self._j(list_tasks(p))),
-            (r"/tasks/(.+)",   lambda p, t: self._j(task_detail(p, t))),
-            (r"/live",         lambda p:    self._j(live_tasks(p))),
-            (r"/agents",       lambda p:    self._j(agent_stats(p))),
-        ):
-            if with_proj(fn): return
-        self._j({"error": "not found"}, 404)
+            for suffix, fn in (
+                (r"/tasks",        lambda p:    self._j(list_tasks(p))),
+                (r"/tasks/(.+)",   lambda p, t: self._j(task_detail(p, t))),
+                (r"/live",         lambda p:    self._j(live_tasks(p))),
+                (r"/agents",       lambda p:    self._j(agent_stats(p))),
+            ):
+                if with_proj(fn): return
+            self._j({"error": "not found"}, 404)
+        except Exception as e:
+            self._safe_error(e)
 
     def log_message(self, fmt, *args): pass  # silent
 

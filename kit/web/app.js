@@ -1,6 +1,14 @@
 // pagent dashboard frontend
 const $ = (s) => document.querySelector(s);
-const j = async (u) => (await fetch(u)).json();
+// Parse JSON an toàn: nếu server trả HTML / rỗng (vd unhandled exception → trang lỗi
+// stdlib) thì throw lỗi có ý nghĩa thay vì "Unexpected token <".
+async function parseJson(res) {
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) return res.json();
+  const text = (await res.text().catch(() => '')).trim();
+  throw new Error(`HTTP ${res.status}${text ? ' — ' + text.slice(0, 200) : ' (phản hồi rỗng)'}`);
+}
+const j = async (u) => parseJson(await fetch(u));
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtMs = (ms) => ms ? (ms < 1000 ? `${ms}ms` : `${(ms/1000).toFixed(1)}s`) : '—';
 const fmtCost = (n) => '$' + (n || 0).toFixed(4);
@@ -194,7 +202,7 @@ async function uploadFiles(files) {
     fd.append('task', draftId);
     fd.append('file', file, file.name);
     try {
-      const r = await (await fetch(`/api/projects/${encodeURIComponent(project)}/upload`, { method: 'POST', body: fd })).json();
+      const r = await parseJson(await fetch(`/api/projects/${encodeURIComponent(project)}/upload`, { method: 'POST', body: fd }));
       if (r.error) { showChatError(r.error); continue; }
       attachments.push({ path: r.path, name: r.name, is_image: r.is_image, url: localUrl });
       renderPreviews();
@@ -269,10 +277,10 @@ async function sendChat() {
   const btn = $('#send-btn');
   btn.classList.add('loading'); updateSendState();
   try {
-    const r = await (await fetch(`/api/projects/${encodeURIComponent(project)}/chat`, {
+    const r = await parseJson(await fetch(`/api/projects/${encodeURIComponent(project)}/chat`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode: chatMode, task, attachments: attachments.map(a => a.path), figma_url: figma }),
-    })).json();
+    }));
     if (r.error) { showChatError(r.error); return; }
     appendUserMessage(task, attachments, figma);
     activeTaskId = r.task_id;
