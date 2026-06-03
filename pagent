@@ -89,6 +89,48 @@ agent_enabled() {
 # Log skip rõ ràng: prefix text "[skip]" là tín hiệu chính, màu chỉ phụ trợ.
 log_skip() { printf '%s %s\n' "$(c_yellow '[skip]')" "$*" >&2; }
 
+# Phát hiện plugin Superpowers của claude CLI (chứa skill brainstorming + writing-plans).
+# Im lặng, KHÔNG lỗi nếu thiếu — echo "1" khi có CẢ 2 skill, ngược lại "0".
+# Chỉ có nghĩa với provider=claude (Superpowers là plugin claude CLI); provider khác → "0".
+# Quét các thư mục plugin chuẩn của claude; tìm thư mục skill dưới một plugin tên *superpowers*.
+detect_superpowers() {
+  local provider="${1:-claude}"
+  [[ "$provider" == "claude" ]] || { echo 0; return 0; }
+  local roots=(
+    "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+    "$HOME/.claude/plugins"
+  )
+  local root
+  for root in "${roots[@]}"; do
+    [[ -d "$root" ]] || continue
+    if find "$root" -maxdepth 6 -type d -ipath '*superpowers*/skills/brainstorming'  2>/dev/null | grep -q . \
+    && find "$root" -maxdepth 6 -type d -ipath '*superpowers*/skills/writing-plans'  2>/dev/null | grep -q .; then
+      echo 1; return 0
+    fi
+  done
+  echo 0
+}
+
+# Phát hiện skill TDD của plugin Superpowers (chứa skill test-driven-development).
+# Im lặng, KHÔNG lỗi nếu thiếu — echo "1" khi có skill, ngược lại "0".
+# Chỉ có nghĩa với provider=claude (Superpowers là plugin claude CLI); provider khác → "0".
+detect_superpowers_tdd() {
+  local provider="${1:-claude}"
+  [[ "$provider" == "claude" ]] || { echo 0; return 0; }
+  local roots=(
+    "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+    "$HOME/.claude/plugins"
+  )
+  local root
+  for root in "${roots[@]}"; do
+    [[ -d "$root" ]] || continue
+    if find "$root" -maxdepth 6 -type d -ipath '*superpowers*/skills/test-driven-development' 2>/dev/null | grep -q .; then
+      echo 1; return 0
+    fi
+  done
+  echo 0
+}
+
 # Gọi OpenRouter /chat/completions, transform response → format giống claude CLI JSON
 # Stdin: user prompt. Args: $1=model $2=system_prompt $3=resp_file
 call_openrouter() {
@@ -260,6 +302,44 @@ $system_prompt" ;;
     off|"")  : ;;
     *) warn "caveman value lạ: $caveman (dùng off|lite|full|ultra)" ;;
   esac
+
+  # Superpowers gating — CHỈ orchestrator. Phát hiện plugin Superpowers theo provider;
+  # có → PAGENT_SUPERPOWERS=1 (orchestrator dùng brainstorming + writing-plans), không → 0.
+  # Inject giá trị đã resolve vào system prompt để orchestrator rẽ nhánh; các agent khác không đụng.
+  if [[ "$agent" == "orchestrator" ]]; then
+    PAGENT_SUPERPOWERS="$(detect_superpowers "$provider")"
+    export PAGENT_SUPERPOWERS
+    system_prompt="$system_prompt
+
+[RUNTIME] PAGENT_SUPERPOWERS=$PAGENT_SUPERPOWERS"
+  fi
+
+  # TDD gating — CHỈ coder. Inject directive TDD bắt buộc (RED→GREEN→REFACTOR) vào
+  # system prompt, mô phỏng khối orchestrator ở trên. Resolve body file theo thứ tự
+  # project-local → kit (dùng md_body để bóc frontmatter). Thiếu file → bỏ qua êm (warn nhẹ).
+  # Nếu phát hiện plugin Superpowers có skill TDD → thêm chỉ dẫn coder invoke Skill.
+  if [[ "$agent" == "coder" ]]; then
+    local tdd_md=""
+    for cand in \
+      "$PAGENT_SOURCE/.pagent/skills/test-driven-development.md" \
+      "$KIT_DIR/skills/test-driven-development.md"; do
+      [[ -f "$cand" ]] && { tdd_md="$cand"; break; }
+    done
+    if [[ -n "$tdd_md" ]]; then
+      local tdd_body; tdd_body="$(md_body "$tdd_md")"
+      system_prompt="$system_prompt
+
+[RUNTIME] TDD bắt buộc — tuân thủ directive dưới đây cho mọi implementation:
+$tdd_body"
+      if [[ "$(detect_superpowers_tdd "$provider")" == "1" ]]; then
+        system_prompt="$system_prompt
+
+[RUNTIME] Plugin Superpowers có sẵn — TRƯỚC khi viết code, invoke Skill superpowers:test-driven-development để nạp quy trình TDD đầy đủ."
+      fi
+    else
+      warn "không tìm thấy skill TDD (.pagent/skills/ + kit/skills/test-driven-development.md) — coder chạy không có directive TDD"
+    fi
+  fi
 
   local resp_file="$PAGENT_RUN_DIR/$agent.json"
   local out_file="$PAGENT_RUN_DIR/$agent.txt"
