@@ -79,6 +79,16 @@ md_meta() {
 # ($$ loại bỏ xác suất trùng khi 2 process khởi tạo trong cùng 1 giây trùng random)
 new_task_id() { printf '%s-%s-%s' "$(date -u +%Y%m%dT%H%M%S)" "$$" "$(jot -r 1 1000 9999 2>/dev/null || echo $RANDOM)"; }
 
+# Agent gating — orchestrator chỉ định `required_agents`; dispatcher skip agent ngoài list.
+# PAGENT_GATE=1 → bật gating; =0 → mọi agent enabled (backward-compat khi field thiếu/parse lỗi).
+# PAGENT_REQUIRED_AGENTS = list cách nhau khoảng trắng (vd " coder reviewer tester ").
+agent_enabled() {
+  [[ "${PAGENT_GATE:-0}" == "1" ]] || return 0
+  [[ " ${PAGENT_REQUIRED_AGENTS:-} " == *" $1 "* ]]
+}
+# Log skip rõ ràng: prefix text "[skip]" là tín hiệu chính, màu chỉ phụ trợ.
+log_skip() { printf '%s %s\n' "$(c_yellow '[skip]')" "$*" >&2; }
+
 # Gọi OpenRouter /chat/completions, transform response → format giống claude CLI JSON
 # Stdin: user prompt. Args: $1=model $2=system_prompt $3=resp_file
 call_openrouter() {
@@ -346,6 +356,7 @@ release_run_lock() {
 write_report() {
   local report_path="$1" title="$2" task="$3" risk="$4" affected="$5"
   local date_str; date_str="$(date -u +%Y-%m-%d)"
+  local datetime_str; datetime_str="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 
   # Tính tổng cost từ token log
   local log_file="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/tokens/$date_str.jsonl"
@@ -379,7 +390,7 @@ write_report() {
     printf '**Project:** %s\n' "$PAGENT_PROJECT"
     printf '**Mode:** %s\n' "$PAGENT_MODE"
     printf '**Task ID:** %s\n' "$PAGENT_TASK_ID"
-    printf '**Date:** %s\n' "$date_str"
+    printf '**Date:** %s\n' "$datetime_str"
     printf '**Risk:** %s\n' "$risk"
     printf '**Total cost:** $%s (%s in / %s out, cache read %s)\n\n' "$cost" "$in_tok" "$out_tok" "$cache_r"
     printf '## Task\n%s\n\n' "$task"
@@ -415,6 +426,9 @@ cmd_init() {
   mkdir -p "$PAGENT_RUN_DIR"
   export PAGENT_TASK_ID PAGENT_MODE PAGENT_RUN_DIR PAGENT_PROJECT PAGENT_REPORT_DIR
 
+  # Ghi source path để web server map project→source (xem cmd_pipeline).
+  printf '%s\n' "$PAGENT_SOURCE" >"$PAGENT_REPORT_DIR/$PAGENT_PROJECT/.source"
+
   local out_path="$PAGENT_SOURCE/.pagent/source-summary.md"
   local response
   response="$(echo "Quét folder $PAGENT_SOURCE và trả về markdown summary theo skill source-summary." \
@@ -437,10 +451,14 @@ cmd_pipeline() {
   [[ -n "$task" ]] || die "thiếu task"
 
   PAGENT_MODE="$mode"
-  PAGENT_TASK_ID="$(new_task_id)"
+  # PAGENT_TASK_ID có thể được set sẵn từ caller (vd web chat) để poll deterministic.
+  PAGENT_TASK_ID="${PAGENT_TASK_ID:-$(new_task_id)}"
   PAGENT_RUN_DIR="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/runs/$PAGENT_TASK_ID"
   mkdir -p "$PAGENT_RUN_DIR"
   export PAGENT_TASK_ID PAGENT_MODE PAGENT_RUN_DIR PAGENT_PROJECT PAGENT_REPORT_DIR
+
+  # Ghi source path để web server (chỉ biết REPORT_DIR) map project→source khi spawn pagent.
+  printf '%s\n' "$PAGENT_SOURCE" >"$PAGENT_REPORT_DIR/$PAGENT_PROJECT/.source"
 
   acquire_run_lock
 
@@ -487,13 +505,44 @@ cmd_pipeline() {
   risk="$(jq -r '.risk // "medium"' <<<"$plan_json")"
   affected="$(jq -r '.affected_paths // [] | join(", ")' <<<"$plan_json")"
 
+  # coder_subtasks (optional): plan lớn tách ≥2 task con độc lập → fan-out coder.
+  # Thiếu field / không phải mảng / rỗng → 0 (giữ luồng coder đơn — backward-compat).
+  local n_subtasks=0
+  if jq -e '(.coder_subtasks | type == "array") and (.coder_subtasks | length > 0)' <<<"$plan_json" >/dev/null 2>&1; then
+    n_subtasks="$(jq -r '.coder_subtasks | length' <<<"$plan_json")"
+  fi
+
+  # required_agents: gate spawn theo plan. Thiếu field / parse lỗi → full pipeline (backward-compat).
+  if jq -e '.required_agents | type == "array"' <<<"$plan_json" >/dev/null 2>&1; then
+    local _ra; _ra="$(jq -r '.required_agents[]' <<<"$plan_json" 2>/dev/null | tr '\n' ' ')"
+    # coder luôn chạy — ép có mặt dù plan quên liệt kê
+    [[ " $_ra " == *" coder "* ]] || _ra="coder $_ra"
+    PAGENT_GATE=1
+    PAGENT_REQUIRED_AGENTS=" $_ra "
+    log "  required_agents: $(c_green "$_ra")"
+  else
+    PAGENT_GATE=0
+    PAGENT_REQUIRED_AGENTS=""
+    log "$(c_dim '  required_agents: (thiếu/parse lỗi) → chạy full pipeline')"
+  fi
+
   log "  title: $(c_green "$title")  risk=$risk"
 
   #────── 1b. Designer (feature, khi task động đến UI) ──────
-  local design_spec=""
-  if [[ "$mode" == "feature" ]] && \
-     printf '%s\n%s\n%s' "$task" "$coder_task" "$affected" \
-       | grep -qiE 'ui|giao diện|screen|màn hình|component|layout|button|form|page|frontend|design|css|style|màu|theme|icon|responsive'; then
+  # Gating: nếu plan có required_agents → theo list; nếu không → fallback keyword-detect.
+  local design_spec="" want_designer=0
+  if [[ "$mode" == "feature" ]]; then
+    if [[ "${PAGENT_GATE}" == "1" ]]; then
+      agent_enabled designer && want_designer=1
+    elif printf '%s\n%s\n%s' "$task" "$coder_task" "$affected" \
+           | grep -qiE 'ui|giao diện|screen|màn hình|component|layout|button|form|page|frontend|design|css|style|màu|theme|icon|responsive'; then
+      want_designer=1
+    fi
+  fi
+  if [[ "$mode" == "feature" && "${PAGENT_GATE}" == "1" && $want_designer -eq 0 ]]; then
+    log_skip "designer — không nằm trong required_agents"
+  fi
+  if (( want_designer )); then
     log "$(c_cyan '[+]') designer → design spec"
     local designer_text
     designer_text="$( {
@@ -516,20 +565,64 @@ cmd_pipeline() {
 
   #────── 2. Coder ↔ Reviewer loop ──────
   local round=1 verdict="CHANGES_REQUESTED" coder_input="$coder_task"
+  local review_enabled=1
+  if ! agent_enabled reviewer; then
+    review_enabled=0
+    log_skip "reviewer — không nằm trong required_agents (coder chạy 1 vòng, không review)"
+  fi
   while (( round <= PAGENT_MAX_REVIEW_ROUND )) && [[ "$verdict" != "APPROVED" ]]; do
-    log "$(c_cyan "[2/4]") coder round $round"
-    {
-      echo "## TASK"; echo "$coder_input"; echo
-      if [[ -n "$design_spec" ]]; then
-        echo "## DESIGN_SPEC"
-        echo "Tuân thủ design spec JSON dưới (design tokens, component, layout, accessibility). Dùng token thay vì hardcode màu/spacing."
-        echo "$design_spec"; echo
-      fi
-      if (( round > 1 )); then
-        echo "## PREVIOUS_REVIEW"; cat "$PAGENT_RUN_DIR/reviewer.txt"; echo
-        echo "## INSTRUCTION"; echo "Fix các điểm BLOCKING/MAJOR ở review trên rồi xuất CHANGES mới."
-      fi
-    } | call_agent coder >/dev/null || die "coder fail"
+    if (( n_subtasks > 1 && round == 1 )); then
+      # Plan lớn: spawn 1 coder cho mỗi subtask độc lập, gộp output → coder.txt.
+      # Subtask không đụng cùng file (orchestrator đảm bảo) nên chạy tuần tự an toàn,
+      # không lẫn diff. Reviewer chạy 1 lần sau khi gộp.
+      # call_agent coder LUÔN overwrite coder.txt (side-effect ghi .result) → tích lũy
+      # vào tmp riêng rồi copy 1 lần cuối, tránh mất output các subtask trước.
+      log "$(c_cyan "[2/4]") coder round $round — fan-out $n_subtasks subtask độc lập"
+      local tmp_coder="$PAGENT_RUN_DIR/coder.tmp"
+      : >"$tmp_coder"
+      local i sub_id sub_task sub_paths sub_out
+      for (( i=0; i<n_subtasks; i++ )); do
+        sub_id="$(jq -r ".coder_subtasks[$i].id // \"sub$((i+1))\"" <<<"$plan_json")"
+        sub_task="$(jq -r ".coder_subtasks[$i].coder_task // \"\"" <<<"$plan_json")"
+        sub_paths="$(jq -r ".coder_subtasks[$i].affected_paths // [] | join(\", \")" <<<"$plan_json")"
+        log "  $(c_cyan "[coder:$sub_id]") ${sub_paths:-(no paths)}"
+        sub_out="$( {
+          echo "## TASK"; echo "$sub_task"; echo
+          [[ -n "$sub_paths" ]] && { echo "## AFFECTED_PATHS"; echo "$sub_paths"; echo; }
+          if [[ -n "$design_spec" ]]; then
+            echo "## DESIGN_SPEC"
+            echo "Tuân thủ design spec JSON dưới (design tokens, component, layout, accessibility). Dùng token thay vì hardcode màu/spacing."
+            echo "$design_spec"; echo
+          fi
+          echo "## SUBTASK_SCOPE"
+          echo "Đây là 1 subtask ĐỘC LẬP trong plan lớn — CHỈ sửa file thuộc AFFECTED_PATHS, KHÔNG động file của subtask khác."
+        } | call_agent coder )" || die "coder subtask $sub_id fail"
+        {
+          printf '### Subtask %s — %s\n\n' "$sub_id" "${sub_paths:-(no paths)}"
+          printf '%s\n\n' "$sub_out"
+        } >>"$tmp_coder"
+      done
+      cp "$tmp_coder" "$PAGENT_RUN_DIR/coder.txt"
+    else
+      log "$(c_cyan "[2/4]") coder round $round"
+      {
+        echo "## TASK"; echo "$coder_input"; echo
+        if [[ -n "$design_spec" ]]; then
+          echo "## DESIGN_SPEC"
+          echo "Tuân thủ design spec JSON dưới (design tokens, component, layout, accessibility). Dùng token thay vì hardcode màu/spacing."
+          echo "$design_spec"; echo
+        fi
+        if (( round > 1 )); then
+          echo "## PREVIOUS_REVIEW"; cat "$PAGENT_RUN_DIR/reviewer.txt"; echo
+          echo "## INSTRUCTION"; echo "Fix các điểm BLOCKING/MAJOR ở review trên rồi xuất CHANGES mới."
+        fi
+      } | call_agent coder >/dev/null || die "coder fail"
+    fi
+
+    if (( review_enabled == 0 )); then
+      verdict="SKIPPED"   # không review → thoát loop sau khi coder chạy 1 vòng
+      break
+    fi
 
     log "$(c_cyan "[3/4]") reviewer (focus: $reviewer_focus)"
     {
@@ -546,12 +639,19 @@ cmd_pipeline() {
     round=$((round+1))
   done
 
-  if [[ "$verdict" != "APPROVED" ]] && (( PAGENT_MAX_REVIEW_ROUND > 0 )); then
+  if [[ "$verdict" != "APPROVED" && "$verdict" != "SKIPPED" ]] && (( PAGENT_MAX_REVIEW_ROUND > 0 )); then
     warn "reviewer chưa APPROVE sau $((round-1)) vòng — vẫn tiếp tục để tester verify"
   fi
 
   #────── 4. Tester ──────
-  if [[ -n "$tester_task" ]] || [[ "$mode" == "feature" ]]; then
+  # Gating: plan có required_agents → theo list; nếu không → fallback (tester_task hoặc feature).
+  local run_tester=0
+  if [[ "${PAGENT_GATE}" == "1" ]]; then
+    agent_enabled tester && run_tester=1
+  elif [[ -n "$tester_task" ]] || [[ "$mode" == "feature" ]]; then
+    run_tester=1
+  fi
+  if (( run_tester )); then
     log "$(c_cyan '[4/4]') tester"
     local tt="${tester_task:-Sinh test phù hợp cho thay đổi vừa rồi.}"
     {
@@ -559,6 +659,8 @@ cmd_pipeline() {
       echo "## TESTER_TASK"; echo "$tt"; echo
       echo "## CODER_CHANGES"; cat "$PAGENT_RUN_DIR/coder.txt"
     } | call_agent tester >/dev/null || warn "tester fail (tiếp tục)"
+  elif [[ "${PAGENT_GATE}" == "1" ]]; then
+    log_skip "tester — không nằm trong required_agents"
   else
     log "$(c_dim 'tester skipped (hotfix không cần)')"
   fi

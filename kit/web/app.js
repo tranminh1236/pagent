@@ -148,6 +148,163 @@ function renderTimeline(steps) {
   return `<div class="timeline">${parts.join('')}</div>`;
 }
 
+// ── chat composer ──
+let chatMode = 'feature';
+let draftId = null;
+let attachments = [];      // {path, name, is_image, url}
+let activeTaskId = null;
+let chatPoll = null;
+let pollTicks = 0;
+
+function newDraftId() { draftId = 'draft-' + Date.now() + '-' + Math.floor(1000 + Math.random() * 9000); }
+function scrollStream() { const s = $('#chat-stream'); s.scrollTop = s.scrollHeight; }
+function clearStreamPlaceholder() { const ph = $('#chat-stream .idle-msg'); if (ph) ph.remove(); }
+
+function updateSendState() {
+  const btn = $('#send-btn');
+  btn.disabled = !$('#task-input').value.trim() || !project || btn.classList.contains('loading');
+}
+
+function setMode(mode) {
+  chatMode = mode;
+  $('#mode-toggle').querySelectorAll('.mode-opt').forEach(b => {
+    const on = b.dataset.mode === mode;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-checked', on ? 'true' : 'false');
+  });
+}
+
+function renderPreviews() {
+  $('#file-previews').innerHTML = attachments.map((a, i) =>
+    a.is_image && a.url
+      ? `<div class="thumb"><img src="${a.url}" alt="${esc(a.name)}">
+           <button class="thumb-x" data-i="${i}" aria-label="Xoá ${esc(a.name)}">×</button></div>`
+      : `<div class="file-chip"><span class="file-chip-name">${esc(a.name)}</span>
+           <button class="thumb-x" data-i="${i}" aria-label="Xoá ${esc(a.name)}">×</button></div>`
+  ).join('');
+  $('#file-previews').querySelectorAll('.thumb-x').forEach(b =>
+    b.addEventListener('click', () => { attachments.splice(+b.dataset.i, 1); renderPreviews(); }));
+}
+
+async function uploadFiles(files) {
+  if (!project) return;
+  for (const file of files) {
+    const localUrl = file.type.startsWith('image/') ? URL.createObjectURL(file) : null;
+    const fd = new FormData();
+    fd.append('task', draftId);
+    fd.append('file', file, file.name);
+    try {
+      const r = await (await fetch(`/api/projects/${encodeURIComponent(project)}/upload`, { method: 'POST', body: fd })).json();
+      if (r.error) { showChatError(r.error); continue; }
+      attachments.push({ path: r.path, name: r.name, is_image: r.is_image, url: localUrl });
+      renderPreviews();
+    } catch (e) { showChatError(String(e)); }
+  }
+}
+
+function showChatError(msg) {
+  clearStreamPlaceholder();
+  $('#chat-stream').insertAdjacentHTML('beforeend', `<div class="msg msg-error">⚠ ${esc(msg)}</div>`);
+  scrollStream();
+}
+
+function appendUserMessage(task, atts, figma) {
+  clearStreamPlaceholder();
+  const chips = atts.map(a => `<span class="msg-chip">${a.is_image ? '🖼' : '📄'} ${esc(a.name)}</span>`).join('');
+  const fig = figma ? `<div class="msg-figma">figma: ${esc(figma)}</div>` : '';
+  $('#chat-stream').insertAdjacentHTML('beforeend',
+    `<div class="msg msg-user"><div class="msg-body">${esc(task)}</div>${chips ? `<div class="msg-chips">${chips}</div>` : ''}${fig}</div>`);
+  scrollStream();
+}
+
+function ensureAgentBubble(id) {
+  let el = document.getElementById('agent-msg-' + id);
+  if (!el) {
+    $('#chat-stream').insertAdjacentHTML('beforeend',
+      `<div class="msg msg-agent" id="agent-msg-${esc(id)}"><div class="msg-meta dim">đang khởi chạy…</div><div class="msg-timeline"></div></div>`);
+    el = document.getElementById('agent-msg-' + id);
+  }
+  return el;
+}
+
+function startChatPoll() { stopChatPoll(); pollTicks = 0; pollChat(); chatPoll = setInterval(pollChat, 2500); }
+function stopChatPoll() { if (chatPoll) clearInterval(chatPoll); chatPoll = null; }
+
+async function pollChat() {
+  if (!activeTaskId || !project) return stopChatPoll();
+  if (++pollTicks > 600) {   // ~25 min safety stop
+    const meta = ensureAgentBubble(activeTaskId).querySelector('.msg-meta');
+    if (meta) meta.textContent = 'timeout — reload để xem kết quả';
+    return stopChatPoll();
+  }
+  const bubble = ensureAgentBubble(activeTaskId);
+  try {
+    const live = await j(`/api/projects/${encodeURIComponent(project)}/live`);
+    const hit = live.find(t => t.task_id === activeTaskId);
+    if (hit) {
+      const running = (hit.active || []).map(a => a.agent).join(', ');
+      bubble.querySelector('.msg-meta').textContent = `${hit.mode} · ${running || '…'} đang chạy`;
+      bubble.querySelector('.msg-timeline').innerHTML = renderTimeline(hit.timeline || []);
+    } else {
+      const tasks = await j(`/api/projects/${encodeURIComponent(project)}/tasks`);
+      const done = tasks.find(t => t.task_id === activeTaskId);
+      if (done) {
+        const detail = await j(`/api/projects/${encodeURIComponent(project)}/tasks/${encodeURIComponent(done.id)}`);
+        bubble.querySelector('.msg-meta').innerHTML =
+          `✓ hoàn thành · <a href="#" class="open-report">xem report</a>`;
+        bubble.querySelector('.msg-timeline').innerHTML = renderTimeline(detail.timeline || []);
+        bubble.querySelector('.open-report').addEventListener('click', (e) => { e.preventDefault(); showDetail(done.id); });
+        stopChatPoll();
+        refresh();
+      }
+    }
+  } catch (e) { /* transient; keep polling */ }
+  scrollStream();
+}
+
+async function sendChat() {
+  const task = $('#task-input').value.trim();
+  if (!task || !project) return;
+  const figma = $('#figma-url').value.trim();
+  const btn = $('#send-btn');
+  btn.classList.add('loading'); updateSendState();
+  try {
+    const r = await (await fetch(`/api/projects/${encodeURIComponent(project)}/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: chatMode, task, attachments: attachments.map(a => a.path), figma_url: figma }),
+    })).json();
+    if (r.error) { showChatError(r.error); return; }
+    appendUserMessage(task, attachments, figma);
+    activeTaskId = r.task_id;
+    ensureAgentBubble(activeTaskId);
+    $('#task-input').value = ''; $('#figma-url').value = '';
+    attachments = []; renderPreviews(); newDraftId();
+    autoGrow();
+    startChatPoll();
+  } catch (e) { showChatError(String(e)); }
+  finally { btn.classList.remove('loading'); updateSendState(); }
+}
+
+function autoGrow() {
+  const ta = $('#task-input');
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
+}
+
+// wiring
+newDraftId();
+$('#mode-toggle').querySelectorAll('.mode-opt').forEach(b => b.addEventListener('click', () => setMode(b.dataset.mode)));
+$('#task-input').addEventListener('input', () => { autoGrow(); updateSendState(); });
+$('#task-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
+$('#send-btn').addEventListener('click', sendChat);
+$('#file-input').addEventListener('change', (e) => { uploadFiles([...e.target.files]); e.target.value = ''; });
+const dz = $('#dropzone');
+['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('drag-over'); }));
+['dragleave', 'drop'].forEach(ev => dz.addEventListener(ev, (e) => { e.preventDefault(); if (ev === 'dragleave' && dz.contains(e.relatedTarget)) return; dz.classList.remove('drag-over'); }));
+dz.addEventListener('drop', (e) => { if (e.dataTransfer && e.dataTransfer.files.length) uploadFiles([...e.dataTransfer.files]); });
+
 $('#project').addEventListener('change', (e) => { project = e.target.value; refresh(); });
 $('#refresh-btn').addEventListener('click', refresh);
 $('#modal-close').addEventListener('click', () => $('#modal').classList.add('hidden'));

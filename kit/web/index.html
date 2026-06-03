@@ -22,6 +22,37 @@
 </header>
 
 <main>
+  <section id="chat-section">
+    <div class="section-head">
+      <h2>Chat — feature / fix</h2>
+      <div id="mode-toggle" class="mode-toggle" role="radiogroup" aria-label="Chế độ">
+        <button type="button" class="mode-opt active" role="radio" aria-checked="true" data-mode="feature">feature</button>
+        <button type="button" class="mode-opt" role="radio" aria-checked="false" data-mode="fix">fix</button>
+      </div>
+    </div>
+
+    <div id="chat-stream" class="chat-stream" aria-live="polite">
+      <div class="idle-msg">Nhập task để khởi chạy pipeline. Đính kèm ảnh/figma → bật designer.</div>
+    </div>
+
+    <div class="composer">
+      <div id="dropzone" class="dropzone">
+        <input type="file" id="file-input" multiple hidden aria-label="Chọn file đính kèm">
+        <label for="file-input" class="dropzone-label">
+          Kéo-thả file vào đây hoặc <span class="link">chọn file</span>
+        </label>
+        <div id="file-previews" class="file-previews"></div>
+      </div>
+      <input type="url" id="figma-url" class="figma-input" placeholder="Figma URL (tuỳ chọn — để so design)" aria-label="Figma URL">
+      <textarea id="task-input" class="task-input" rows="2"
+        placeholder="Mô tả task… (Enter để gửi, Shift+Enter xuống dòng)" aria-label="Task"></textarea>
+      <div class="composer-foot">
+        <span class="hint dim">Enter để gửi · Shift+Enter xuống dòng</span>
+        <button id="send-btn" class="send-btn" disabled>Send</button>
+      </div>
+    </div>
+  </section>
+
   <section id="live-section">
     <div class="section-head">
       <h2><span class="dot" id="live-dot"></span>Live</h2>
