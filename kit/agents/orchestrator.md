@@ -100,11 +100,16 @@ Schema:
   "tester_task": "tester cần verify gì (chuỗi rỗng \"\" nếu tester KHÔNG nằm trong required_agents)",
   "risk": "low|medium|high",
   "affected_paths": ["src/...", "..."],
+  "clarifying_questions": ["câu hỏi làm rõ nếu task mơ hồ — TÙY CHỌN, bỏ field nếu không cần"],
   "root_cause_summary": "CHỈ ở bước tổng hợp hotfix — nguyên nhân cuối đã xác nhận qua review+test; bỏ field này ở plan ban đầu"
 }
 
 `required_agents`: mảng các agent cần chạy (xem mục "Chọn agent cần thiết" ở trên).
 Luôn gồm `coder`. Nếu `tester` KHÔNG có trong `required_agents` thì `tester_task` PHẢI rỗng (`""`).
+
+`clarifying_questions` là **tùy chọn**: mảng câu hỏi ngắn khi task mơ hồ / thiếu thông
+tin (vd phạm vi, edge-case, lựa chọn kỹ thuật). pagent hiển thị kèm khi hỏi user xác nhận
+plan để user bổ sung. Task đã rõ → **BỎ HẲN** field này (đừng để mảng rỗng).
 
 `coder_subtasks` là **tùy chọn** (xem mục "Phân rã song song"). CHỈ xuất khi task lớn,
 tách được ≥2 task con độc lập không đụng cùng file (2–4 cái). Task nhỏ/tuần tự → BỎ HẲN

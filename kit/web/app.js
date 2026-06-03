@@ -24,6 +24,16 @@ const fmtAgo = (ts) => {
 };
 
 let project = null;
+// Chat tách theo project: mỗi project giữ riêng nội dung stream + task đang theo dõi + offset log.
+// chatState[proj] = { streamHTML, activeTaskId, logOffset }
+const chatState = {};
+const CHAT_PLACEHOLDER =
+  '<div class="idle-msg">Nhập task để khởi chạy pipeline. Đính kèm ảnh/figma → bật designer.</div>';
+
+function getChatState(proj) {
+  if (!chatState[proj]) chatState[proj] = { streamHTML: null, activeTaskId: null, logOffset: 0 };
+  return chatState[proj];
+}
 
 async function loadProjects() {
   const projs = await j('/api/projects');
@@ -31,8 +41,46 @@ async function loadProjects() {
   sel.innerHTML = projs.length
     ? projs.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('')
     : '<option value="">(no projects)</option>';
-  project = projs[0] || null;
-  if (project) refresh();
+  const first = projs[0] || null;
+  if (first) switchProject(first);
+}
+
+// Đổi project: lưu state hiện tại, dừng poll cũ, nạp lại stream của project đích,
+// rồi re-attach task đang chạy (nếu có) để biết 'đang chạy / hoàn thành'.
+async function switchProject(newProj) {
+  if (project) {
+    const cur = getChatState(project);
+    cur.streamHTML = $('#chat-stream').innerHTML;
+    cur.activeTaskId = activeTaskId;
+    cur.logOffset = logOffset;
+  }
+  stopChatPoll();
+  project = newProj;
+  const st = getChatState(newProj);
+  $('#chat-stream').innerHTML = st.streamHTML != null ? st.streamHTML : CHAT_PLACEHOLDER;
+  activeTaskId = st.activeTaskId;
+  logOffset = st.logOffset || 0;
+  updateSendState();
+  refresh();
+  await attachLive(newProj);                       // phát hiện task còn chạy → dựng bubble + poll
+  // attachLive đã startChatPoll() nếu tìm thấy task running. Guard project===newProj phòng
+  // re-entrant switch: user đổi project lần nữa trong lúc await → đừng arm poll cho project cũ.
+  if (project === newProj && activeTaskId && !chatPoll) startChatPoll();  // khôi phục để bắt 'done' + tail log
+}
+
+// Re-attach: hỏi /live, nếu có task đang chạy thì dựng lại agent bubble + arm poll đúng project.
+async function attachLive(proj) {
+  try {
+    const live = await j(`/api/projects/${encodeURIComponent(proj)}/live`);
+    if (proj !== project || !live.length) return;
+    const t = live[0];                             // live sort desc theo ts → task mới nhất
+    if (activeTaskId !== t.task_id) { activeTaskId = t.task_id; logOffset = 0; }
+    const bubble = ensureAgentBubble(activeTaskId);
+    const running = (t.active || []).map(a => a.agent).join(', ');
+    bubble.querySelector('.msg-meta').textContent = `${t.mode} · ${running || '…'} đang chạy`;
+    bubble.querySelector('.msg-timeline').innerHTML = renderTimeline(t.timeline || []);
+    startChatPoll();
+  } catch (e) { /* transient; bỏ qua */ }
 }
 
 async function refresh() {
@@ -163,6 +211,7 @@ let attachments = [];      // {path, name, is_image, url}
 let activeTaskId = null;
 let chatPoll = null;
 let pollTicks = 0;
+let logOffset = 0;         // byte offset đã đọc của log task hiện tại (tail incremental)
 
 function newDraftId() { draftId = 'draft-' + Date.now() + '-' + Math.floor(1000 + Math.random() * 9000); }
 function scrollStream() { const s = $('#chat-stream'); s.scrollTop = s.scrollHeight; }
@@ -229,7 +278,7 @@ function ensureAgentBubble(id) {
   let el = document.getElementById('agent-msg-' + id);
   if (!el) {
     $('#chat-stream').insertAdjacentHTML('beforeend',
-      `<div class="msg msg-agent" id="agent-msg-${esc(id)}"><div class="msg-meta dim">đang khởi chạy…</div><div class="msg-timeline"></div></div>`);
+      `<div class="msg msg-agent" id="agent-msg-${esc(id)}"><div class="msg-meta dim">đang khởi chạy…</div><div class="msg-timeline"></div><pre class="msg-log" hidden></pre></div>`);
     el = document.getElementById('agent-msg-' + id);
   }
   return el;
@@ -239,35 +288,65 @@ function startChatPoll() { stopChatPoll(); pollTicks = 0; pollChat(); chatPoll =
 function stopChatPoll() { if (chatPoll) clearInterval(chatPoll); chatPoll = null; }
 
 async function pollChat() {
-  if (!activeTaskId || !project) return stopChatPoll();
+  // Snapshot project/task ở đầu hàm: pollChat là async, đọc globals sau mỗi await.
+  // stopChatPoll() chỉ huỷ interval — KHÔNG cancel promise đang in-flight. Nếu switchProject
+  // chạy giữa chừng (ghi đè project/activeTaskId/logOffset), promise cũ resume với state của
+  // project mới → rò log/timeline project này vào stream project khác. Bail khi stale.
+  const proj = project, tid = activeTaskId;
+  if (!tid || !proj) return stopChatPoll();
+  const stale = () => proj !== project || tid !== activeTaskId;
   if (++pollTicks > 600) {   // ~25 min safety stop
-    const meta = ensureAgentBubble(activeTaskId).querySelector('.msg-meta');
+    const meta = ensureAgentBubble(tid).querySelector('.msg-meta');
     if (meta) meta.textContent = 'timeout — reload để xem kết quả';
     return stopChatPoll();
   }
-  const bubble = ensureAgentBubble(activeTaskId);
+  const bubble = ensureAgentBubble(tid);
   try {
-    const live = await j(`/api/projects/${encodeURIComponent(project)}/live`);
-    const hit = live.find(t => t.task_id === activeTaskId);
+    const live = await j(`/api/projects/${encodeURIComponent(proj)}/live`);
+    if (stale()) return;
+    const hit = live.find(t => t.task_id === tid);
+    await fetchChatLog(bubble, proj, tid);
+    if (stale()) return;
     if (hit) {
       const running = (hit.active || []).map(a => a.agent).join(', ');
       bubble.querySelector('.msg-meta').textContent = `${hit.mode} · ${running || '…'} đang chạy`;
       bubble.querySelector('.msg-timeline').innerHTML = renderTimeline(hit.timeline || []);
     } else {
-      const tasks = await j(`/api/projects/${encodeURIComponent(project)}/tasks`);
-      const done = tasks.find(t => t.task_id === activeTaskId);
+      const tasks = await j(`/api/projects/${encodeURIComponent(proj)}/tasks`);
+      if (stale()) return;
+      const done = tasks.find(t => t.task_id === tid);
       if (done) {
-        const detail = await j(`/api/projects/${encodeURIComponent(project)}/tasks/${encodeURIComponent(done.id)}`);
+        const detail = await j(`/api/projects/${encodeURIComponent(proj)}/tasks/${encodeURIComponent(done.id)}`);
+        if (stale()) return;
         bubble.querySelector('.msg-meta').innerHTML =
-          `✓ hoàn thành · <a href="#" class="open-report">xem report</a>`;
+          `✓ hoàn thành · <a href="#" class="open-report" data-report-id="${esc(done.id)}">xem report</a>`;
         bubble.querySelector('.msg-timeline').innerHTML = renderTimeline(detail.timeline || []);
-        bubble.querySelector('.open-report').addEventListener('click', (e) => { e.preventDefault(); showDetail(done.id); });
+        await fetchChatLog(bubble, proj, tid);   // gom nốt phần log ghi ra ngay trước khi pagent thoát
+        if (stale()) return;
         stopChatPoll();
         refresh();
       }
+      // chưa có trong live và chưa done → pagent đang khởi chạy, tiếp tục poll
     }
   } catch (e) { /* transient; keep polling */ }
-  scrollStream();
+  if (!stale()) scrollStream();
+}
+
+// Tail log per-task: fetch từ logOffset, append text (esc tự nhiên qua text node) vào khối terminal.
+// proj/tid được snapshot bởi caller; bail khi stale để không append/ghi offset nhầm project.
+async function fetchChatLog(bubble, proj, tid) {
+  if (!tid || !proj) return;
+  const off = logOffset;
+  try {
+    const r = await j(`/api/projects/${encodeURIComponent(proj)}/chat-log/${encodeURIComponent(tid)}?offset=${off}`);
+    if (proj !== project || tid !== activeTaskId) return;   // user đã đổi project/task khi đang fetch
+    if (r.error) return;
+    if (r.data) {
+      const log = bubble.querySelector('.msg-log');
+      if (log) { log.hidden = false; log.insertAdjacentText('beforeend', r.data); }
+    }
+    if (typeof r.offset === 'number') logOffset = r.offset;
+  } catch (e) { /* transient; keep polling */ }
 }
 
 async function sendChat() {
@@ -284,6 +363,7 @@ async function sendChat() {
     if (r.error) { showChatError(r.error); return; }
     appendUserMessage(task, attachments, figma);
     activeTaskId = r.task_id;
+    logOffset = 0;
     ensureAgentBubble(activeTaskId);
     $('#task-input').value = ''; $('#figma-url').value = '';
     attachments = []; renderPreviews(); newDraftId();
@@ -313,7 +393,12 @@ const dz = $('#dropzone');
 ['dragleave', 'drop'].forEach(ev => dz.addEventListener(ev, (e) => { e.preventDefault(); if (ev === 'dragleave' && dz.contains(e.relatedTarget)) return; dz.classList.remove('drag-over'); }));
 dz.addEventListener('drop', (e) => { if (e.dataTransfer && e.dataTransfer.files.length) uploadFiles([...e.dataTransfer.files]); });
 
-$('#project').addEventListener('change', (e) => { project = e.target.value; refresh(); });
+$('#project').addEventListener('change', (e) => { switchProject(e.target.value); });
+// Delegation: link 'xem report' tồn tại qua các lần restore innerHTML khi đổi project.
+$('#chat-stream').addEventListener('click', (e) => {
+  const a = e.target.closest('.open-report');
+  if (a) { e.preventDefault(); showDetail(a.dataset.reportId); }
+});
 $('#refresh-btn').addEventListener('click', refresh);
 $('#modal-close').addEventListener('click', () => $('#modal').classList.add('hidden'));
 $('#modal').addEventListener('click', (e) => { if (e.target.id === 'modal') $('#modal').classList.add('hidden'); });

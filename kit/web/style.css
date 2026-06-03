@@ -150,6 +150,14 @@ tr.row:hover { background: var(--panel-2); }
 .msg-meta .open-report { color: var(--accent); text-decoration: none; }
 .msg-meta .open-report:hover { text-decoration: underline; }
 .msg-timeline .timeline { flex-wrap: wrap; }
+.msg-log {
+  margin: 8px 0 0; padding: 10px 12px; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 6px;
+  font-family: var(--mono); font-size: 11px; line-height: 1.5; color: var(--dim);
+  white-space: pre-wrap; word-break: break-word; overflow-x: auto;
+  max-height: 240px; overflow-y: auto;
+}
+.msg-log[hidden] { display: none; }
 
 .composer { display: flex; flex-direction: column; gap: 10px; }
 .dropzone {

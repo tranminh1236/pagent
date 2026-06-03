@@ -445,6 +445,68 @@ cmd_init() {
   fi
 }
 
+# Truthy: 1|true|yes|on (case-insensitive) — dùng cho cờ env confirm. Bash 3.2-safe.
+_is_truthy() {
+  case "$1" in
+    1|true|TRUE|True|yes|YES|Yes|on|ON|On) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Confirm gate sau khi orchestrator ra plan: in tóm tắt cho user qua stderr rồi hỏi qua /dev/tty.
+#   return 0  → user xác nhận / bỏ qua gate → tiếp tục pipeline
+#   return 1  → user nhập text bổ sung (set CONFIRM_EXTRA) → caller re-run orchestrator
+#   n/q       → hủy gọn (exit 0)
+# Tự bỏ qua (return 0) khi PAGENT_NO_CONFIRM/PAGENT_YES truthy, hoặc không có tty
+# → giữ backward-compat cho chạy tự động / web.
+confirm_plan_gate() {
+  local pj="$1"
+  CONFIRM_EXTRA=""
+
+  if _is_truthy "${PAGENT_NO_CONFIRM:-}" || _is_truthy "${PAGENT_YES:-}"; then
+    return 0
+  fi
+  if [[ ! -t 0 || ! -e /dev/tty ]]; then
+    return 0
+  fi
+
+  local q_title q_summary q_coder q_agents q_risk q_affected
+  q_title="$(jq -r '.title // "(no title)"' <<<"$pj" 2>/dev/null)"
+  q_summary="$(jq -r '.summary // "(no summary)"' <<<"$pj" 2>/dev/null)"
+  q_coder="$(jq -r '.coder_task // "(no coder_task)"' <<<"$pj" 2>/dev/null)"
+  q_agents="$(jq -r '.required_agents // [] | join(", ")' <<<"$pj" 2>/dev/null)"
+  q_risk="$(jq -r '.risk // "medium"' <<<"$pj" 2>/dev/null)"
+  q_affected="$(jq -r '.affected_paths // [] | join(", ")' <<<"$pj" 2>/dev/null)"
+
+  {
+    printf '\n%s\n' "$(c_cyan '──────── PLAN cần xác nhận ────────')"
+    printf '  %s %s\n' "$(c_dim 'title      :')" "$q_title"
+    printf '  %s %s\n' "$(c_dim 'summary    :')" "$q_summary"
+    printf '  %s %s\n' "$(c_dim 'coder_task :')" "$q_coder"
+    printf '  %s %s\n' "$(c_dim 'agents     :')" "${q_agents:-(full pipeline)}"
+    printf '  %s %s\n' "$(c_dim 'risk       :')" "$q_risk"
+    printf '  %s %s\n' "$(c_dim 'affected   :')" "${q_affected:-(none)}"
+  } >&2
+
+  # clarifying_questions (optional): orchestrator có thể hỏi lại để user bổ sung.
+  if jq -e '(.clarifying_questions | type == "array") and (.clarifying_questions | length > 0)' <<<"$pj" >/dev/null 2>&1; then
+    printf '  %s\n' "$(c_yellow 'orchestrator hỏi:')" >&2
+    jq -r '.clarifying_questions[]' <<<"$pj" 2>/dev/null | while IFS= read -r _q; do
+      printf '    • %s\n' "$_q" >&2
+    done
+  fi
+
+  printf '\n%s ' "$(c_cyan '[Enter/y] chạy · [n/q] hủy · hoặc gõ thông tin bổ sung →')" >&2
+  local reply
+  IFS= read -r reply </dev/tty || { printf '\n' >&2; return 0; }
+
+  case "$reply" in
+    ""|y|Y|yes|YES|có|co) return 0 ;;
+    n|N|q|Q|no|NO)        log "$(c_yellow 'hủy') bởi user — không chạy pipeline"; exit 0 ;;
+    *)                    CONFIRM_EXTRA="$reply"; return 1 ;;
+  esac
+}
+
 cmd_pipeline() {
   local mode="$1" task="$2"
   [[ "$mode" =~ ^(feature|hotfix)$ ]] || die "mode phải là feature hoặc hotfix"
@@ -471,62 +533,80 @@ cmd_pipeline() {
     warn "chưa có .pagent/source-summary.md → chạy: pagent init"
   fi
 
-  #────── 1. Orchestrator ──────
+  #────── 1. Orchestrator (confirm gate → có thể re-run với info bổ sung) ──────
   log "$(c_cyan '[1/4]') orchestrator → lập plan"
-  local plan_text
-  plan_text="$( {
-    echo "## MODE"; echo "$mode"; echo
-    echo "## SOURCE_SUMMARY_PATH"; echo ".pagent/source-summary.md"; echo
-    echo "## TASK"; echo "$task"
-  } | call_agent orchestrator )" || die "orchestrator fail"
-
-  local plan_json
-  plan_json="$(echo "$plan_text" | extract_json 2>/dev/null || true)"
-  if ! jq -e '.title' <<<"$plan_json" >/dev/null 2>&1; then
-    warn "plan JSON không parse được — fallback plan tối thiểu"
-    warn "raw output ở: $PAGENT_RUN_DIR/orchestrator.txt (đầu 40 dòng):"
-    head -40 "$PAGENT_RUN_DIR/orchestrator.txt" >&2
-    plan_json="$(jq -n --arg task "$task" '{
-      title: "(orchestrator JSON parse fail)",
-      summary: "fallback — coder làm task trực tiếp",
-      coder_task: $task,
-      reviewer_focus: "general correctness",
-      tester_task: "",
-      risk: "medium",
-      affected_paths: []
-    }')"
-  fi
-
+  local plan_text plan_json
   local title coder_task reviewer_focus tester_task risk affected
-  title="$(jq -r '.title' <<<"$plan_json")"
-  coder_task="$(jq -r '.coder_task' <<<"$plan_json")"
-  reviewer_focus="$(jq -r '.reviewer_focus' <<<"$plan_json")"
-  tester_task="$(jq -r '.tester_task // ""' <<<"$plan_json")"
-  risk="$(jq -r '.risk // "medium"' <<<"$plan_json")"
-  affected="$(jq -r '.affected_paths // [] | join(", ")' <<<"$plan_json")"
-
-  # coder_subtasks (optional): plan lớn tách ≥2 task con độc lập → fan-out coder.
-  # Thiếu field / không phải mảng / rỗng → 0 (giữ luồng coder đơn — backward-compat).
   local n_subtasks=0
-  if jq -e '(.coder_subtasks | type == "array") and (.coder_subtasks | length > 0)' <<<"$plan_json" >/dev/null 2>&1; then
-    n_subtasks="$(jq -r '.coder_subtasks | length' <<<"$plan_json")"
-  fi
+  local extra_info="" orch_round=0 orch_max=3
 
-  # required_agents: gate spawn theo plan. Thiếu field / parse lỗi → full pipeline (backward-compat).
-  if jq -e '.required_agents | type == "array"' <<<"$plan_json" >/dev/null 2>&1; then
-    local _ra; _ra="$(jq -r '.required_agents[]' <<<"$plan_json" 2>/dev/null | tr '\n' ' ')"
-    # coder luôn chạy — ép có mặt dù plan quên liệt kê
-    [[ " $_ra " == *" coder "* ]] || _ra="coder $_ra"
-    PAGENT_GATE=1
-    PAGENT_REQUIRED_AGENTS=" $_ra "
-    log "  required_agents: $(c_green "$_ra")"
-  else
-    PAGENT_GATE=0
-    PAGENT_REQUIRED_AGENTS=""
-    log "$(c_dim '  required_agents: (thiếu/parse lỗi) → chạy full pipeline')"
-  fi
+  while :; do
+    plan_text="$( {
+      echo "## MODE"; echo "$mode"; echo
+      echo "## SOURCE_SUMMARY_PATH"; echo ".pagent/source-summary.md"; echo
+      echo "## TASK"; echo "$task"
+      # NB: phải dùng `if ... fi` (không phải `[[ ]] &&`) — đây là lệnh CUỐI của
+      # brace group bên trái pipe. Với `set -o pipefail`, `[[ -n "" ]]` (extra_info
+      # rỗng ở vòng đầu) exit 1 → cả pipeline nonzero dù call_agent OK → die oan.
+      if [[ -n "$extra_info" ]]; then echo; echo "## ADDITIONAL_INFO"; echo "$extra_info"; fi
+    } | call_agent orchestrator )" || die "orchestrator fail"
 
-  log "  title: $(c_green "$title")  risk=$risk"
+    plan_json="$(echo "$plan_text" | extract_json 2>/dev/null || true)"
+    if ! jq -e '.title' <<<"$plan_json" >/dev/null 2>&1; then
+      warn "plan JSON không parse được — fallback plan tối thiểu"
+      warn "raw output ở: $PAGENT_RUN_DIR/orchestrator.txt (đầu 40 dòng):"
+      head -40 "$PAGENT_RUN_DIR/orchestrator.txt" >&2
+      plan_json="$(jq -n --arg task "$task" '{
+        title: "(orchestrator JSON parse fail)",
+        summary: "fallback — coder làm task trực tiếp",
+        coder_task: $task,
+        reviewer_focus: "general correctness",
+        tester_task: "",
+        risk: "medium",
+        affected_paths: []
+      }')"
+    fi
+
+    title="$(jq -r '.title' <<<"$plan_json")"
+    coder_task="$(jq -r '.coder_task' <<<"$plan_json")"
+    reviewer_focus="$(jq -r '.reviewer_focus' <<<"$plan_json")"
+    tester_task="$(jq -r '.tester_task // ""' <<<"$plan_json")"
+    risk="$(jq -r '.risk // "medium"' <<<"$plan_json")"
+    affected="$(jq -r '.affected_paths // [] | join(", ")' <<<"$plan_json")"
+
+    # coder_subtasks (optional): plan lớn tách ≥2 task con độc lập → fan-out coder.
+    # Thiếu field / không phải mảng / rỗng → 0 (giữ luồng coder đơn — backward-compat).
+    n_subtasks=0
+    if jq -e '(.coder_subtasks | type == "array") and (.coder_subtasks | length > 0)' <<<"$plan_json" >/dev/null 2>&1; then
+      n_subtasks="$(jq -r '.coder_subtasks | length' <<<"$plan_json")"
+    fi
+
+    # required_agents: gate spawn theo plan. Thiếu field / parse lỗi → full pipeline (backward-compat).
+    if jq -e '.required_agents | type == "array"' <<<"$plan_json" >/dev/null 2>&1; then
+      local _ra; _ra="$(jq -r '.required_agents[]' <<<"$plan_json" 2>/dev/null | tr '\n' ' ')"
+      # coder luôn chạy — ép có mặt dù plan quên liệt kê
+      [[ " $_ra " == *" coder "* ]] || _ra="coder $_ra"
+      PAGENT_GATE=1
+      PAGENT_REQUIRED_AGENTS=" $_ra "
+      log "  required_agents: $(c_green "$_ra")"
+    else
+      PAGENT_GATE=0
+      PAGENT_REQUIRED_AGENTS=""
+      log "$(c_dim '  required_agents: (thiếu/parse lỗi) → chạy full pipeline')"
+    fi
+
+    log "  title: $(c_green "$title")  risk=$risk"
+
+    # User xác nhận plan / bổ sung info / hủy (tự bỏ qua khi không tty hoặc PAGENT_NO_CONFIRM/PAGENT_YES).
+    confirm_plan_gate "$plan_json" && break
+    orch_round=$((orch_round + 1))
+    extra_info="${extra_info:+$extra_info$'\n'}$CONFIRM_EXTRA"
+    if (( orch_round >= orch_max )); then
+      log "$(c_dim "  đã đạt $orch_max vòng bổ sung → tự tiếp tục với plan hiện tại")"
+      break
+    fi
+    log "  re-run orchestrator (vòng $((orch_round + 1))/$orch_max) với thông tin bổ sung…"
+  done
 
   #────── 1b. Designer (feature, khi task động đến UI) ──────
   # Gating: nếu plan có required_agents → theo list; nếu không → fallback keyword-detect.

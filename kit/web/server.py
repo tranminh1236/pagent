@@ -3,7 +3,7 @@
 import os, json, re, sys, random, shutil, subprocess
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 MAX_BODY = int(os.environ.get("PAGENT_MAX_UPLOAD", str(50 * 1024 * 1024)))  # 50MB
 _IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}
@@ -191,6 +191,33 @@ def task_detail(proj, task_filename):
             timeline = _task_timeline(proj, tid)
             return {"kind": kind, "content": content, "timeline": timeline, "task_id": tid}
     return {"error": "not found"}
+
+def read_chat_log(proj, tid, offset=0):
+    """Đọc tail log per-task (REPORTS/<proj>/logs/<tid>.log) kể từ byte `offset`.
+    Trả {data, offset}: offset mới = vị trí đọc tiếp theo để client tail incremental."""
+    try:
+        off = max(0, int(offset))
+    except (ValueError, TypeError):
+        off = 0
+    # tid là raw task_id (<ts>-<pid>-<rand>) — dùng _ID_RE như upload task id; _valid_tid
+    # chỉ khớp report-file stem (YYYY-MM-DD-…) nên không áp dụng được ở đây.
+    if not (_ID_RE.fullmatch(tid or "") and ".." not in (tid or "")):
+        return {"error": "task id không hợp lệ"}
+    logpath = _safe_join(REPORTS, proj, "logs", tid + ".log")
+    if not logpath:
+        return {"error": "đường dẫn log không hợp lệ"}
+    if not os.path.isfile(logpath):
+        return {"data": "", "offset": off}
+    try:
+        size = os.path.getsize(logpath)
+        if off > size:                 # file bị rút gọn/xoay → đọc lại từ đầu
+            off = 0
+        with open(logpath, "rb") as f:
+            f.seek(off)
+            chunk = f.read()
+        return {"data": chunk.decode("utf-8", "replace"), "offset": off + len(chunk)}
+    except Exception as e:
+        return {"error": f"đọc log thất bại: {e}"}
 
 def _task_timeline(proj, task_id):
     """Trả về sequence agent steps cho 1 task_id (orchestrator → coder → reviewer → ...)."""
@@ -408,7 +435,11 @@ class H(BaseHTTPRequestHandler):
             env["PAGENT_DESIGN"] = "1"   # gate figma/canvas MCP (xem pagent call_agent)
 
         full_task = _compose_task(task, safe_atts, figma_url)
-        logpath = _safe_join(REPORTS, proj, "chat.log")
+        logdir = _safe_join(REPORTS, proj, "logs")
+        if not logdir:
+            return self._j({"error": "đường dẫn log không hợp lệ"}, 400)
+        os.makedirs(logdir, exist_ok=True)
+        logpath = _safe_join(logdir, tid + ".log")   # per-task: 1 file/task để tail riêng
         if not logpath:
             return self._j({"error": "đường dẫn log không hợp lệ"}, 400)
         try:
@@ -462,7 +493,9 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
+            qs = parse_qs(parsed.query)
             if path == "/":               return self._f("index.html", "text/html; charset=utf-8")
             if path == "/app.js":         return self._f("app.js", "application/javascript")
             if path == "/style.css":      return self._f("style.css", "text/css")
@@ -480,6 +513,7 @@ class H(BaseHTTPRequestHandler):
             for suffix, fn in (
                 (r"/tasks",        lambda p:    self._j(list_tasks(p))),
                 (r"/tasks/(.+)",   lambda p, t: self._j(task_detail(p, t))),
+                (r"/chat-log/(.+)",lambda p, t: self._j(read_chat_log(p, t, (qs.get("offset") or ["0"])[0]))),
                 (r"/live",         lambda p:    self._j(live_tasks(p))),
                 (r"/agents",       lambda p:    self._j(agent_stats(p))),
             ):
