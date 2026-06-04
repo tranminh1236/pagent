@@ -1,7 +1,7 @@
 ---
 name: orchestrator
 description: Lead agent — phối hợp coder/reviewer/tester theo skill, ghi nhận feature/bug
-model: claude-opus-4-8
+model: claude-opus-4-6
 allowed_tools: Read Grep Glob Bash(ls *) Bash(cat *) Bash(head *) Bash(find *) Bash(git status:*) Bash(git diff:*) mcp__plugin_context7_context7__resolve-library-id mcp__plugin_context7_context7__query-docs
 disallowed_tools: Write,Edit,MultiEdit,NotebookEdit
 mcp_servers: context7
