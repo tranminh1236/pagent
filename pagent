@@ -171,7 +171,13 @@ call_openrouter() {
         cache_read_input_tokens:     ($r.usage.prompt_tokens_details.cached_tokens // 0),
         cache_creation_input_tokens: 0
       },
-      modelUsage: { ($r.model // $m): {} },
+      modelUsage: { ($r.model // $m): {
+        inputTokens:              ($r.usage.prompt_tokens // 0),
+        outputTokens:             ($r.usage.completion_tokens // 0),
+        cacheReadInputTokens:     ($r.usage.prompt_tokens_details.cached_tokens // 0),
+        cacheCreationInputTokens: 0,
+        costUSD:                  ($r.usage.cost // 0)
+      } },
       terminal_reason: (if $r.error then ($r.error.message // "error") else "completed" end),
       provider: "openrouter"
     }
@@ -617,7 +623,7 @@ cmd_pipeline() {
   log "$(c_cyan '[1/4]') orchestrator → lập plan"
   local plan_text plan_json
   local title coder_task reviewer_focus tester_task risk affected
-  local n_subtasks=0
+  local n_subtasks=0 n_tester_subtasks=0
   local extra_info="" orch_round=0 orch_max=3
 
   while :; do
@@ -659,6 +665,13 @@ cmd_pipeline() {
     n_subtasks=0
     if jq -e '(.coder_subtasks | type == "array") and (.coder_subtasks | length > 0)' <<<"$plan_json" >/dev/null 2>&1; then
       n_subtasks="$(jq -r '.coder_subtasks | length' <<<"$plan_json")"
+    fi
+
+    # tester_subtasks (optional): plan tách test ≥2 phạm vi độc lập → fan-out tester.
+    # Thiếu field / không phải mảng / rỗng → 0 (giữ luồng tester đơn — backward-compat).
+    n_tester_subtasks=0
+    if jq -e '(.tester_subtasks | type == "array") and (.tester_subtasks | length > 0)' <<<"$plan_json" >/dev/null 2>&1; then
+      n_tester_subtasks="$(jq -r '.tester_subtasks | length' <<<"$plan_json")"
     fi
 
     # required_agents: gate spawn theo plan. Thiếu field / parse lỗi → full pipeline (backward-compat).
@@ -746,6 +759,9 @@ cmd_pipeline() {
         sub_task="$(jq -r ".coder_subtasks[$i].coder_task // \"\"" <<<"$plan_json")"
         sub_paths="$(jq -r ".coder_subtasks[$i].affected_paths // [] | join(\", \")" <<<"$plan_json")"
         log "  $(c_cyan "[coder:$sub_id]") ${sub_paths:-(no paths)}"
+        # Gắn danh tính subtask vào pre/post hook → token log phân biệt được từng subagent,
+        # web hiển thị "subtask nào làm gì". Label ưu tiên task; rỗng → affected_paths.
+        export PAGENT_SUBTASK_ID="$sub_id" PAGENT_SUBTASK_LABEL="${sub_task:-$sub_paths}"
         sub_out="$( {
           echo "## TASK"; echo "$sub_task"; echo
           [[ -n "$sub_paths" ]] && { echo "## AFFECTED_PATHS"; echo "$sub_paths"; echo; }
@@ -756,7 +772,8 @@ cmd_pipeline() {
           fi
           echo "## SUBTASK_SCOPE"
           echo "Đây là 1 subtask ĐỘC LẬP trong plan lớn — CHỈ sửa file thuộc AFFECTED_PATHS, KHÔNG động file của subtask khác."
-        } | call_agent coder )" || die "coder subtask $sub_id fail"
+        } | call_agent coder )" || { unset PAGENT_SUBTASK_ID PAGENT_SUBTASK_LABEL; die "coder subtask $sub_id fail"; }
+        unset PAGENT_SUBTASK_ID PAGENT_SUBTASK_LABEL
         {
           printf '### Subtask %s — %s\n\n' "$sub_id" "${sub_paths:-(no paths)}"
           printf '%s\n\n' "$sub_out"
@@ -811,7 +828,38 @@ cmd_pipeline() {
   elif [[ -n "$tester_task" ]] || [[ "$mode" == "feature" ]]; then
     run_tester=1
   fi
-  if (( run_tester )); then
+  if (( run_tester && n_tester_subtasks > 1 )); then
+    # Plan tách test: spawn 1 tester cho mỗi subtask độc lập, gộp output → tester.txt.
+    # Subtask không đụng cùng file (orchestrator đảm bảo) nên chạy tuần tự an toàn.
+    # call_agent tester LUÔN overwrite tester.txt (side-effect ghi .result) → tích lũy
+    # vào tmp riêng rồi copy 1 lần cuối, tránh mất output các subtask trước.
+    log "$(c_cyan '[4/4]') tester — fan-out $n_tester_subtasks subtask độc lập"
+    local tmp_tester="$PAGENT_RUN_DIR/tester.tmp"
+    : >"$tmp_tester"
+    local ti tsub_id tsub_task tsub_paths tsub_out
+    for (( ti=0; ti<n_tester_subtasks; ti++ )); do
+      tsub_id="$(jq -r ".tester_subtasks[$ti].id // \"tsub$((ti+1))\"" <<<"$plan_json")"
+      tsub_task="$(jq -r ".tester_subtasks[$ti].tester_task // \"\"" <<<"$plan_json")"
+      tsub_paths="$(jq -r ".tester_subtasks[$ti].affected_paths // [] | join(\", \")" <<<"$plan_json")"
+      log "  $(c_cyan "[tester:$tsub_id]") ${tsub_paths:-(no paths)}"
+      # Gắn danh tính subtask (như coder fan-out) → web phân biệt từng tester subagent.
+      export PAGENT_SUBTASK_ID="$tsub_id" PAGENT_SUBTASK_LABEL="${tsub_task:-$tsub_paths}"
+      tsub_out="$( {
+        echo "## ORIGINAL_TASK"; echo "$task"; echo
+        echo "## TESTER_TASK"; echo "${tsub_task:-Sinh test phù hợp cho thay đổi vừa rồi.}"; echo
+        [[ -n "$tsub_paths" ]] && { echo "## AFFECTED_PATHS"; echo "$tsub_paths"; echo; }
+        echo "## SUBTASK_SCOPE"
+        echo "Đây là 1 subtask test ĐỘC LẬP — CHỈ test trong phạm vi AFFECTED_PATHS, KHÔNG đụng phạm vi của subtask khác."; echo
+        echo "## CODER_CHANGES"; cat "$PAGENT_RUN_DIR/coder.txt"
+      } | call_agent tester )" || warn "tester subtask $tsub_id fail (tiếp tục)"
+      unset PAGENT_SUBTASK_ID PAGENT_SUBTASK_LABEL
+      {
+        printf '### Subtask %s — %s\n\n' "$tsub_id" "${tsub_paths:-(no paths)}"
+        printf '%s\n\n' "$tsub_out"
+      } >>"$tmp_tester"
+    done
+    cp "$tmp_tester" "$PAGENT_RUN_DIR/tester.txt"
+  elif (( run_tester )); then
     log "$(c_cyan '[4/4]') tester"
     local tt="${tester_task:-Sinh test phù hợp cho thay đổi vừa rồi.}"
     {

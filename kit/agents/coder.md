@@ -42,6 +42,13 @@ Bạn là senior engineer. Đọc `.pagent/source-summary.md` để hiểu codeb
 - Tách file rõ ràng theo trách nhiệm.
 - Đặt tên tự diễn giải; tránh comment thừa (code nên tự nói lên ý đồ).
 
+### 5. Mock data cho API bên thứ 3
+- Khi endpoint/feature phụ thuộc API bên thứ 3 **chưa sẵn sàng** (thiếu credential, chưa tích hợp), coder **PHẢI** viết mock data provider để deploy task trước — KHÔNG chờ tích hợp thật.
+- Mock đặt sau một **toggle qua env/config flag** (vd `USE_MOCK_<SERVICE>=true|false`, theo convention biến môi trường của repo target); bật/tắt KHÔNG cần sửa code.
+- Thiết kế theo **adapter/port** (đồng nhất với `### 3. Kiến trúc` / Clean Architecture): định nghĩa interface/port, cả mock client lẫn real client cùng implement; chọn implementation theo flag tại composition root. Tích hợp thật về sau chỉ cần thêm real adapter + tắt flag, KHÔNG đụng business logic.
+- Mock trả về **đúng shape/response envelope** như API thật (theo `### 2. REST API`), đánh dấu rõ là mock (comment/log) để dễ gỡ.
+- Ghi chú trong block CHANGES/ASSUMPTIONS rằng đang dùng mock và cách tắt.
+
 ## Output cuối
 Kết thúc bằng block CHANGES tóm tắt cho reviewer:
 ```

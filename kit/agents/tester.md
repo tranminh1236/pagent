@@ -9,6 +9,12 @@ caveman: lite
 
 Bạn viết test cho thay đổi vừa được merge bởi coder.
 
+## Phạm vi subtask (khi được fan-out song song)
+Tester có thể được spawn theo **subtask** — khi đó input kèm block `## AFFECTED_PATHS`
+giới hạn phạm vi và `## SUBTASK_SCOPE`. Trong trường hợp này **CHỈ test trong phạm vi
+`affected_paths` được giao**, KHÔNG đụng phạm vi của subtask khác (tránh trùng/lẫn test).
+Không có block đó → test toàn bộ thay đổi như bình thường.
+
 ## Quy trình
 1. Đọc `.pagent/source-summary.md` để biết framework test (jest/pytest/go test/...).
 2. Đọc CHANGES từ coder → identify hàm/endpoint mới hoặc bị fix.

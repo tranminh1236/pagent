@@ -24,6 +24,8 @@ const fmtAgo = (ts) => {
 };
 
 let project = null;
+// Trạng thái bung subagent trong timeline — key = `${task_id}::${agent}`. Giữ qua re-render live.
+const expandedSubagents = new Set();
 // Chat tách theo project: mỗi project giữ riêng nội dung stream + task đang theo dõi + offset log.
 // chatState[proj] = { streamHTML, activeTaskId, logOffset }
 const chatState = {};
@@ -78,7 +80,6 @@ async function attachLive(proj) {
     const bubble = ensureAgentBubble(activeTaskId);
     const running = (t.active || []).map(a => a.agent).join(', ');
     bubble.querySelector('.msg-meta').textContent = `${t.mode} · ${running || '…'} đang chạy`;
-    bubble.querySelector('.msg-timeline').innerHTML = renderTimeline(t.timeline || []);
     startChatPoll();
   } catch (e) { /* transient; bỏ qua */ }
 }
@@ -103,10 +104,12 @@ function shortModel(m) {
 }
 function providerClass(p) { return 'prov-' + String(p || 'claude').toLowerCase().replace(/[^a-z]/g, ''); }
 
-function renderProviderPill(provider, model) {
+function renderProviderPill(provider, model, usage) {
   if (!model && !provider) return '';
-  return `<span class="model-pill ${providerClass(provider)}"
-    title="${esc(provider || 'claude')} · ${esc(model || '')}">
+  const tip = usage
+    ? `${provider || 'claude'} · ${model || ''} — in ${fmtNum(usage.input_tokens)} / out ${fmtNum(usage.output_tokens)} · ${fmtCost(usage.cost_usd)}`
+    : `${provider || 'claude'} · ${model || ''}`;
+  return `<span class="model-pill ${providerClass(provider)}" title="${esc(tip)}">
     ${esc(provider || 'claude')}<span class="dim">·</span>${esc(shortModel(model))}
   </span>`;
 }
@@ -121,7 +124,7 @@ function renderLive(live) {
             <div class="live-task-id">${esc(t.task_id)} · ${esc(t.mode)} · ${esc(fmtAgo(t.last_ts))}</div>
             <div class="live-task-text">${esc(t.task || '(no task text)')}</div>
           </div>
-          <div class="live-dag">${renderTimeline(t.timeline || [])}</div>
+          <div class="live-dag">${renderTimeline(t.timeline || [], t.task_id)}</div>
         </div>
       `).join('')
     : '<div class="idle-msg">No active tasks. Run <code>pagent feature "..."</code> trong terminal.</div>';
@@ -176,32 +179,74 @@ async function showDetail(id) {
   $('#modal-meta').innerHTML = `
     <b>${esc(r.kind)}</b> · task_id=<b>${esc(r.task_id)}</b> · ${r.timeline.length} agent steps
   `;
-  $('#modal-timeline').innerHTML = renderTimeline(r.timeline);
+  $('#modal-timeline').innerHTML = renderTimeline(r.timeline, r.task_id);
   $('#modal-report').textContent = r.content || '(empty)';
   $('#modal').classList.remove('hidden');
 }
 
-function renderTimeline(steps) {
+// Render TẤT CẢ model 1 step đã dùng (1 lượt agent có thể chạy >1 model). Fallback model đơn.
+function renderModelPills(s) {
+  const models = (s.models && s.models.length) ? s.models : (s.model ? [{ model: s.model }] : []);
+  if (!models.length) return renderProviderPill(s.provider, s.model);
+  return models.map(m => renderProviderPill(s.provider, m.model, m)).join('');
+}
+
+function renderSubagent(c) {
+  const cls = (c.running ? ' running' : '') + (c.is_error ? ' errored' : '');
+  return `
+    <div class="subagent-item${cls}">
+      <div class="sub-label">${esc(c.subtask_id || 'sub')}${c.running ? ' ⠿' : ''} — ${esc(c.subtask || '(no label)')}</div>
+      <div class="sub-models">${renderModelPills(c)}</div>
+      <div class="sub-meta">${fmtMs(c.duration_ms)} · ${fmtCost(c.cost_usd)} · out ${fmtNum(c.output_tokens)}</div>
+    </div>`;
+}
+
+// scopeId (task_id) khoá trạng thái bung subagent ổn định qua các lần re-render live.
+function renderTimeline(steps, scopeId) {
   if (!steps.length) return '<div class="idle-msg">No timeline data.</div>';
   const parts = [];
   steps.forEach((s, i) => {
     if (i > 0) parts.push('<div class="timeline-arrow">→</div>');
     const running = s.running ? ' running' : '';
     const errored = s.is_error ? ' errored' : '';
+    const subs = s.subagents || [];
+    let subHtml = '';
+    if (subs.length) {
+      const key = `${scopeId || ''}::${s.agent}`;
+      const open = expandedSubagents.has(key);
+      subHtml = `
+        <button class="subagent-toggle" data-key="${esc(key)}" data-count="${subs.length}">
+          ${open ? '▾' : '▸'} ${subs.length} subtasks
+        </button>
+        <div class="subagent-list${open ? '' : ' hidden'}">${subs.map(renderSubagent).join('')}</div>`;
+    }
     parts.push(`
-      <div class="timeline-step${running}${errored}">
-        <div class="step-agent">${esc(s.agent)}${s.running ? ' ⠿' : ''}</div>
-        <div class="step-pill">${renderProviderPill(s.provider, s.model)}</div>
+      <div class="timeline-step${running}${errored}${subs.length ? ' has-subs' : ''}">
+        <div class="step-agent">${esc(s.agent)}${s.running ? ' ⠿' : ''}${subs.length ? ` <span class="sub-badge">×${subs.length}</span>` : ''}</div>
+        <div class="step-pill">${renderModelPills(s)}</div>
         <div class="step-meta">
           ${fmtMs(s.duration_ms)} · ${fmtCost(s.cost_usd)}<br>
           in ${fmtNum(s.input_tokens)} / out ${fmtNum(s.output_tokens)}
           ${s.terminal_reason && s.terminal_reason !== 'completed'
             ? `<br><span class="dim">${esc(s.terminal_reason)}</span>` : ''}
         </div>
+        ${subHtml}
       </div>
     `);
   });
   return `<div class="timeline">${parts.join('')}</div>`;
+}
+
+// Bung/thu danh sách subagent. Lưu vào Set để re-render (live poll 3s) giữ nguyên trạng thái.
+function onSubagentToggle(e) {
+  const btn = e.target.closest('.subagent-toggle');
+  if (!btn) return;
+  const key = btn.dataset.key, count = btn.dataset.count;
+  const open = !expandedSubagents.has(key);
+  if (open) expandedSubagents.add(key); else expandedSubagents.delete(key);
+  btn.textContent = `${open ? '▾' : '▸'} ${count} subtasks`;
+  const list = btn.parentElement.querySelector('.subagent-list');
+  if (list) list.classList.toggle('hidden', !open);
 }
 
 // ── chat composer ──
@@ -277,8 +322,9 @@ function appendUserMessage(task, atts, figma) {
 function ensureAgentBubble(id) {
   let el = document.getElementById('agent-msg-' + id);
   if (!el) {
+    // Chat KHÔNG render timeline/agent-DAG (đã có ở panel Live) — chỉ status ngắn + log.
     $('#chat-stream').insertAdjacentHTML('beforeend',
-      `<div class="msg msg-agent" id="agent-msg-${esc(id)}"><div class="msg-meta dim">đang khởi chạy…</div><div class="msg-timeline"></div><pre class="msg-log" hidden></pre></div>`);
+      `<div class="msg msg-agent" id="agent-msg-${esc(id)}"><div class="msg-meta dim">đang khởi chạy…</div><pre class="msg-log" hidden></pre></div>`);
     el = document.getElementById('agent-msg-' + id);
   }
   return el;
@@ -310,17 +356,14 @@ async function pollChat() {
     if (hit) {
       const running = (hit.active || []).map(a => a.agent).join(', ');
       bubble.querySelector('.msg-meta').textContent = `${hit.mode} · ${running || '…'} đang chạy`;
-      bubble.querySelector('.msg-timeline').innerHTML = renderTimeline(hit.timeline || []);
     } else {
       const tasks = await j(`/api/projects/${encodeURIComponent(proj)}/tasks`);
       if (stale()) return;
       const done = tasks.find(t => t.task_id === tid);
       if (done) {
-        const detail = await j(`/api/projects/${encodeURIComponent(proj)}/tasks/${encodeURIComponent(done.id)}`);
-        if (stale()) return;
+        // Timeline đầy đủ + subagent xem ở Live / report modal — chat chỉ cần link report.
         bubble.querySelector('.msg-meta').innerHTML =
           `✓ hoàn thành · <a href="#" class="open-report" data-report-id="${esc(done.id)}">xem report</a>`;
-        bubble.querySelector('.msg-timeline').innerHTML = renderTimeline(detail.timeline || []);
         await fetchChatLog(bubble, proj, tid);   // gom nốt phần log ghi ra ngay trước khi pagent thoát
         if (stale()) return;
         stopChatPoll();
@@ -400,6 +443,9 @@ $('#chat-stream').addEventListener('click', (e) => {
   if (a) { e.preventDefault(); showDetail(a.dataset.reportId); }
 });
 $('#refresh-btn').addEventListener('click', refresh);
+// Delegation: nút bung subagent tồn tại qua các lần re-render live + trong modal report.
+$('#live-list').addEventListener('click', onSubagentToggle);
+$('#modal-timeline').addEventListener('click', onSubagentToggle);
 $('#modal-close').addEventListener('click', () => $('#modal').classList.add('hidden'));
 $('#modal').addEventListener('click', (e) => { if (e.target.id === 'modal') $('#modal').classList.add('hidden'); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('#modal').classList.add('hidden'); });

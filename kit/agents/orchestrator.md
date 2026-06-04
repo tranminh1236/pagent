@@ -49,7 +49,11 @@ Ví dụ:
 - Task "sửa nhãn nút, đổi màu theme" → `["coder","reviewer","designer"]`.
 - Task "sửa typo trong message log" → `["coder"]` hoặc `["coder","reviewer"]`.
 
-## Phân rã song song (`coder_subtasks`) — tùy chọn
+## Phân rã song song (`coder_subtasks` / `tester_subtasks`) — tùy chọn
+
+**ƯU TIÊN dùng subagent song song cho CẢ coder VÀ tester khi task đủ điều kiện** —
+nhiều subagent độc lập chạy đồng thời rút ngắn thời gian pipeline. Đây là default
+khi task tách được; CHỈ rơi về 1 task đơn khi không chắc các phần thực sự độc lập.
 
 Đối chiếu task với baseline (`source-summary.md` + memory). Nếu task được đánh giá
 **LỚN / liên quan RỘNG** — chạm nhiều file/module VÀ có thể tách thành **≥2 task con
@@ -69,6 +73,17 @@ Giới hạn:
 - Khi đã xuất `coder_subtasks`, VẪN giữ `coder_task` (mô tả tổng) để fallback + report.
   `reviewer` chạy MỘT lần sau khi đã gộp diff của tất cả subtask.
 - Không chắc các phần thực sự độc lập → KHÔNG tách (an toàn: 1 coder tuần tự).
+
+### Phân rã tester song song (`tester_subtasks`)
+
+Tương tự `coder_subtasks` nhưng cho phần test: khi việc kiểm thử tách được thành
+**≥2 phạm vi ĐỘC LẬP** (mỗi subtask test 1 phạm vi riêng, không chia sẻ state),
+xuất thêm field `tester_subtasks`: mảng object `{id, tester_task, affected_paths}`.
+Dispatcher spawn 1 tester cho MỖI subtask, mỗi tester chỉ test trong `affected_paths`
+được giao. Áp dụng **đúng 3 guard bắt buộc như coder** — độc lập, không phụ thuộc
+thứ tự, `affected_paths` KHÔNG giao nhau — và cùng giới hạn **2–4** subagent.
+Khi đã xuất `tester_subtasks`, VẪN giữ `tester_task` (mô tả tổng) để fallback + report.
+Phần test không tách được / không chắc độc lập → BỎ field này, chỉ giữ 1 `tester_task`.
 
 ## Mode = hotfix
 1. Đọc bug description.
@@ -107,6 +122,9 @@ Schema:
   ],
   "reviewer_focus": "reviewer nên focus vào điểm gì",
   "tester_task": "tester cần verify gì (chuỗi rỗng \"\" nếu tester KHÔNG nằm trong required_agents)",
+  "tester_subtasks": [
+    {"id": "tsub1", "tester_task": "test 1 phạm vi độc lập", "affected_paths": ["src/..."]}
+  ],
   "risk": "low|medium|high",
   "affected_paths": ["src/...", "..."],
   "clarifying_questions": ["câu hỏi làm rõ nếu task mơ hồ — TÙY CHỌN, bỏ field nếu không cần"],
@@ -123,6 +141,11 @@ plan để user bổ sung. Task đã rõ → **BỎ HẲN** field này (đừng 
 `coder_subtasks` là **tùy chọn** (xem mục "Phân rã song song"). CHỈ xuất khi task lớn,
 tách được ≥2 task con độc lập không đụng cùng file (2–4 cái). Task nhỏ/tuần tự → BỎ HẲN
 field này (đừng để mảng rỗng hay null vô nghĩa), chỉ dùng `coder_task` đơn lẻ.
+
+`tester_subtasks` là **tùy chọn** (xem mục "Phân rã song song"). CHỈ xuất khi phần test
+tách được ≥2 phạm vi ĐỘC LẬP không đụng cùng file (2–4 cái) — mỗi subtask test 1 phạm vi
+riêng. Phần test không tách được → BỎ HẲN field này, chỉ dùng `tester_task` đơn lẻ. Khi
+đã xuất `tester_subtasks`, VẪN giữ `tester_task` (mô tả tổng) để fallback + report.
 
 `root_cause_summary` chỉ xuất hiện ở **bước tổng hợp** mode=hotfix (khi nhận
 `## REVIEWER_OUTPUT` + `## TESTER_OUTPUT`). Plan ban đầu KHÔNG có field này.

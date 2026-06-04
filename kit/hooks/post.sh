@@ -17,6 +17,9 @@ mkdir -p "$log_dir"
 log_file="$log_dir/$date_str.jsonl"
 
 # Extract usage từ claude CLI JSON. Fallback 0/empty nếu response không parse được.
+# `model` = model LÀM CHÍNH (nhiều output tokens nhất) chứ KHÔNG phải key đầu theo alphabet.
+# Lý do: claude CLI 1 lượt thường gọi 2+ model (vd haiku phụ + sonnet chính); `keys|first`
+# sắp alphabet nên luôn ra haiku → hiển thị sai model. max_by(outputTokens) lấy model thật.
 if ! parsed="$(jq -r '
   [
     .usage.input_tokens                  // 0,
@@ -25,7 +28,7 @@ if ! parsed="$(jq -r '
     .usage.cache_creation_input_tokens   // 0,
     .total_cost_usd                      // 0,
     .duration_ms                         // 0,
-    (.modelUsage // {} | keys | first   // "unknown"),
+    ((.modelUsage // {} | to_entries | max_by(.value.outputTokens // 0) | .key) // "unknown"),
     .session_id                          // "",
     .terminal_reason                     // "",
     (.is_error // false | tostring),
@@ -35,6 +38,22 @@ if ! parsed="$(jq -r '
   parsed=$'0\t0\t0\t0\t0\t0\tunknown\t\tparse_fail\ttrue\tclaude'
 fi
 read -r in_tok out_tok cache_r cache_c cost dur_ms model sid term_reason is_err provider <<<"$parsed"
+
+# Breakdown TẤT CẢ model đã làm việc trong lượt này (không chỉ model chính) → field `models`.
+# Web hiển thị hết để user thấy "có bao nhiêu model làm việc".
+if ! models_json="$(jq -c '
+  (.modelUsage // {}) | to_entries | map({
+    model:          .key,
+    input_tokens:   (.value.inputTokens               // 0),
+    output_tokens:  (.value.outputTokens              // 0),
+    cache_read:     (.value.cacheReadInputTokens      // 0),
+    cache_creation: (.value.cacheCreationInputTokens  // 0),
+    cost_usd:       (.value.costUSD                   // 0)
+  })
+' "$resp_file" 2>/dev/null)"; then
+  models_json="[]"
+fi
+[[ -n "$models_json" ]] || models_json="[]"
 
 line="$(jq -nc \
   --arg ts        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -53,9 +72,13 @@ line="$(jq -nc \
   --argjson durms "${dur_ms:-0}" \
   --arg term      "${term_reason:-}" \
   --arg err       "${is_err:-false}" \
-  --arg prov      "${provider:-claude}" '
+  --arg prov      "${provider:-claude}" \
+  --argjson models "$models_json" \
+  --arg subtid    "${PAGENT_SUBTASK_ID:-}" \
+  --arg subtask   "${PAGENT_SUBTASK_LABEL:-}" '
   {ts:$ts, event:$event, project:$project, mode:$mode, task_id:$task_id, agent:$agent,
-   provider:$prov, model:$model, session_id:$sid,
+   subtask_id:$subtid, subtask:$subtask,
+   provider:$prov, model:$model, models:$models, session_id:$sid,
    input_tokens:$in, output_tokens:$out, cache_read:$cr, cache_creation:$cc,
    cost_usd:$cost, duration_ms:$durms,
    terminal_reason:$term, is_error:($err=="true")}

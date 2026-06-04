@@ -27,8 +27,11 @@ line="$(jq -nc \
   --arg agent     "$PAGENT_AGENT" \
   --arg provider  "${PAGENT_AGENT_PROVIDER:-claude}" \
   --arg model     "${PAGENT_AGENT_MODEL:-}" \
+  --arg subtid    "${PAGENT_SUBTASK_ID:-}" \
+  --arg subtask   "${PAGENT_SUBTASK_LABEL:-}" \
   --arg task      "${task:0:200}" '
   {ts:$ts, event:$event, project:$project, mode:$mode, task_id:$task_id,
-   agent:$agent, provider:$provider, model:$model, task:$task}')"
+   agent:$agent, subtask_id:$subtid, subtask:$subtask,
+   provider:$provider, model:$model, task:$task}')"
 _append() { printf '%s\n' "$line" >>"$log_file"; }
 with_lock "$log_file" _append

@@ -219,44 +219,118 @@ def read_chat_log(proj, tid, offset=0):
     except Exception as e:
         return {"error": f"đọc log thất bại: {e}"}
 
+def _step_models(e):
+    """Danh sách TẤT CẢ model 1 lượt agent đã dùng. Ưu tiên field `models` (post.sh mới);
+    fallback model đơn (event cũ) để không vỡ timeline lịch sử."""
+    ms = e.get("models")
+    if isinstance(ms, list) and ms:
+        return ms
+    m = e.get("model")
+    if m and m != "unknown":
+        return [{"model": m, "input_tokens": e.get("input_tokens", 0),
+                 "output_tokens": e.get("output_tokens", 0),
+                 "cache_read": e.get("cache_read", 0),
+                 "cost_usd": e.get("cost_usd", 0)}]
+    return []
+
+def _merge_models(lists):
+    """Gộp nhiều models[] (union theo tên model, cộng tokens/cost) — cho node cha fan-out."""
+    acc = {}
+    order = []
+    for ms in lists:
+        for m in ms or []:
+            k = m.get("model", "")
+            if k not in acc:
+                acc[k] = {"model": k, "input_tokens": 0, "output_tokens": 0,
+                          "cache_read": 0, "cost_usd": 0.0}
+                order.append(k)
+            acc[k]["input_tokens"] += m.get("input_tokens", 0) or 0
+            acc[k]["output_tokens"] += m.get("output_tokens", 0) or 0
+            acc[k]["cache_read"] += m.get("cache_read", 0) or 0
+            acc[k]["cost_usd"] += m.get("cost_usd", 0) or 0
+    return [acc[k] for k in order]
+
 def _task_timeline(proj, task_id):
-    """Trả về sequence agent steps cho 1 task_id (orchestrator → coder → reviewer → ...)."""
+    """Sequence agent steps cho 1 task_id (orchestrator → coder → reviewer → ...).
+    Subtask (coder/tester fan-out, có subtask_id) được gom thành 1 node cha với
+    `subagents` để web bung ra xem từng subtask làm gì."""
     evs = _read_tokens(proj)
     steps = []
-    pending = {}  # agent -> list of start events
+    pending = {}  # (agent, subtask_id) -> list of start events (FIFO pairing)
     for e in evs:
         if e.get("task_id") != task_id: continue
         ag = e.get("agent")
         if not ag: continue
+        key = (ag, e.get("subtask_id") or "")
         if e.get("event") == "start":
-            pending[ag] = pending.get(ag, []) + [e]
+            pending[key] = pending.get(key, []) + [e]
         elif e.get("event") == "end":
-            starts = pending.get(ag, [])
+            starts = pending.get(key, [])
             start_ev = starts.pop(0) if starts else {}
-            pending[ag] = starts
+            pending[key] = starts
             steps.append({
                 "agent": ag,
+                "subtask_id": e.get("subtask_id") or start_ev.get("subtask_id") or "",
+                "subtask": e.get("subtask") or start_ev.get("subtask") or "",
                 "start": start_ev.get("ts"),
                 "end": e.get("ts"),
                 "duration_ms": e.get("duration_ms", 0),
                 "cost_usd": e.get("cost_usd", 0),
                 "input_tokens": e.get("input_tokens", 0),
                 "output_tokens": e.get("output_tokens", 0),
+                "models": _step_models(e),
                 # provider/model: ưu tiên end event (đầy đủ), fallback start (lúc post.sh chưa chạy)
                 "model": e.get("model") or start_ev.get("model", ""),
                 "provider": e.get("provider") or start_ev.get("provider", "claude"),
                 "terminal_reason": e.get("terminal_reason", ""),
                 "is_error": e.get("is_error", False),
+                "running": False,
             })
     # in-flight (start chưa end)
-    for ag, starts in pending.items():
+    for (ag, _sub), starts in pending.items():
         for s in starts:
-            steps.append({"agent": ag, "start": s.get("ts"), "end": None,
+            steps.append({"agent": ag, "subtask_id": s.get("subtask_id") or "",
+                          "subtask": s.get("subtask") or "",
+                          "start": s.get("ts"), "end": None,
                           "duration_ms": 0, "cost_usd": 0, "input_tokens": 0, "output_tokens": 0,
-                          "model": s.get("model", ""), "provider": s.get("provider", "claude"),
-                          "running": True})
+                          "models": [], "model": s.get("model", ""),
+                          "provider": s.get("provider", "claude"), "running": True})
     steps.sort(key=lambda s: s.get("start") or "")
-    return steps
+    return _group_subtasks(steps)
+
+def _group_subtasks(steps):
+    """Gom các step có subtask_id thành node cha (1 node/agent), giữ step thường nguyên vẹn."""
+    nodes = []
+    parents = {}  # agent -> parent node (đã chèn vào nodes)
+    for s in steps:
+        if not s.get("subtask_id"):
+            nodes.append(s)
+            continue
+        p = parents.get(s["agent"])
+        if p is None:
+            p = {"agent": s["agent"], "provider": s.get("provider", "claude"),
+                 "start": s.get("start"), "end": s.get("end"),
+                 "duration_ms": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0,
+                 "models": [], "running": False, "is_error": False,
+                 "terminal_reason": "", "is_group": True, "subagents": []}
+            parents[s["agent"]] = p
+            nodes.append(p)
+        p["subagents"].append(s)
+        p["duration_ms"] += s.get("duration_ms", 0) or 0
+        p["cost_usd"] += s.get("cost_usd", 0) or 0
+        p["input_tokens"] += s.get("input_tokens", 0) or 0
+        p["output_tokens"] += s.get("output_tokens", 0) or 0
+        p["models"] = _merge_models([p["models"], s.get("models", [])])
+        if s.get("running"): p["running"] = True
+        if s.get("is_error"): p["is_error"] = True
+        if s.get("start") and (not p["start"] or s["start"] < p["start"]):
+            p["start"] = s["start"]
+        if p["running"]:
+            p["end"] = None
+        elif s.get("end") and (not p["end"] or s["end"] > p["end"]):
+            p["end"] = s["end"]
+    nodes.sort(key=lambda n: n.get("start") or "")
+    return nodes
 
 def _parse_ts(s):
     try: return datetime.fromisoformat((s or "").replace("Z", "+00:00"))
@@ -319,10 +393,13 @@ def agent_stats(proj):
         s["cost"] += e.get("cost_usd", 0) or 0
         s["duration_ms"] += e.get("duration_ms", 0) or 0
         s["tokens_out"] += e.get("output_tokens", 0) or 0
-        key = f"{e.get('provider', 'claude')}/{e.get('model', 'unknown')}"
-        m = s["by_model"].setdefault(key, {"runs": 0, "cost": 0.0})
-        m["runs"] += 1
-        m["cost"] += e.get("cost_usd", 0) or 0
+        # by_model: liệt kê HẾT model đã làm việc (1 lượt có thể >1 model), không chỉ model chính.
+        prov = e.get("provider", "claude")
+        for mm in _step_models(e):
+            key = f"{prov}/{mm.get('model', 'unknown')}"
+            m = s["by_model"].setdefault(key, {"runs": 0, "cost": 0.0})
+            m["runs"] += 1
+            m["cost"] += mm.get("cost_usd", 0) or 0
     out = []
     for ag, s in sorted(stats.items(), key=lambda x: -x[1]["cost"]):
         by_model = sorted(
