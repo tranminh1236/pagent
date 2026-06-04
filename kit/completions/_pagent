@@ -36,6 +36,9 @@ _pagent() {
     'feature:Build feature mới qua orchestrator+coder+reviewer+tester'
     'feat:Build feature mới qua orchestrator+coder+reviewer+tester'
     'fix:Hotfix bug (alias: bug, hotfix)'
+    'chore:Chore — refactor/bổ sung nhỏ (orchestrator→coder→reviewer)'
+    'find:Đọc source trả lời câu hỏi (alias: query) — read-only'
+    'query:Đọc source trả lời câu hỏi (alias of find) — read-only'
     'report:Tóm tắt features/bugs + cost'
     'workflow:Quản lý workflow.md'
     'skills:Liệt kê skills/agents (project-local + global)'
@@ -53,7 +56,7 @@ _pagent() {
   fi
 
   case "${words[2]}" in
-    feat|feature|fix|bug|hotfix)
+    feat|feature|fix|bug|hotfix|chore|find|query)
       _arguments \
         '-a[chỉ định agent]:agent:_pagent_skills' \
         '-s[chỉ định skill]:skill:_pagent_skills' \

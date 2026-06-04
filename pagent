@@ -595,7 +595,7 @@ confirm_plan_gate() {
 
 cmd_pipeline() {
   local mode="$1" task="$2"
-  [[ "$mode" =~ ^(feature|hotfix)$ ]] || die "mode phải là feature hoặc hotfix"
+  [[ "$mode" =~ ^(feature|hotfix|chore|find)$ ]] || die "mode phải là feature, hotfix, chore hoặc find"
   [[ -n "$task" ]] || die "thiếu task"
 
   PAGENT_MODE="$mode"
@@ -620,7 +620,9 @@ cmd_pipeline() {
   fi
 
   #────── 1. Orchestrator (confirm gate → có thể re-run với info bổ sung) ──────
-  log "$(c_cyan '[1/4]') orchestrator → lập plan"
+  local step_total=4
+  [[ "$mode" == "find" ]] && step_total=2
+  log "$(c_cyan "[1/$step_total]") orchestrator → lập plan"
   local plan_text plan_json
   local title coder_task reviewer_focus tester_task risk affected
   local n_subtasks=0 n_tester_subtasks=0
@@ -677,8 +679,10 @@ cmd_pipeline() {
     # required_agents: gate spawn theo plan. Thiếu field / parse lỗi → full pipeline (backward-compat).
     if jq -e '.required_agents | type == "array"' <<<"$plan_json" >/dev/null 2>&1; then
       local _ra; _ra="$(jq -r '.required_agents[]' <<<"$plan_json" 2>/dev/null | tr '\n' ' ')"
-      # coder luôn chạy — ép có mặt dù plan quên liệt kê
-      [[ " $_ra " == *" coder "* ]] || _ra="coder $_ra"
+      # coder luôn chạy — ép có mặt dù plan quên liệt kê (trừ find: read-only, không spawn coder)
+      if [[ "$mode" != "find" ]]; then
+        [[ " $_ra " == *" coder "* ]] || _ra="coder $_ra"
+      fi
       PAGENT_GATE=1
       PAGENT_REQUIRED_AGENTS=" $_ra "
       log "  required_agents: $(c_green "$_ra")"
@@ -736,13 +740,30 @@ cmd_pipeline() {
     fi
   fi
 
-  #────── 2. Coder ↔ Reviewer loop ──────
+  #────── 2. Coder ↔ Reviewer loop (skip toàn bộ khi mode=find — chỉ đọc + trả lời) ──────
   local round=1 verdict="CHANGES_REQUESTED" coder_input="$coder_task"
   local review_enabled=1
-  if ! agent_enabled reviewer; then
+  # Find mode tự chạy reviewer riêng (xem nhánh bên dưới) → bỏ qua gate cosmetic này
+  # tránh log nhầm "coder chạy 1 vòng" cho task find vốn không spawn coder.
+  if [[ "$mode" != "find" ]] && ! agent_enabled reviewer; then
     review_enabled=0
     log_skip "reviewer — không nằm trong required_agents (coder chạy 1 vòng, không review)"
   fi
+
+  if [[ "$mode" == "find" ]]; then
+    # find: KHÔNG có coder. Reviewer đọc source + plan → trả lời câu hỏi.
+    log "$(c_cyan "[2/$step_total]") reviewer (find — đọc source trả lời câu hỏi)"
+    local source_summary=""
+    [[ -f "$PAGENT_SOURCE/.pagent/source-summary.md" ]] && source_summary="$(cat "$PAGENT_SOURCE/.pagent/source-summary.md")"
+    {
+      echo "## MODE"; echo "$mode"; echo
+      echo "## QUESTION"; echo "$task"; echo
+      echo "## REVIEWER_FOCUS"; echo "$reviewer_focus"; echo
+      echo "## ORCHESTRATOR_PLAN"; cat "$PAGENT_RUN_DIR/orchestrator.txt"; echo
+      echo "## SOURCE_SUMMARY"; echo "$source_summary"
+    } | call_agent reviewer >/dev/null || die "reviewer fail"
+    verdict="ANSWERED"
+  else
   while (( round <= PAGENT_MAX_REVIEW_ROUND )) && [[ "$verdict" != "APPROVED" ]]; do
     if (( n_subtasks > 1 && round == 1 )); then
       # Plan lớn: spawn 1 coder cho mỗi subtask độc lập, gộp output → coder.txt.
@@ -819,8 +840,10 @@ cmd_pipeline() {
   if [[ "$verdict" != "APPROVED" && "$verdict" != "SKIPPED" ]] && (( PAGENT_MAX_REVIEW_ROUND > 0 )); then
     warn "reviewer chưa APPROVE sau $((round-1)) vòng — vẫn tiếp tục để tester verify"
   fi
+  fi  # end mode != find
 
-  #────── 4. Tester ──────
+  #────── 4. Tester (skip toàn bộ khi mode=find — không có code change để test) ──────
+  if [[ "$mode" != "find" ]]; then
   # Gating: plan có required_agents → theo list; nếu không → fallback (tester_task hoặc feature).
   local run_tester=0
   if [[ "${PAGENT_GATE}" == "1" ]]; then
@@ -872,6 +895,7 @@ cmd_pipeline() {
   else
     log "$(c_dim 'tester skipped (hotfix không cần)')"
   fi
+  fi  # end mode != find (tester block)
 
   #────── 4b. Orchestrator tổng hợp root cause (hotfix only) ──────
   if [[ "$mode" == "hotfix" && -s "$PAGENT_RUN_DIR/reviewer.txt" ]]; then
@@ -916,8 +940,13 @@ cmd_pipeline() {
   fi
 
   #────── 6. Báo cáo + auto compact ──────
-  local report_subdir="features"
-  [[ "$mode" == "hotfix" ]] && report_subdir="bugs"
+  local report_subdir
+  case "$mode" in
+    feature) report_subdir="features" ;;
+    hotfix)  report_subdir="bugs" ;;
+    chore)   report_subdir="chores" ;;
+    find)    report_subdir="findings" ;;
+  esac
   local report_dir="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/$report_subdir"
   mkdir -p "$report_dir"
   local date_str; date_str="$(date -u +%Y-%m-%d)"
@@ -1140,6 +1169,8 @@ USAGE
   pagent init                          Quét source folder, sinh .pagent/source-summary.md
   pagent feature "task..."             Build feature (alias: feat): orchestrator→coder→reviewer→tester→workflow
   pagent fix     "task..."             Hotfix bug:   orchestrator→coder→reviewer→tester regression
+  pagent chore   "task..."             Chore (refactor/bổ sung nhỏ): orchestrator→coder→reviewer
+  pagent find    "question..."         Đọc source trả lời câu hỏi (alias: query): orchestrator→reviewer (read-only)
   pagent report  [project]             Tóm tắt features/bugs + cost theo ngày
   pagent workflow [show|list|run|new|file]   Quản lý workflow.md (xem 'pagent workflow' để biết)
   pagent skills                        Liệt kê skills/agents project-local + global
@@ -1161,7 +1192,7 @@ ENVIRONMENT (đặt trong .env.pagent hoặc shell)
   PAGENT_PROJECT            tên project (mặc định basename của SOURCE)
   PAGENT_REPORT_DIR         nơi lưu report (mặc định ~/.pagent-reports)
   PAGENT_MODEL              claude model (mặc định claude-sonnet-4-6)
-  PAGENT_MODE               feature | hotfix (override subcommand)
+  PAGENT_MODE               feature | hotfix | chore | find (override subcommand)
   PAGENT_CLAUDE_BIN         path tới claude CLI (mặc định "claude")
   PAGENT_MAX_REVIEW_ROUND   số vòng coder↔reviewer (mặc định 2)
   PAGENT_CAVEMAN            off|lite|full|ultra — token compress mode (override md frontmatter)
@@ -1171,18 +1202,19 @@ ENVIRONMENT (đặt trong .env.pagent hoặc shell)
   PAGENT_KIT_DIR            override kit/ folder
 
 PIPELINE
-  1. orchestrator → JSON plan (title, coder_task, reviewer_focus, tester_task, risk)
-  2. coder → edit code thật trong $PAGENT_SOURCE, xuất CHANGES block
-  3. reviewer (read-only) → APPROVED hoặc CHANGES_REQUESTED (loop tối đa N vòng)
-  4. tester → viết test + chạy
-  5. workflow-extractor (chỉ feature) → append section vào workflow.md
-  6. Pre/post hook → ghi token+cost vào tokens/<date>.jsonl
-  7. Auto-compact run dir → bundle.tar.gz
+  feature: orchestrator → (designer) → coder → reviewer (loop) → tester → workflow-extractor
+  hotfix:  orchestrator → coder → reviewer (loop) → tester regression → orchestrator (root cause)
+  chore:   orchestrator → coder → reviewer (loop)  [tester nếu plan yêu cầu; KHÔNG workflow-extractor]
+  find:    orchestrator → reviewer (read-only, đọc source trả lời câu hỏi — KHÔNG coder/tester)
+  Pre/post hook → ghi token+cost vào tokens/<date>.jsonl
+  Auto-compact run dir → bundle.tar.gz
 
 OUTPUT TREE
   $PAGENT_REPORT_DIR/<project>/
     ├── features/<date>-<taskid>.md
     ├── bugs/<date>-<taskid>.md
+    ├── chores/<date>-<taskid>.md
+    ├── findings/<date>-<taskid>.md
     ├── workflow.md
     ├── tokens/<date>.jsonl
     └── runs/<taskid>/bundle.tar.gz
@@ -1197,6 +1229,8 @@ case "$cmd" in
   init)      cmd_init ;;
   feat|feature)   cmd_pipeline feature "${*:-}" ;;
   fix|bug|hotfix) cmd_pipeline hotfix "${*:-}" ;;
+  chore)          cmd_pipeline chore "${*:-}" ;;
+  find|query)     cmd_pipeline find "${*:-}" ;;
   report)    cmd_report "${1:-}" ;;
   workflow)  cmd_workflow "$@" ;;
   env)       cmd_env ;;

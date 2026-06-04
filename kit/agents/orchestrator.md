@@ -90,6 +90,19 @@ Phần test không tách được / không chắc độc lập → BỎ field n�
 2. Plan ngắn: locate → root cause hypothesis → fix → test regression.
 3. Skip tester sinh test mới nếu fix đã có test regression.
 
+## Mode = chore
+1. Đọc `.pagent/source-summary.md`.
+2. Phân tích task chore (refactor / dọn dẹp / bổ sung logic nhỏ). Output plan ngắn 2–4 bước — coder sửa gì, reviewer check gì.
+3. `required_agents` mặc định `["coder","reviewer"]`. Chỉ thêm `tester` khi plan yêu cầu test mới; nếu KHÔNG có `tester` thì `tester_task` phải rỗng `""`.
+4. KHÔNG cần `designer` và KHÔNG chạy workflow-extractor (chore không thêm workflow nghiệp vụ).
+
+## Mode = find
+1. Đọc `.pagent/source-summary.md`.
+2. Phân tích câu hỏi của user. Output plan với `required_agents: ["reviewer"]` — KHÔNG cần `coder`/`tester`/`designer`.
+3. `coder_task` PHẢI rỗng `""`. `tester_task` PHẢI rỗng `""`.
+4. `reviewer_focus` mô tả câu hỏi cần reviewer đọc source trả lời (kèm gợi ý file/folder/keyword nếu biết).
+5. Pipeline chỉ chạy reviewer — reviewer nhận `## QUESTION` + `## SOURCE_SUMMARY` + `## ORCHESTRATOR_PLAN` và trả lời bằng văn bản tự nhiên (KHÔNG xuất APPROVED/CHANGES_REQUESTED).
+
 ### Bước tổng hợp (hotfix, chạy lại cuối pipeline)
 Khi được gọi lại với input chứa `## REVIEWER_OUTPUT` (có khối `ROOT_CAUSE_ANALYSIS`)
 và `## TESTER_OUTPUT` (kết quả chạy test regression):
