@@ -43,7 +43,7 @@ detect_source() {
 PAGENT_SOURCE="${PAGENT_SOURCE:-$(detect_source)}"
 PAGENT_PROJECT="${PAGENT_PROJECT:-$(basename "$PAGENT_SOURCE")}"
 PAGENT_REPORT_DIR="${PAGENT_REPORT_DIR:-$HOME/.pagent-reports}"
-PAGENT_MODEL="${PAGENT_MODEL:-claude-sonnet-4-6}"
+PAGENT_MODEL="${PAGENT_MODEL:-sonnet}"
 PAGENT_CLAUDE_BIN="${PAGENT_CLAUDE_BIN:-claude}"
 PAGENT_MAX_REVIEW_ROUND="${PAGENT_MAX_REVIEW_ROUND:-2}"
 PAGENT_OPENROUTER_BASE="${PAGENT_OPENROUTER_BASE:-https://openrouter.ai/api/v1}"
@@ -364,7 +364,12 @@ $tdd_body"
     ) 2>"$PAGENT_RUN_DIR/$agent.err" &
     backend_pid=$!
   else
-    local args=(-p --output-format json --model "$model")
+    # --setting-sources project,local: KHÔNG nạp ~/.claude/settings.json (user scope).
+    # Hook PreToolUse global (vd rtk) rewrite `cat`→`rtk read`, `grep`→`rtk grep`… TRƯỚC
+    # khi check permission → lệnh đã rewrite không khớp allowed_tools của agent (Bash(cat *)…)
+    # → mọi bash bị deny → agent đốt hết max_turns → JSON parse fail. Loại user hook để
+    # agent chạy đúng allowlist tự khai trong frontmatter.
+    local args=(-p --output-format json --model "$model" --setting-sources project,local)
     if [[ "$sp_mode" == "replace" ]]; then
       args+=(--system-prompt "$system_prompt")
     else
@@ -463,13 +468,26 @@ write_report() {
   fi
 
   local plan_f="$PAGENT_RUN_DIR/orchestrator.txt"
-  local designer_f="$PAGENT_RUN_DIR/designer.txt"
-  local coder_f="$PAGENT_RUN_DIR/coder.txt"
-  local reviewer_f="$PAGENT_RUN_DIR/reviewer.txt"
   local tester_f="$PAGENT_RUN_DIR/tester.txt"
+  local reviewer_f="$PAGENT_RUN_DIR/reviewer.txt"
   local rootcause_f="$PAGENT_RUN_DIR/root_cause.txt"
   local diffstat; diffstat="$(git_diff_summary)"
   [[ -z "$diffstat" ]] && diffstat="(no git diff)"
+
+  # flow_diagram: parse từ plan JSON trong orchestrator.txt. Field vắng/rỗng/parse
+  # lỗi → bỏ qua im lặng (chỉ in task) → backward-compat.
+  local flow=""
+  if [[ -s "$plan_f" ]]; then
+    flow="$(extract_json <"$plan_f" 2>/dev/null | jq -r '.flow_diagram // ""' 2>/dev/null || true)"
+  fi
+
+  # Tóm tắt test 1 dòng: ưu tiên dòng có count "N passed/failed" hoặc token PASS/FAIL
+  # đứng riêng (anchored) → tránh match nhầm prose ("fails to load") / tên file (pass.py).
+  local test_line=""
+  if [[ -s "$tester_f" ]]; then
+    test_line="$(grep -iE '[0-9]+ (passed|failed)|\b(PASS|FAIL)\b' "$tester_f" | head -1 | sed -E 's/^[[:space:]]+//' || true)"
+    [[ -z "$test_line" ]] && test_line="(tester chạy — không trích được dòng pass/fail)"
+  fi
 
   {
     printf '# %s\n\n' "$title"
@@ -479,24 +497,27 @@ write_report() {
     printf '**Date:** %s\n' "$datetime_str"
     printf '**Risk:** %s\n' "$risk"
     printf '**Total cost:** $%s (%s in / %s out, cache read %s)\n\n' "$cost" "$in_tok" "$out_tok" "$cache_r"
-    printf '## Task\n%s\n\n' "$task"
     if [[ -s "$rootcause_f" ]]; then
       printf '## Root cause (review + test, đã xác nhận)\n%s\n\n' "$(cat "$rootcause_f")"
     fi
-    printf '## Plan (orchestrator)\n'
-    [[ -s "$plan_f" ]] && cat "$plan_f" || echo '(none)'
-    if [[ -s "$designer_f" ]]; then
-      printf '\n## Design spec (designer)\n'
-      cat "$designer_f"
+    printf '## Input\n%s\n' "$task"
+    if [[ -n "$flow" ]]; then
+      printf '\n**Sơ đồ logic task:**\n```\n%s\n```\n' "$flow"
     fi
-    printf '\n## Code changes (coder)\n'
-    [[ -s "$coder_f" ]] && cat "$coder_f" || echo '(none)'
-    printf '\n## Review (reviewer)\n'
-    [[ -s "$reviewer_f" ]] && cat "$reviewer_f" || echo '(none)'
-    printf '\n## Tests (tester)\n'
-    [[ -s "$tester_f" ]] && cat "$tester_f" || echo '(skipped)'
-    printf '\n## Affected files\n%s\n\n' "$affected"
-    printf '## Git diff stat\n```\n%s\n```\n' "$diffstat"
+    printf '\n## Output\n'
+    if [[ "$PAGENT_MODE" == "find" ]]; then
+      # find: KHÔNG có coder/diff — reviewer ANSWER chính LÀ deliverable cho user.
+      # affected/diffstat/test đều rỗng ở mode này → in thẳng nội dung reviewer.txt.
+      if [[ -s "$reviewer_f" ]]; then
+        cat "$reviewer_f"
+      else
+        printf '(reviewer không trả lời được)\n'
+      fi
+    else
+      printf '**Affected files:** %s\n\n' "${affected:-(none)}"
+      printf '**Git diff stat:**\n```\n%s\n```\n' "$diffstat"
+      [[ -n "$test_line" ]] && printf '\n**Test:** %s\n' "$test_line"
+    fi
   } >"$report_path"
 }
 
@@ -556,13 +577,15 @@ confirm_plan_gate() {
     return 0
   fi
 
-  local q_title q_summary q_coder q_agents q_risk q_affected
+  local q_title q_summary q_coder q_agents q_risk q_affected q_flow
   q_title="$(jq -r '.title // "(no title)"' <<<"$pj" 2>/dev/null)"
   q_summary="$(jq -r '.summary // "(no summary)"' <<<"$pj" 2>/dev/null)"
   q_coder="$(jq -r '.coder_task // "(no coder_task)"' <<<"$pj" 2>/dev/null)"
   q_agents="$(jq -r '.required_agents // [] | join(", ")' <<<"$pj" 2>/dev/null)"
   q_risk="$(jq -r '.risk // "medium"' <<<"$pj" 2>/dev/null)"
   q_affected="$(jq -r '.affected_paths // [] | join(", ")' <<<"$pj" 2>/dev/null)"
+  # flow_diagram (optional): field vắng/rỗng → bỏ qua im lặng (backward-compat).
+  q_flow="$(jq -r '.flow_diagram // ""' <<<"$pj" 2>/dev/null)"
 
   {
     printf '\n%s\n' "$(c_cyan '──────── PLAN cần xác nhận ────────')"
@@ -572,6 +595,12 @@ confirm_plan_gate() {
     printf '  %s %s\n' "$(c_dim 'agents     :')" "${q_agents:-(full pipeline)}"
     printf '  %s %s\n' "$(c_dim 'risk       :')" "$q_risk"
     printf '  %s %s\n' "$(c_dim 'affected   :')" "${q_affected:-(none)}"
+    if [[ -n "$q_flow" ]]; then
+      printf '  %s\n' "$(c_dim 'Sơ đồ logic task:')"
+      while IFS= read -r _fl; do
+        printf '    %s\n' "$_fl"
+      done <<<"$q_flow"
+    fi
   } >&2
 
   # clarifying_questions (optional): orchestrator có thể hỏi lại để user bổ sung.

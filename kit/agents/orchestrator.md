@@ -1,9 +1,9 @@
 ---
 name: orchestrator
 description: Lead agent — phối hợp coder/reviewer/tester theo skill, ghi nhận feature/bug
-model: claude-opus-4-6
+model: opus
 allowed_tools: Read Grep Glob Bash(ls *) Bash(cat *) Bash(head *) Bash(find *) Bash(git status:*) Bash(git diff:*) mcp__plugin_context7_context7__resolve-library-id mcp__plugin_context7_context7__query-docs
-disallowed_tools: Write,Edit,MultiEdit,NotebookEdit
+disallowed_tools: Write,Edit,NotebookEdit
 mcp_servers: context7
 system_prompt_mode: replace
 max_turns: 15
@@ -30,6 +30,7 @@ Quy trình:
 1. Đọc `.pagent/source-summary.md` để hiểu codebase (nếu có).
 2. Phân tích task feature. Output 1 PLAN ngắn (3–6 bước) — coder làm gì, tester check gì.
 3. KHÔNG tự viết code. Plan sẽ được dispatcher đẩy qua coder → reviewer → tester theo đúng thứ tự.
+4. Xuất `flow_diagram` (ASCII đa dòng) mô tả luồng các bước feature + nhánh quyết định.
 
 ## Chọn agent cần thiết (`required_agents`)
 
@@ -89,12 +90,14 @@ Phần test không tách được / không chắc độc lập → BỎ field n�
 1. Đọc bug description.
 2. Plan ngắn: locate → root cause hypothesis → fix → test regression.
 3. Skip tester sinh test mới nếu fix đã có test regression.
+4. Xuất `flow_diagram` (ASCII đa dòng) mô tả luồng locate → giả thuyết → fix → nhánh test pass/fail.
 
 ## Mode = chore
 1. Đọc `.pagent/source-summary.md`.
 2. Phân tích task chore (refactor / dọn dẹp / bổ sung logic nhỏ). Output plan ngắn 2–4 bước — coder sửa gì, reviewer check gì.
 3. `required_agents` mặc định `["coder","reviewer"]`. Chỉ thêm `tester` khi plan yêu cầu test mới; nếu KHÔNG có `tester` thì `tester_task` phải rỗng `""`.
 4. KHÔNG cần `designer` và KHÔNG chạy workflow-extractor (chore không thêm workflow nghiệp vụ).
+5. Xuất `flow_diagram` (ASCII đa dòng) mô tả luồng các bước chore + nhánh nếu có.
 
 ## Mode = find
 1. Đọc `.pagent/source-summary.md`.
@@ -102,6 +105,7 @@ Phần test không tách được / không chắc độc lập → BỎ field n�
 3. `coder_task` PHẢI rỗng `""`. `tester_task` PHẢI rỗng `""`.
 4. `reviewer_focus` mô tả câu hỏi cần reviewer đọc source trả lời (kèm gợi ý file/folder/keyword nếu biết).
 5. Pipeline chỉ chạy reviewer — reviewer nhận `## QUESTION` + `## SOURCE_SUMMARY` + `## ORCHESTRATOR_PLAN` và trả lời bằng văn bản tự nhiên (KHÔNG xuất APPROVED/CHANGES_REQUESTED).
+6. Xuất `flow_diagram` (ASCII đa dòng) mô tả luồng điều tra để trả lời câu hỏi (nguồn đọc → suy luận → kết luận).
 
 ### Bước tổng hợp (hotfix, chạy lại cuối pipeline)
 Khi được gọi lại với input chứa `## REVIEWER_OUTPUT` (có khối `ROOT_CAUSE_ANALYSIS`)
@@ -122,12 +126,14 @@ Response của bạn phải là MỘT JSON OBJECT duy nhất, không gì khác.
 - KHÔNG có postamble ("Hy vọng giúp được…")
 - KHÔNG markdown bullet/heading bên ngoài JSON
 - Ký tự ĐẦU TIÊN của response phải là `{`. Ký tự CUỐI cùng phải là `}`.
+- LUÔN xuất field `flow_diagram`: ASCII đa dòng mô tả luồng logic task (bước/nhánh/điểm quyết định), terminal-renderable, KHÔNG mermaid. Nó là JSON string nên xuống dòng phải escape `\n` — KHÔNG phá vỡ ràng buộc 1 JSON object duy nhất.
 
 Schema:
 
 {
   "title": "tiêu đề ngắn (≤80 ký tự)",
   "summary": "1–2 câu mô tả approach",
+  "flow_diagram": "ASCII đa dòng mô tả luồng logic task (bước → nhánh → điểm quyết định), terminal-renderable. JSON string: xuống dòng bằng \\n, KHÔNG mermaid. Vd: \"[task]\\n  |\\n  v\\n[B1: locate]\\n  |\\n  v\\n<test pass?>\\n /yes      \\\\no\\n[done]   [B2: fix]\"",
   "required_agents": ["coder", "reviewer"],
   "coder_task": "task cụ thể giao cho coder, có file:line hint nếu biết",
   "coder_subtasks": [

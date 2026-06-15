@@ -415,5 +415,55 @@ class TestReadBodyMalformedHeader(unittest.TestCase):
         self.assertEqual(result, b"")
 
 
+class TestTaskScanCoversChoreAndFind(unittest.TestCase):
+    """list_tasks / task_detail must scan chores/ + findings/ directories,
+    otherwise chat completion-detection for chore/find modes never resolves."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pagent_scan_test_")
+        import server as srv
+        srv.REPORTS = os.path.realpath(self.tmp)
+        self.srv = srv
+        self.proj = "scanproj"
+        os.makedirs(os.path.join(self.tmp, self.proj))
+
+    def tearDown(self):
+        import shutil; shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_report(self, kind, stem, title):
+        d = os.path.join(self.tmp, self.proj, kind)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, stem + ".md"), "w") as f:
+            f.write(f"# {title}\n")
+
+    def test_list_tasks_includes_chores_dir(self):
+        self._write_report("chores", "2026-06-04-1700000000-1234-abcd", "tidy imports")
+        tasks = self.srv.list_tasks(self.proj)
+        kinds = {t["kind"] for t in tasks}
+        self.assertIn("chores", kinds, f"chore reports missing from listing: {tasks}")
+
+    def test_list_tasks_includes_findings_dir(self):
+        self._write_report("findings", "2026-06-04-1700000000-5678-efgh", "where is X")
+        tasks = self.srv.list_tasks(self.proj)
+        kinds = {t["kind"] for t in tasks}
+        self.assertIn("findings", kinds, f"find reports missing from listing: {tasks}")
+
+    def test_task_detail_returns_chore_report(self):
+        stem = "2026-06-04-1700000000-1234-abcd"
+        self._write_report("chores", stem, "tidy imports")
+        out = self.srv.task_detail(self.proj, stem)
+        self.assertEqual(out.get("kind"), "chores",
+                         f"task_detail did not return chore report: {out}")
+        self.assertIn("tidy imports", out.get("content", ""))
+
+    def test_task_detail_returns_find_report(self):
+        stem = "2026-06-04-1700000000-5678-efgh"
+        self._write_report("findings", stem, "where is X")
+        out = self.srv.task_detail(self.proj, stem)
+        self.assertEqual(out.get("kind"), "findings",
+                         f"task_detail did not return find report: {out}")
+        self.assertIn("where is X", out.get("content", ""))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

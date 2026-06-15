@@ -82,6 +82,8 @@ tr.row:hover { background: var(--panel-2); }
 .kind-tag { padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
 .kind-tag.features { background: rgba(74,222,128,0.15); color: var(--feature); }
 .kind-tag.bugs { background: rgba(248,113,113,0.15); color: var(--bug); }
+.kind-tag.chores { background: rgba(251,191,36,0.15); color: var(--warn); }
+.kind-tag.findings { background: rgba(125,211,252,0.15); color: var(--accent); }
 
 /* ── modal ── */
 #modal { position: fixed; inset: 0; background: rgba(0,0,0,0.75); display: flex; align-items: center; justify-content: center; z-index: 100; padding: 24px; }
@@ -154,6 +156,8 @@ tr.row:hover { background: var(--panel-2); }
 .mode-opt:hover { color: var(--text); border-color: transparent; }
 .mode-opt[data-mode="feature"].active { background: rgba(74,222,128,0.15); color: var(--feature); }
 .mode-opt[data-mode="fix"].active { background: rgba(248,113,113,0.15); color: var(--bug); }
+.mode-opt[data-mode="chore"].active { background: rgba(251,191,36,0.15); color: var(--warn); }
+.mode-opt[data-mode="find"].active { background: rgba(125,211,252,0.15); color: var(--accent); }
 .mode-opt:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .chat-stream {

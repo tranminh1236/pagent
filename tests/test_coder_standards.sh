@@ -52,7 +52,7 @@ echo "=== coder.md — Coding Standards verification ==="
 
 # --- YAML frontmatter fields intact ---
 assert_meta "name = coder" "name" "coder"
-assert_meta "model = claude-opus-4-8" "model" "claude-opus-4-8"
+assert_meta "model = opus" "model" "opus"
 assert_meta "caveman = lite" "caveman" "lite"
 assert_meta "mcp_servers = context7" "mcp_servers" "context7"
 

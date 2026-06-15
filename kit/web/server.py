@@ -145,7 +145,7 @@ def list_tasks(proj):
         if ag and ag not in a["agents"]: a["agents"].append(ag)
     # Scan report files
     tasks = []
-    for kind in ("features", "bugs"):
+    for kind in ("features", "bugs", "chores", "findings"):
         d = os.path.join(root, kind)
         if not os.path.isdir(d): continue
         for f in sorted(os.listdir(d), reverse=True):
@@ -181,7 +181,7 @@ def task_detail(proj, task_filename):
     if not _valid_tid(task_filename):
         return {"error": "invalid task id"}
     root = os.path.join(REPORTS, proj)
-    for kind in ("features", "bugs"):
+    for kind in ("features", "bugs", "chores", "findings"):
         p = _safe_join(root, kind, task_filename + ".md")
         if p and os.path.isfile(p):
             with open(p) as f: content = f.read()
@@ -473,8 +473,8 @@ class H(BaseHTTPRequestHandler):
             return self._j({"error": "JSON không hợp lệ"}, 400)
 
         mode = data.get("mode")
-        if mode not in ("feature", "fix"):
-            return self._j({"error": "mode phải là 'feature' hoặc 'fix'"}, 400)
+        if mode not in ("feature", "fix", "chore", "find"):
+            return self._j({"error": "mode phải là 'feature', 'fix', 'chore' hoặc 'find'"}, 400)
         task = (data.get("task") or "").strip()
         if not task:
             return self._j({"error": "task rỗng"}, 400)

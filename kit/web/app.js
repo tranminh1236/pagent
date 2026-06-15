@@ -13,6 +13,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'
 const fmtMs = (ms) => ms ? (ms < 1000 ? `${ms}ms` : `${(ms/1000).toFixed(1)}s`) : '—';
 const fmtCost = (n) => '$' + (n || 0).toFixed(4);
 const fmtNum = (n) => (n || 0).toLocaleString();
+const KIND_LABEL = { features: 'feat', bugs: 'bug', chores: 'chore', findings: 'find' };
 const fmtAgo = (ts) => {
   if (!ts) return '';
   const d = new Date(ts);
@@ -160,7 +161,7 @@ function renderHistory(tasks) {
     ? tasks.map(t => `
         <tr class="row" data-id="${esc(t.id)}">
           <td><span title="${esc(new Date(t.mtime*1000).toLocaleString())}">${esc(fmtAgo(new Date(t.mtime*1000).toISOString()))}</span></td>
-          <td><span class="kind-tag ${t.kind}">${esc(t.kind === 'features' ? 'feat' : 'bug')}</span></td>
+          <td><span class="kind-tag ${t.kind}">${esc(KIND_LABEL[t.kind] || t.kind)}</span></td>
           <td>${esc(t.title)}</td>
           <td><div class="agent-pills">${(t.agents || []).map(a => `<span class="agent-pill">${esc(a)}</span>`).join('')}</div></td>
           <td class="num">${fmtCost(t.cost_usd)}</td>
