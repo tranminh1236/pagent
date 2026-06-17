@@ -118,17 +118,38 @@ function renderProviderPill(provider, model, usage) {
 function renderLive(live) {
   $('#live-dot').classList.toggle('active', live.length > 0);
   $('#live-count').textContent = live.length ? `${live.length} running` : 'idle';
-  $('#live-list').innerHTML = live.length
+
+  const list = $('#live-list');
+  const html = live.length
     ? live.map(t => `
         <div class="live-item">
           <div class="live-head">
             <div class="live-task-id">${esc(t.task_id)} · ${esc(t.mode)} · ${esc(fmtAgo(t.last_ts))}</div>
             <div class="live-task-text">${esc(t.task || '(no task text)')}</div>
           </div>
-          <div class="live-dag">${renderTimeline(t.timeline || [], t.task_id)}</div>
+          <div class="live-dag" data-task-id="${esc(t.task_id)}">${renderTimeline(t.timeline || [], t.task_id)}</div>
         </div>
       `).join('')
     : '<div class="idle-msg">No active tasks. Run <code>pagent feature "..."</code> trong terminal.</div>';
+
+  // Bỏ qua re-render nếu HTML không đổi — tránh reset scroll mỗi nhịp poll.
+  if (list.innerHTML === html) return;
+
+  // Lưu vị trí scroll dọc của list + scroll ngang từng timeline (map theo task_id).
+  const listScrollTop = list.scrollTop;
+  const dagScrollLeft = {};
+  list.querySelectorAll('.live-dag').forEach(dag => {
+    dagScrollLeft[dag.dataset.taskId] = dag.scrollLeft;
+  });
+
+  list.innerHTML = html;
+
+  // Khôi phục scroll sau khi re-render.
+  list.scrollTop = listScrollTop;
+  list.querySelectorAll('.live-dag').forEach(dag => {
+    const left = dagScrollLeft[dag.dataset.taskId];
+    if (left != null) dag.scrollLeft = left;
+  });
 }
 
 function renderAgents(agents) {

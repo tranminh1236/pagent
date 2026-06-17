@@ -57,6 +57,7 @@ section h2 {
 .live-head { margin-bottom: 10px; }
 .live-task-id { font-family: var(--mono); font-size: 11px; color: var(--dim); }
 .live-task-text { margin: 4px 0; font-size: 13px; }
+#live-list { max-height: 60vh; overflow-y: auto; }
 .live-dag { overflow-x: auto; }
 .live-dag .timeline-step { min-width: 130px; padding: 6px 10px; }
 .live-dag .timeline-step .step-meta { font-size: 10px; }
