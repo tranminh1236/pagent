@@ -239,3 +239,61 @@ tr.row:hover { background: var(--panel-2); }
   .dot.active, .agent-pill.running, .timeline-step.running { animation: none; }
   .send-btn.loading::after { animation: none; }
 }
+
+/* Copy report-id (@<task_id>) — dùng ở history / live / modal */
+.copy-id {
+  font-family: var(--mono); font-size: 11px; line-height: 1;
+  padding: 1px 5px; border-radius: 4px; cursor: pointer;
+  background: var(--panel-2); color: var(--dim);
+  border: 1px solid var(--border); vertical-align: middle;
+}
+.copy-id:hover { color: var(--accent); border-color: var(--accent); }
+.copy-id.copied { color: var(--feature); border-color: var(--feature); }
+.hist-title { vertical-align: middle; }
+.open-parent { color: var(--accent); text-decoration: none; }
+.open-parent:hover { text-decoration: underline; }
+
+/* Plan confirm gate — pause trước khi agent sửa file */
+.plan-gate {
+  margin-top: 8px; padding: 10px 12px; border-radius: 8px;
+  background: var(--panel-2); border: 1px solid var(--warn);
+}
+.plan-title { font-weight: 700; color: var(--warn); margin-bottom: 6px; font-size: 13px; }
+.plan-row { font-size: 12px; margin: 3px 0; line-height: 1.4; }
+.plan-q ul { margin: 4px 0 0; padding-left: 18px; }
+.plan-risk { font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 1px 6px; border-radius: 4px; }
+.risk-low { background: rgba(74,222,128,0.15); color: var(--feature); }
+.risk-medium { background: rgba(251,191,36,0.15); color: var(--warn); }
+.risk-high { background: rgba(248,113,113,0.15); color: var(--bug); }
+.plan-flow {
+  font-family: var(--mono); font-size: 11px; color: var(--text);
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px; margin: 6px 0; overflow-x: auto; white-space: pre;
+}
+.plan-edit {
+  width: 100%; box-sizing: border-box; margin: 6px 0; resize: vertical;
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; font: inherit; font-size: 12px;
+}
+.plan-actions { display: flex; gap: 8px; margin-top: 4px; }
+.plan-actions button {
+  cursor: pointer; padding: 5px 12px; border-radius: 6px; font-size: 12px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+}
+.plan-run { border-color: var(--feature) !important; color: var(--feature) !important; }
+.plan-run:hover { background: rgba(74,222,128,0.12); }
+.plan-edit-btn:hover { background: var(--panel-2); }
+.plan-cancel { border-color: var(--bug) !important; color: var(--bug) !important; }
+.plan-cancel:hover { background: rgba(248,113,113,0.12); }
+
+/* Cancel task đang chạy (Live panel) */
+.live-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.live-head .live-task-id { flex: 1; min-width: 0; }
+.live-head .live-task-text { width: 100%; }
+.live-cancel {
+  flex: none; cursor: pointer; font-size: 11px; font-weight: 600;
+  padding: 3px 10px; border-radius: 6px;
+  background: var(--panel); color: var(--bug); border: 1px solid var(--bug);
+}
+.live-cancel:hover { background: rgba(248,113,113,0.12); }
+.live-cancel:disabled { opacity: 0.55; cursor: default; color: var(--dim); border-color: var(--border); }

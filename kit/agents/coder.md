@@ -1,7 +1,7 @@
 ---
 name: coder
 description: Implement feature hoặc fix bug — edit code thật trong source folder
-model: opus
+model: claude-opus-4-7
 allowed_tools: Read,Write,Edit,Bash,Grep,Glob,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs
 mcp_servers: context7
 caveman: lite

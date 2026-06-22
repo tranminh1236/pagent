@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """pagent web dashboard — single-file HTTP server, Python stdlib only."""
-import os, json, re, sys, random, shutil, subprocess
+import os, json, re, sys, random, shutil, subprocess, signal
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote, parse_qs
@@ -219,6 +219,71 @@ def read_chat_log(proj, tid, offset=0):
     except Exception as e:
         return {"error": f"đọc log thất bại: {e}"}
 
+def _valid_rawtid(t):
+    """task_id thô (<ts>-<pid>-<rand>) — như chat-log, KHÁC _valid_tid (stem report)."""
+    return bool(t) and bool(_ID_RE.fullmatch(t)) and ".." not in t
+
+def _is_cancelled(proj, tid):
+    m = _safe_join(REPORTS, proj, "runs", tid, "cancelled")
+    return bool(m) and os.path.isfile(m)
+
+def cancel_task(proj, tid):
+    """Dừng task đang chạy: ghi marker `cancelled` (live ẩn ngay) + kill cây process pagent.
+    pagent ghi runs/<tid>/pagent.pid lúc khởi chạy. Web spawn start_new_session=True nên
+    pid = group leader → killpg hạ cả claude con. Run khởi từ CLI (pid != pgid) → chỉ kill
+    pagent (an toàn, không đụng shell của user)."""
+    if not _valid_rawtid(tid):
+        return {"error": "task id không hợp lệ"}
+    rundir = _safe_join(REPORTS, proj, "runs", tid)
+    if not rundir or not os.path.isdir(rundir):
+        return {"error": "run dir không tồn tại (task đã xong hoặc chưa khởi chạy?)"}
+    # Marker trước khi kill — live_tasks ẩn task ngay cả khi post-hook không ghi 'end'.
+    marker = _safe_join(rundir, "cancelled")
+    if marker:
+        try:
+            tmp = marker + ".tmp"
+            with open(tmp, "w") as f:
+                f.write("1")
+            os.replace(tmp, marker)
+        except Exception:
+            pass
+    killed = False
+    pidf = _safe_join(rundir, "pagent.pid")
+    if pidf and os.path.isfile(pidf):
+        try:
+            with open(pidf) as f:
+                pid = int(f.readline().strip())
+        except Exception:
+            pid = 0
+        if pid > 1:
+            try:
+                pgid = os.getpgid(pid)
+                if pgid == pid:                    # web-spawned: nhóm cô lập → kill cả cây
+                    os.killpg(pgid, signal.SIGTERM)
+                else:                              # CLI-spawned: chỉ pagent (tránh kill shell)
+                    os.kill(pid, signal.SIGTERM)
+                killed = True
+            except ProcessLookupError:
+                killed = False                     # đã thoát rồi
+            except Exception:
+                pass
+    return {"ok": True, "killed": killed}
+
+def plan_pending(proj, tid):
+    """Plan đang chờ user xác nhận (pagent ghi runs/<tid>/plan.pending.json khi PAGENT_CONFIRM=1).
+    {pending: bool, plan?: {...}}."""
+    if not _valid_rawtid(tid):
+        return {"error": "task id không hợp lệ"}
+    pend = _safe_join(REPORTS, proj, "runs", tid, "plan.pending.json")
+    if not pend or not os.path.isfile(pend):
+        return {"pending": False}
+    try:
+        with open(pend) as f:
+            plan = json.load(f)
+    except Exception:
+        return {"pending": False}     # đang ghi dở / hỏng → coi như chưa sẵn sàng
+    return {"pending": True, "plan": plan}
+
 def _step_models(e):
     """Danh sách TẤT CẢ model 1 lượt agent đã dùng. Ưu tiên field `models` (post.sh mới);
     fallback model đơn (event cũ) để không vỡ timeline lịch sử."""
@@ -377,6 +442,7 @@ def live_tasks(proj):
          "mode": meta[tid]["mode"], "last_ts": meta[tid]["ts"],
          "timeline": _task_timeline(proj, tid)}
         for tid, ags in sorted(live.items(), key=lambda x: meta[x[0]]["ts"], reverse=True)
+        if not _is_cancelled(proj, tid)        # task đã bị Cancel → ẩn khỏi Live ngay
     ]
 
 def agent_stats(proj):
@@ -451,6 +517,18 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             path = urlparse(self.path).path
+            md = re.match(r"^/api/projects/([^/]+)/plan/(.+)$", path)
+            if md:
+                proj = unquote(md.group(1))
+                if not _valid_proj(proj):
+                    return self._j({"error": "invalid or unknown project"}, 400)
+                return self._decision(proj, unquote(md.group(2)))
+            mc = re.match(r"^/api/projects/([^/]+)/cancel/(.+)$", path)
+            if mc:
+                proj = unquote(mc.group(1))
+                if not _valid_proj(proj):
+                    return self._j({"error": "invalid or unknown project"}, 400)
+                return self._j(cancel_task(proj, unquote(mc.group(2))))
             m = re.match(r"^/api/projects/([^/]+)/(chat|upload)$", path)
             if not m:
                 return self._j({"error": "not found"}, 404)
@@ -462,6 +540,35 @@ class H(BaseHTTPRequestHandler):
             return self._upload(proj)
         except Exception as e:
             self._safe_error(e)
+
+    def _decision(self, proj, tid):
+        """Web POST quyết định plan → ghi runs/<tid>/decision.json để pagent đọc (atomic)."""
+        if not _valid_rawtid(tid):
+            return self._j({"error": "task id không hợp lệ"}, 400)
+        raw = self._read_body()
+        if raw is None:
+            return self._j({"error": "body quá lớn"}, 413)
+        try:
+            data = json.loads(raw or b"{}")
+        except Exception:
+            return self._j({"error": "JSON không hợp lệ"}, 400)
+        action = data.get("action")
+        if action not in ("run", "edit", "cancel"):
+            return self._j({"error": "action phải là run|edit|cancel"}, 400)
+        extra = (data.get("extra") or "").strip()
+        if action == "edit" and not extra:
+            return self._j({"error": "cần nội dung sửa plan"}, 400)
+        rundir = _safe_join(REPORTS, proj, "runs", tid)
+        if not rundir or not os.path.isdir(rundir):
+            return self._j({"error": "run dir không tồn tại (task đã xong hoặc chưa khởi chạy?)"}, 409)
+        decpath = _safe_join(rundir, "decision.json")
+        if not decpath:
+            return self._j({"error": "đường dẫn không hợp lệ"}, 400)
+        tmp = decpath + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"action": action, "extra": extra}, f)
+        os.replace(tmp, decpath)   # atomic — pagent không bao giờ đọc file ghi dở
+        return self._j({"ok": True, "action": action})
 
     def _chat(self, proj):
         raw = self._read_body()
@@ -508,6 +615,8 @@ class H(BaseHTTPRequestHandler):
         env["PAGENT_REPORT_DIR"] = REPORTS
         env["PAGENT_SOURCE"] = source
         env["PAGENT_TASK_ID"] = tid
+        # Web LUÔN bắt xác nhận plan (handshake qua file) — trừ khi client tắt rõ ràng.
+        env["PAGENT_CONFIRM"] = "0" if data.get("no_confirm") is True else "1"
         if design:
             env["PAGENT_DESIGN"] = "1"   # gate figma/canvas MCP (xem pagent call_agent)
 
@@ -591,6 +700,7 @@ class H(BaseHTTPRequestHandler):
                 (r"/tasks",        lambda p:    self._j(list_tasks(p))),
                 (r"/tasks/(.+)",   lambda p, t: self._j(task_detail(p, t))),
                 (r"/chat-log/(.+)",lambda p, t: self._j(read_chat_log(p, t, (qs.get("offset") or ["0"])[0]))),
+                (r"/plan/(.+)",    lambda p, t: self._j(plan_pending(p, t))),
                 (r"/live",         lambda p:    self._j(live_tasks(p))),
                 (r"/agents",       lambda p:    self._j(agent_stats(p))),
             ):

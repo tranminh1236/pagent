@@ -1,7 +1,7 @@
 ---
 name: designer
 description: Design agent — nhận task + plan, xuất design spec JSON (tokens, component, layout, a11y) chuẩn Grab/Shopee/Apple HIG
-model: opus
+model: claude-opus-4-8
 allowed_tools: Read Grep mcp__figma mcp__canvas
 disallowed_tools: Write,Edit,NotebookEdit,Bash
 mcp_servers: figma,canvas

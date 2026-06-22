@@ -190,11 +190,16 @@ extract_json() {
   python3 -c '
 import sys, re, json
 t = sys.stdin.read()
-try: json.loads(t); print(t); sys.exit(0)
+# strict=False: chấp nhận control char thô (vd newline literal trong flow_diagram —
+# model thường quên escape \n). Luôn RE-SERIALIZE bằng json.dumps để output là JSON
+# canonical hợp lệ strict (escape \n đúng) → downstream jq (strict theo spec) parse được.
+def emit(o):
+    sys.stdout.write(json.dumps(o, ensure_ascii=False)); sys.exit(0)
+try: emit(json.loads(t, strict=False))
 except Exception: pass
 s = re.sub(r"^```\w*\s*", "", t.strip(), flags=re.M)
 s = re.sub(r"\s*```$", "", s, flags=re.M)
-try: json.loads(s); print(s); sys.exit(0)
+try: emit(json.loads(s, strict=False))
 except Exception: pass
 def fb(s):
     i = s.find("{")
@@ -214,7 +219,7 @@ def fb(s):
     return None
 c = fb(t)
 if c:
-    try: json.loads(c); print(c); sys.exit(0)
+    try: emit(json.loads(c, strict=False))
     except Exception: pass
 sys.exit(1)
 '
@@ -431,14 +436,73 @@ acquire_run_lock() {
   fi
   printf '%s %s\n' "$$" "$PAGENT_TASK_ID" >"$lock"
   PAGENT_RUN_LOCK="$lock"
+  # INT/TERM (vd web bấm Cancel → kill process group) cũng dọn lock + pid để không
+  # để lại lock "ma" cảnh báo run sau. Handler tự exit sau khi dọn.
+  trap 'release_run_lock; exit 130' INT
+  trap 'release_run_lock; exit 143' TERM
   trap 'release_run_lock' EXIT
 }
 release_run_lock() {
+  # pid file (web cancel đọc để kill) — dọn luôn khi thoát/bị kill.
+  [[ -n "${PAGENT_RUN_DIR:-}" ]] && rm -f "$PAGENT_RUN_DIR/pagent.pid" 2>/dev/null || true
   [[ -n "${PAGENT_RUN_LOCK:-}" && -f "$PAGENT_RUN_LOCK" ]] || return 0
   # Chỉ xoá nếu lock vẫn của ta (tránh xoá lock của run giành sau cảnh báo)
   local lp; read -r lp _ <"$PAGENT_RUN_LOCK" 2>/dev/null || true
   [[ "${lp:-}" == "$$" ]] && rm -f "$PAGENT_RUN_LOCK"
   return 0
+}
+
+#─────────────────────────────────────────────
+# Lineage: tham chiếu report cũ qua @<task_id>
+#─────────────────────────────────────────────
+# Định dạng task_id chuẩn: <YYYYMMDDTHHMMSS>-<pid>-<rand> (xem new_task_id).
+PAGENT_TID_RE='[0-9]{8}T[0-9]{6}-[0-9]+-[0-9]+'
+
+# Trích @<task_id> ĐẦU TIÊN trong text (stdin/$1). Stdout: task_id (không @). Exit 1 nếu không có.
+extract_parent_ref() {
+  local txt="$1"
+  [[ "$txt" =~ @($PAGENT_TID_RE) ]] && { printf '%s' "${BASH_REMATCH[1]}"; return 0; }
+  return 1
+}
+
+# Tìm file report theo task_id (quét 4 loại report). Stdout: path. Exit 1 nếu không thấy.
+find_report_by_id() {
+  local tid="$1" base="$PAGENT_REPORT_DIR/$PAGENT_PROJECT" sub f
+  for sub in features bugs chores findings; do
+    for f in "$base/$sub/"*-"$tid".md; do
+      [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+    done
+  done
+  return 1
+}
+
+# Đọc parent id của 1 report file (dòng `**Parent:** <id>`). Rỗng nếu không có.
+report_parent_id() {
+  grep -m1 '^\*\*Parent:\*\*' "$1" 2>/dev/null | sed -E 's/^\*\*Parent:\*\* *//; s/[^0-9A-Za-z._T-].*$//'
+}
+
+# Dựng context lineage: đi từ <task_id> ngược lên gốc, in các report theo thứ tự GỐC→CON
+# để orchestrator hiểu task tiến hoá thế nào. Chống cycle + giới hạn độ sâu. Exit 1 nếu rỗng.
+build_lineage_context() {
+  local cur="$1" depth=0 max=10 seen=" "
+  local -a files=()
+  while [[ -n "$cur" && $depth -lt $max ]]; do
+    [[ "$seen" == *" $cur "* ]] && break       # cycle guard
+    seen+="$cur "
+    local f; f="$(find_report_by_id "$cur")" || break
+    files+=("$f")
+    cur="$(report_parent_id "$f")"
+    depth=$((depth + 1))
+  done
+  [[ ${#files[@]} -eq 0 ]] && return 1
+  local i
+  for (( i=${#files[@]}-1; i>=0; i-- )); do
+    local f="${files[i]}" tid
+    tid="$(basename "$f" .md | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}-//')"
+    printf '### report @%s\n' "$tid"
+    head -120 "$f"                               # report nhỏ; cap để chain sâu không phình context
+    printf '\n'
+  done
 }
 
 #─────────────────────────────────────────────
@@ -494,6 +558,8 @@ write_report() {
     printf '**Project:** %s\n' "$PAGENT_PROJECT"
     printf '**Mode:** %s\n' "$PAGENT_MODE"
     printf '**Task ID:** %s\n' "$PAGENT_TASK_ID"
+    printf '**Ref (copy để nối task sau):** `@%s`\n' "$PAGENT_TASK_ID"
+    [[ -n "${PAGENT_PARENT:-}" ]] && printf '**Parent:** %s\n' "$PAGENT_PARENT"
     printf '**Date:** %s\n' "$datetime_str"
     printf '**Risk:** %s\n' "$risk"
     printf '**Total cost:** $%s (%s in / %s out, cache read %s)\n\n' "$cost" "$in_tok" "$out_tok" "$cache_r"
@@ -560,6 +626,42 @@ _is_truthy() {
   esac
 }
 
+# Handshake xác nhận plan qua file — cho web / non-tty (không hỏi được qua /dev/tty).
+# Ghi plan ra $RUN_DIR/plan.pending.json rồi POLL $RUN_DIR/decision.json (web POST vào).
+#   action=run   → return 0 (chạy pipeline)
+#   action=edit  → set CONFIRM_EXTRA, return 1 (caller re-run orchestrator với info bổ sung)
+#   action=cancel→ exit 0 (hủy)
+# Hết PAGENT_CONFIRM_TIMEOUT giây không có quyết định → HỦY (an toàn: không tự sửa file).
+confirm_plan_via_file() {
+  local pj="$1"
+  local pend="$PAGENT_RUN_DIR/plan.pending.json"
+  local dec="$PAGENT_RUN_DIR/decision.json"
+  rm -f "$dec"
+  printf '%s\n' "$pj" >"$pend"
+  log "$(c_cyan 'PLAN chờ xác nhận') — mở web dashboard để [Chạy] / [Sửa] / [Hủy]"
+  local timeout="${PAGENT_CONFIRM_TIMEOUT:-1800}" waited=0
+  while :; do
+    if [[ -f "$dec" ]]; then
+      local action extra
+      action="$(jq -r '.action // "run"' "$dec" 2>/dev/null || echo run)"
+      extra="$(jq -r '.extra // ""' "$dec" 2>/dev/null || echo "")"
+      rm -f "$dec"
+      case "$action" in
+        run)    rm -f "$pend"; log "$(c_green 'xác nhận') plan (web) — chạy pipeline"; return 0 ;;
+        cancel) rm -f "$pend"; log "$(c_yellow 'hủy') bởi user (web) — không chạy pipeline"; exit 0 ;;
+        edit)   rm -f "$pend"; CONFIRM_EXTRA="$extra"; log "$(c_cyan 'sửa plan') (web) — lập lại plan"; return 1 ;;
+        *)      rm -f "$pend"; return 0 ;;
+      esac
+    fi
+    sleep 2; waited=$((waited + 2))
+    if (( waited >= timeout )); then
+      rm -f "$pend"
+      warn "hết thời gian chờ xác nhận (${timeout}s) — hủy để tránh tự sửa file"
+      exit 0
+    fi
+  done
+}
+
 # Confirm gate sau khi orchestrator ra plan: in tóm tắt cho user qua stderr rồi hỏi qua /dev/tty.
 #   return 0  → user xác nhận / bỏ qua gate → tiếp tục pipeline
 #   return 1  → user nhập text bổ sung (set CONFIRM_EXTRA) → caller re-run orchestrator
@@ -573,7 +675,12 @@ confirm_plan_gate() {
   if _is_truthy "${PAGENT_NO_CONFIRM:-}" || _is_truthy "${PAGENT_YES:-}"; then
     return 0
   fi
+  # Không có tty (vd web spawn với stdin=DEVNULL): nếu PAGENT_CONFIRM bật → handshake
+  # qua file (web POST decision). Không bật → auto-run (backward-compat automation).
   if [[ ! -t 0 || ! -e /dev/tty ]]; then
+    if _is_truthy "${PAGENT_CONFIRM:-}"; then
+      confirm_plan_via_file "$pj"; return $?
+    fi
     return 0
   fi
 
@@ -638,6 +745,8 @@ cmd_pipeline() {
   printf '%s\n' "$PAGENT_SOURCE" >"$PAGENT_REPORT_DIR/$PAGENT_PROJECT/.source"
 
   acquire_run_lock
+  # PID để web Cancel kill được cả cây process (pagent + claude con).
+  printf '%s\n' "$$" >"$PAGENT_RUN_DIR/pagent.pid"
 
   log "project=$PAGENT_PROJECT mode=$mode task_id=$PAGENT_TASK_ID"
   log "source=$PAGENT_SOURCE"
@@ -647,6 +756,20 @@ cmd_pipeline() {
   if [[ ! -f "$PAGENT_SOURCE/.pagent/source-summary.md" ]]; then
     warn "chưa có .pagent/source-summary.md → chạy: pagent init"
   fi
+
+  # Lineage: task có thể tham chiếu report cũ qua @<task_id> (hoặc PAGENT_PARENT env).
+  # Resolve chain GỐC→CON → nhét vào input orchestrator để hiểu toàn bộ context.
+  PAGENT_PARENT="${PAGENT_PARENT:-$(extract_parent_ref "$task" || true)}"
+  local parent_context=""
+  if [[ -n "$PAGENT_PARENT" ]]; then
+    if parent_context="$(build_lineage_context "$PAGENT_PARENT")" && [[ -n "$parent_context" ]]; then
+      log "  parent: $(c_green "@$PAGENT_PARENT") (lineage $(grep -c '^### report @' <<<"$parent_context") report)"
+    else
+      warn "parent @$PAGENT_PARENT — không tìm thấy report tương ứng (bỏ qua lineage)"
+      PAGENT_PARENT=""
+    fi
+  fi
+  export PAGENT_PARENT
 
   #────── 1. Orchestrator (confirm gate → có thể re-run với info bổ sung) ──────
   local step_total=4
@@ -661,6 +784,10 @@ cmd_pipeline() {
     plan_text="$( {
       echo "## MODE"; echo "$mode"; echo
       echo "## SOURCE_SUMMARY_PATH"; echo ".pagent/source-summary.md"; echo
+      if [[ -n "$parent_context" ]]; then
+        echo "## PARENT_CONTEXT (lineage report cũ, thứ tự GỐC→CON — hiểu toàn bộ context, ĐỪNG làm lại việc đã xong)"
+        echo "$parent_context"; echo
+      fi
       echo "## TASK"; echo "$task"
       # NB: phải dùng `if ... fi` (không phải `[[ ]] &&`) — đây là lệnh CUỐI của
       # brace group bên trái pipe. Với `set -o pipefail`, `[[ -n "" ]]` (extra_info
@@ -723,7 +850,8 @@ cmd_pipeline() {
 
     log "  title: $(c_green "$title")  risk=$risk"
 
-    # User xác nhận plan / bổ sung info / hủy (tự bỏ qua khi không tty hoặc PAGENT_NO_CONFIRM/PAGENT_YES).
+    # User xác nhận plan / bổ sung info / hủy. Tty → hỏi /dev/tty; web (PAGENT_CONFIRM) →
+    # handshake file; non-tty không bật confirm hoặc PAGENT_YES/NO_CONFIRM → tự chạy.
     confirm_plan_gate "$plan_json" && break
     orch_round=$((orch_round + 1))
     extra_info="${extra_info:+$extra_info$'\n'}$CONFIRM_EXTRA"
@@ -1209,6 +1337,12 @@ USAGE
   pagent web [port] [host]             Bật web dashboard (mặc định http://127.0.0.1:8765)
   pagent help                          Trợ giúp
 
+LINEAGE (nối tiếp report cũ)
+  Mỗi report có **Task ID** + dòng Ref `@<task_id>`. Chèn `@<task_id>` vào text task
+  mới → pagent tra ngược chain GỐC→CON, nhét vào input orchestrator để hiểu toàn bộ
+  context và không làm lại việc đã xong. Vd: pagent feature "thêm pagination @20250622T101500-123-4567"
+  (hoặc set env PAGENT_PARENT=<task_id>). Copy id nhanh ở web dashboard.
+
 SKILL RESOLUTION (project-local override global)
   1. $PAGENT_SOURCE/.pagent/skills/<name>.md   ← project-local
   2. $PAGENT_SOURCE/.pagent/agents/<name>.md
@@ -1224,6 +1358,9 @@ ENVIRONMENT (đặt trong .env.pagent hoặc shell)
   PAGENT_MODE               feature | hotfix | chore | find (override subcommand)
   PAGENT_CLAUDE_BIN         path tới claude CLI (mặc định "claude")
   PAGENT_MAX_REVIEW_ROUND   số vòng coder↔reviewer (mặc định 2)
+  PAGENT_CONFIRM            1 → bắt buộc xác nhận plan trước khi chạy agent (web tự bật)
+  PAGENT_CONFIRM_TIMEOUT    giây chờ xác nhận qua web rồi hủy (mặc định 1800)
+  PAGENT_YES / PAGENT_NO_CONFIRM  1 → bỏ qua gate xác nhận, chạy luôn
   PAGENT_CAVEMAN            off|lite|full|ultra — token compress mode (override md frontmatter)
   PAGENT_OPENROUTER_KEY     OpenRouter API key (sk-or-v1-…) cho fallback khi Claude down
   PAGENT_OPENROUTER_BASE    default: https://openrouter.ai/api/v1

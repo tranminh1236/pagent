@@ -25,8 +25,32 @@ const fmtAgo = (ts) => {
 };
 
 let project = null;
+// task_id (thuần) → stem report (date-taskid) để mở report cha từ modal. Nạp ở renderHistory.
+const taskStemById = {};
+
+// Copy @<task_id> để dán vào task sau (referencing → pagent tra ngược lineage gốc→con).
+async function copyText(text, btn) {
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try { document.execCommand('copy'); } catch {}
+    ta.remove();
+  }
+  if (btn) {
+    const old = btn.textContent;
+    btn.textContent = '✓'; btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = old; btn.classList.remove('copied'); }, 900);
+  }
+}
+// Nút copy id: copy '@<task_id>' (paste-ready để nối task sau).
+const copyBtn = (taskId) =>
+  `<button class="copy-id" data-ref="@${esc(taskId)}" title="Copy @${esc(taskId)} — dán vào task sau để nối lineage">⧉</button>`;
 // Trạng thái bung subagent trong timeline — key = `${task_id}::${agent}`. Giữ qua re-render live.
 const expandedSubagents = new Set();
+// Plan đã quyết định (hash) — chặn re-render gate sau khi user bấm, tránh nháy lại do poll race.
+const decidedPlans = new Set();
 // Chat tách theo project: mỗi project giữ riêng nội dung stream + task đang theo dõi + offset log.
 // chatState[proj] = { streamHTML, activeTaskId, logOffset }
 const chatState = {};
@@ -124,7 +148,8 @@ function renderLive(live) {
     ? live.map(t => `
         <div class="live-item">
           <div class="live-head">
-            <div class="live-task-id">${esc(t.task_id)} · ${esc(t.mode)} · ${esc(fmtAgo(t.last_ts))}</div>
+            <div class="live-task-id">${esc(t.task_id)} ${copyBtn(t.task_id)} · ${esc(t.mode)} · ${esc(fmtAgo(t.last_ts))}</div>
+            <button class="live-cancel" data-task-id="${esc(t.task_id)}" title="Dừng task này">✕ Cancel</button>
             <div class="live-task-text">${esc(t.task || '(no task text)')}</div>
           </div>
           <div class="live-dag" data-task-id="${esc(t.task_id)}">${renderTimeline(t.timeline || [], t.task_id)}</div>
@@ -150,6 +175,21 @@ function renderLive(live) {
     const left = dagScrollLeft[dag.dataset.taskId];
     if (left != null) dag.scrollLeft = left;
   });
+}
+
+// Dừng task đang chạy: kill cây process pagent + ẩn khỏi Live. Thay đổi đã ghi vào file giữ nguyên.
+async function cancelLiveTask(tid, btn) {
+  if (!confirm(`Dừng task ${tid}?\nCác thay đổi đã ghi vào file sẽ giữ nguyên (không tự revert).`)) return;
+  if (btn) { btn.disabled = true; btn.textContent = '… đang dừng'; }
+  try {
+    const r = await parseJson(await fetch(
+      `/api/projects/${encodeURIComponent(project)}/cancel/${encodeURIComponent(tid)}`, { method: 'POST' }));
+    if (r.error) { alert(r.error); if (btn) { btn.disabled = false; btn.textContent = '✕ Cancel'; } return; }
+    refresh();   // live_tasks ẩn task đã cancel ngay
+  } catch (e) {
+    alert(String(e));
+    if (btn) { btn.disabled = false; btn.textContent = '✕ Cancel'; }
+  }
 }
 
 function renderAgents(agents) {
@@ -178,12 +218,13 @@ function renderAgents(agents) {
 
 function renderHistory(tasks) {
   $('#history-count').textContent = tasks.length ? `(${tasks.length})` : '';
+  tasks.forEach(t => { taskStemById[t.task_id] = t.id; });
   $('#history-tbody').innerHTML = tasks.length
     ? tasks.map(t => `
         <tr class="row" data-id="${esc(t.id)}">
           <td><span title="${esc(new Date(t.mtime*1000).toLocaleString())}">${esc(fmtAgo(new Date(t.mtime*1000).toISOString()))}</span></td>
           <td><span class="kind-tag ${t.kind}">${esc(KIND_LABEL[t.kind] || t.kind)}</span></td>
-          <td>${esc(t.title)}</td>
+          <td><span class="hist-title">${esc(t.title)}</span> ${copyBtn(t.task_id)}</td>
           <td><div class="agent-pills">${(t.agents || []).map(a => `<span class="agent-pill">${esc(a)}</span>`).join('')}</div></td>
           <td class="num">${fmtCost(t.cost_usd)}</td>
           <td class="num">${fmtMs(t.duration_ms)}</td>
@@ -192,14 +233,26 @@ function renderHistory(tasks) {
       `).join('')
     : '<tr><td colspan="7" class="idle-msg">Chưa có report nào.</td></tr>';
   $('#history-tbody').querySelectorAll('tr.row').forEach(tr =>
-    tr.addEventListener('click', () => showDetail(tr.dataset.id)));
+    tr.addEventListener('click', (e) => {
+      if (e.target.closest('.copy-id')) return;   // click nút copy → đừng mở modal
+      showDetail(tr.dataset.id);
+    }));
 }
 
 async function showDetail(id) {
   const r = await j(`/api/projects/${encodeURIComponent(project)}/tasks/${encodeURIComponent(id)}`);
   if (r.error) { alert(r.error); return; }
+  // Parent từ report markdown (dòng **Parent:** <id>) → link mở report cha nếu có trong history.
+  const pm = /\*\*Parent:\*\*\s*([0-9A-Za-z._T-]+)/.exec(r.content || '');
+  let parentHtml = '';
+  if (pm) {
+    const pid = pm[1], stem = taskStemById[pid];
+    parentHtml = stem
+      ? ` · parent <a href="#" class="open-parent" data-stem="${esc(stem)}">@${esc(pid)}</a> ${copyBtn(pid)}`
+      : ` · parent <span class="dim">@${esc(pid)}</span> ${copyBtn(pid)}`;
+  }
   $('#modal-meta').innerHTML = `
-    <b>${esc(r.kind)}</b> · task_id=<b>${esc(r.task_id)}</b> · ${r.timeline.length} agent steps
+    <b>${esc(r.kind)}</b> · task_id=<b>${esc(r.task_id)}</b> ${copyBtn(r.task_id)}${parentHtml} · ${r.timeline.length} agent steps
   `;
   $('#modal-timeline').innerHTML = renderTimeline(r.timeline, r.task_id);
   $('#modal-report').textContent = r.content || '(empty)';
@@ -352,6 +405,78 @@ function ensureAgentBubble(id) {
   return el;
 }
 
+// ── plan confirm gate (PAGENT_CONFIRM) ──
+const planHash = (p) => JSON.stringify(p || {});
+
+// Render/cập nhật khối xác nhận plan trong bubble. Giữ nguyên textarea nếu cùng plan đang mở.
+function renderPlanGate(bubble, tid, plan) {
+  const existing = bubble.querySelector('.plan-gate');
+  if (!plan || !plan.pending) { if (existing) existing.remove(); return; }
+  const p = plan.plan || {};
+  const h = planHash(p);
+  if (decidedPlans.has(h)) { if (existing) existing.remove(); return; }  // user đã quyết
+  if (existing && existing.dataset.h === h) return;                       // cùng plan → giữ
+  if (existing) existing.remove();                                        // plan mới → thay
+  const agents = (p.required_agents || []).join(', ') || '(full pipeline)';
+  const affected = (p.affected_paths || []).join(', ') || '(none)';
+  const flow = p.flow_diagram ? `<pre class="plan-flow">${esc(p.flow_diagram)}</pre>` : '';
+  const quest = (Array.isArray(p.clarifying_questions) && p.clarifying_questions.length)
+    ? `<div class="plan-row plan-q">orchestrator hỏi:<ul>${p.clarifying_questions.map(q => `<li>${esc(q)}</li>`).join('')}</ul></div>`
+    : '';
+  bubble.insertAdjacentHTML('beforeend', `
+    <div class="plan-gate" data-tid="${esc(tid)}" data-h="${esc(h)}">
+      <div class="plan-title">⏸ Plan chờ xác nhận — chưa sửa file</div>
+      <div class="plan-row"><b>${esc(p.title || '(no title)')}</b> <span class="plan-risk risk-${esc(p.risk || 'medium')}">${esc(p.risk || 'medium')}</span></div>
+      <div class="plan-row dim">${esc(p.summary || '')}</div>
+      <div class="plan-row"><span class="dim">agents:</span> ${esc(agents)}</div>
+      <div class="plan-row"><span class="dim">coder:</span> ${esc(p.coder_task || '(none)')}</div>
+      <div class="plan-row"><span class="dim">affected:</span> ${esc(affected)}</div>
+      ${flow}${quest}
+      <textarea class="plan-edit" rows="2" placeholder="Sửa plan: nhập yêu cầu bổ sung rồi bấm 'Sửa & lập lại'…"></textarea>
+      <div class="plan-actions">
+        <button class="plan-run">▶ Chạy</button>
+        <button class="plan-edit-btn">✎ Sửa &amp; lập lại</button>
+        <button class="plan-cancel">✕ Hủy</button>
+      </div>
+    </div>`);
+  scrollStream();
+}
+
+async function postDecision(tid, action, extra) {
+  try {
+    const r = await parseJson(await fetch(
+      `/api/projects/${encodeURIComponent(project)}/plan/${encodeURIComponent(tid)}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, extra: extra || '' }),
+      }));
+    if (r.error) { showChatError(r.error); return false; }
+    return true;
+  } catch (e) { showChatError(String(e)); return false; }
+}
+
+// Click trong khối plan-gate: Chạy / Sửa / Hủy.
+async function onPlanGateClick(e) {
+  const gate = e.target.closest('.plan-gate');
+  if (!gate) return;
+  const tid = gate.dataset.tid;
+  const setMeta = (txt) => {
+    const m = document.getElementById('agent-msg-' + tid)?.querySelector('.msg-meta');
+    if (m) m.textContent = txt;
+  };
+  if (e.target.closest('.plan-run')) {
+    decidedPlans.add(gate.dataset.h); gate.remove(); setMeta('▶ đang chạy pipeline…');
+    postDecision(tid, 'run');
+  } else if (e.target.closest('.plan-cancel')) {
+    decidedPlans.add(gate.dataset.h); gate.remove(); setMeta('✕ đã hủy');
+    postDecision(tid, 'cancel');
+  } else if (e.target.closest('.plan-edit-btn')) {
+    const extra = gate.querySelector('.plan-edit').value.trim();
+    if (!extra) { gate.querySelector('.plan-edit').focus(); return; }
+    decidedPlans.add(gate.dataset.h); gate.remove(); setMeta('✎ đang lập lại plan…');
+    postDecision(tid, 'edit', extra);
+  }
+}
+
 function startChatPoll() { stopChatPoll(); pollTicks = 0; pollChat(); chatPoll = setInterval(pollChat, 2500); }
 function stopChatPoll() { if (chatPoll) clearInterval(chatPoll); chatPoll = null; }
 
@@ -370,6 +495,10 @@ async function pollChat() {
   }
   const bubble = ensureAgentBubble(tid);
   try {
+    // Plan chờ xác nhận? (PAGENT_CONFIRM) — dựng gate Run/Edit/Cancel trước khi agent sửa file.
+    const plan = await j(`/api/projects/${encodeURIComponent(proj)}/plan/${encodeURIComponent(tid)}`);
+    if (stale()) return;
+    renderPlanGate(bubble, tid, plan);
     const live = await j(`/api/projects/${encodeURIComponent(proj)}/live`);
     if (stale()) return;
     const hit = live.find(t => t.task_id === tid);
@@ -462,11 +591,24 @@ $('#project').addEventListener('change', (e) => { switchProject(e.target.value);
 // Delegation: link 'xem report' tồn tại qua các lần restore innerHTML khi đổi project.
 $('#chat-stream').addEventListener('click', (e) => {
   const a = e.target.closest('.open-report');
-  if (a) { e.preventDefault(); showDetail(a.dataset.reportId); }
+  if (a) { e.preventDefault(); showDetail(a.dataset.reportId); return; }
+  if (e.target.closest('.plan-gate')) onPlanGateClick(e);
 });
 $('#refresh-btn').addEventListener('click', refresh);
+// Delegation toàn cục: nút copy id (history/live/modal) + link mở report cha trong modal.
+document.addEventListener('click', (e) => {
+  const cp = e.target.closest('.copy-id');
+  if (cp) { e.preventDefault(); e.stopPropagation(); copyText(cp.dataset.ref, cp); return; }
+  const op = e.target.closest('.open-parent');
+  if (op) { e.preventDefault(); e.stopPropagation(); showDetail(op.dataset.stem); }
+});
 // Delegation: nút bung subagent tồn tại qua các lần re-render live + trong modal report.
 $('#live-list').addEventListener('click', onSubagentToggle);
+// Delegation: nút Cancel mỗi live-item.
+$('#live-list').addEventListener('click', (e) => {
+  const c = e.target.closest('.live-cancel');
+  if (c) cancelLiveTask(c.dataset.taskId, c);
+});
 $('#modal-timeline').addEventListener('click', onSubagentToggle);
 $('#modal-close').addEventListener('click', () => $('#modal').classList.add('hidden'));
 $('#modal').addEventListener('click', (e) => { if (e.target.id === 'modal') $('#modal').classList.add('hidden'); });
