@@ -139,11 +139,69 @@ function renderProviderPill(provider, model, usage) {
   </span>`;
 }
 
+// Chữ ký structural của live data — KHÔNG kèm tick metadata (duration/cost/tokens).
+// Chỉ đổi khi cấu trúc đổi (task thêm/xoá, step running→done, subagent thêm/xoá hoặc running→done).
+function liveSignature(live) {
+  return live.map(t =>
+    `${t.task_id}|${t.mode}|${(t.timeline || []).map(s =>
+      `${s.agent}:${s.running ? 1 : 0}:${s.is_error ? 1 : 0}:${(s.subagents || []).map(c => `${c.running ? 1 : 0}${c.is_error ? 1 : 0}`).join('')}:${s.terminal_reason ? 1 : 0}`
+    ).join('+')}`
+  ).join('||');
+}
+
+// Đoạn .step-meta cho 1 step — đồng bộ format với renderTimeline (tick-only, dùng cho patch tại chỗ).
+function stepMetaHtml(s) {
+  return `
+          ${fmtMs(s.duration_ms)} · ${fmtCost(s.cost_usd)}<br>
+          in ${fmtNum(s.input_tokens)} / out ${fmtNum(s.output_tokens)}
+          ${s.terminal_reason && s.terminal_reason !== 'completed'
+            ? `<br><span class="dim">${esc(s.terminal_reason)}</span>` : ''}`;
+}
+
+// Đoạn .sub-meta cho 1 subagent — đồng bộ format với renderSubagent (tick-only, dùng cho patch tại chỗ).
+function subMetaHtml(c) {
+  return `${fmtMs(c.duration_ms)} · ${fmtCost(c.cost_usd)} · out ${fmtNum(c.output_tokens)}`;
+}
+
 function renderLive(live) {
   $('#live-dot').classList.toggle('active', live.length > 0);
   $('#live-count').textContent = live.length ? `${live.length} running` : 'idle';
 
   const list = $('#live-list');
+  const newSig = liveSignature(live);
+
+  // Sig khớp & không phải first render: cấu trúc không đổi, chỉ tick metadata thay đổi.
+  // GIỮ NGUYÊN innerHTML #live-list (DOM bất biến → trình duyệt tự giữ scrollTop/scrollLeft),
+  // chỉ patch .step-meta tại chỗ. Đây là điểm mấu chốt chống reset scroll khi log đang stream
+  // (cùng pattern sticky-scroll đã dùng ở chat-stream).
+  if (renderLive._sig !== undefined && renderLive._sig === newSig) {
+    live.forEach(t => {
+      const dag = list.querySelector(`.live-dag[data-task-id="${CSS.escape(t.task_id)}"]`);
+      if (!dag) return;
+      const steps = dag.querySelectorAll('.timeline-step');
+      (t.timeline || []).forEach((s, i) => {
+        const stepEl = steps[i];
+        if (!stepEl) return;
+        const meta = stepEl.querySelector('.step-meta');
+        if (meta) meta.innerHTML = stepMetaHtml(s);
+        // model có thể tích luỹ thêm khi step còn running (sig không gồm models) → repaint pill.
+        const pill = stepEl.querySelector('.step-pill');
+        if (pill) pill.innerHTML = renderModelPills(s);
+        // subagent spawn & tick khi parent step vẫn running (sig giữ nguyên) → patch tại chỗ.
+        const subEls = stepEl.querySelectorAll('.subagent-item');
+        (s.subagents || []).forEach((c, j) => {
+          const subEl = subEls[j];
+          if (!subEl) return;
+          const subMeta = subEl.querySelector('.sub-meta');
+          if (subMeta) subMeta.innerHTML = subMetaHtml(c);
+          const subModels = subEl.querySelector('.sub-models');
+          if (subModels) subModels.innerHTML = renderModelPills(c);
+        });
+      });
+    });
+    return;
+  }
+
   const html = live.length
     ? live.map(t => `
         <div class="live-item">
@@ -157,24 +215,31 @@ function renderLive(live) {
       `).join('')
     : '<div class="idle-msg">No active tasks. Run <code>pagent feature "..."</code> trong terminal.</div>';
 
-  // Bỏ qua re-render nếu HTML không đổi — tránh reset scroll mỗi nhịp poll.
-  if (list.innerHTML === html) return;
-
-  // Lưu vị trí scroll dọc của list + scroll ngang từng timeline (map theo task_id).
+  // Full re-render: lưu scroll dọc list + scroll ngang cả .live-dag và .timeline (key theo task_id + index).
   const listScrollTop = list.scrollTop;
   const dagScrollLeft = {};
+  const timelineScrollLeft = {};
   list.querySelectorAll('.live-dag').forEach(dag => {
     dagScrollLeft[dag.dataset.taskId] = dag.scrollLeft;
+    dag.querySelectorAll('.timeline').forEach((tl, i) => {
+      timelineScrollLeft[`${dag.dataset.taskId}#${i}`] = tl.scrollLeft;
+    });
   });
 
   list.innerHTML = html;
 
-  // Khôi phục scroll sau khi re-render.
+  // Khôi phục cả 2 lớp scroller (.live-dag bao ngoài, .timeline scroller thật khi steps overflow).
   list.scrollTop = listScrollTop;
   list.querySelectorAll('.live-dag').forEach(dag => {
     const left = dagScrollLeft[dag.dataset.taskId];
     if (left != null) dag.scrollLeft = left;
+    dag.querySelectorAll('.timeline').forEach((tl, i) => {
+      const tLeft = timelineScrollLeft[`${dag.dataset.taskId}#${i}`];
+      if (tLeft != null) tl.scrollLeft = tLeft;
+    });
   });
+
+  renderLive._sig = newSig;
 }
 
 // Dừng task đang chạy: kill cây process pagent + ẩn khỏi Live. Thay đổi đã ghi vào file giữ nguyên.
