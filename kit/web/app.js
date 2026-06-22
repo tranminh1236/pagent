@@ -334,7 +334,9 @@ let pollTicks = 0;
 let logOffset = 0;         // byte offset đã đọc của log task hiện tại (tail incremental)
 
 function newDraftId() { draftId = 'draft-' + Date.now() + '-' + Math.floor(1000 + Math.random() * 9000); }
-function scrollStream() { const s = $('#chat-stream'); s.scrollTop = s.scrollHeight; }
+function isPinnedToBottom(el, slack = 32) { return el.scrollHeight - el.scrollTop - el.clientHeight <= slack; }
+// sticky-bottom: chỉ auto-scroll khi user đang pinned ở bottom; tránh hijack khi user đang đọc context cũ ở trên. force=true cho user-action (luôn nhảy bottom).
+function scrollStream(force = false) { const s = $('#chat-stream'); if (force || isPinnedToBottom(s)) s.scrollTop = s.scrollHeight; }
 function clearStreamPlaceholder() { const ph = $('#chat-stream .idle-msg'); if (ph) ph.remove(); }
 
 function updateSendState() {
@@ -382,7 +384,7 @@ async function uploadFiles(files) {
 function showChatError(msg) {
   clearStreamPlaceholder();
   $('#chat-stream').insertAdjacentHTML('beforeend', `<div class="msg msg-error">⚠ ${esc(msg)}</div>`);
-  scrollStream();
+  scrollStream(true);
 }
 
 function appendUserMessage(task, atts, figma) {
@@ -391,7 +393,7 @@ function appendUserMessage(task, atts, figma) {
   const fig = figma ? `<div class="msg-figma">figma: ${esc(figma)}</div>` : '';
   $('#chat-stream').insertAdjacentHTML('beforeend',
     `<div class="msg msg-user"><div class="msg-body">${esc(task)}</div>${chips ? `<div class="msg-chips">${chips}</div>` : ''}${fig}</div>`);
-  scrollStream();
+  scrollStream(true);
 }
 
 function ensureAgentBubble(id) {
@@ -409,7 +411,7 @@ function ensureAgentBubble(id) {
 const planHash = (p) => JSON.stringify(p || {});
 
 // Render/cập nhật khối xác nhận plan trong bubble. Giữ nguyên textarea nếu cùng plan đang mở.
-function renderPlanGate(bubble, tid, plan) {
+function renderPlanGate(bubble, tid, plan, pinned = false) {
   const existing = bubble.querySelector('.plan-gate');
   if (!plan || !plan.pending) { if (existing) existing.remove(); return; }
   const p = plan.plan || {};
@@ -439,7 +441,7 @@ function renderPlanGate(bubble, tid, plan) {
         <button class="plan-cancel">✕ Hủy</button>
       </div>
     </div>`);
-  scrollStream();
+  if (pinned) scrollStream(true);   // user đang ở đáy lúc đầu tick → kéo gate mới vào tầm nhìn; ngược lại để yên
 }
 
 async function postDecision(tid, action, extra) {
@@ -487,6 +489,9 @@ async function pollChat() {
   // project mới → rò log/timeline project này vào stream project khác. Bail khi stale.
   const proj = project, tid = activeTaskId;
   if (!tid || !proj) return stopChatPoll();
+  // Snapshot vị trí pinned NGAY ĐẦU tick — renderPlanGate/fetchChatLog có thể append nội dung
+  // làm thay đổi scrollHeight, nên phải đo trước khi gọi chúng.
+  const pinned = isPinnedToBottom($('#chat-stream'));
   const stale = () => proj !== project || tid !== activeTaskId;
   if (++pollTicks > 600) {   // ~25 min safety stop
     const meta = ensureAgentBubble(tid).querySelector('.msg-meta');
@@ -498,7 +503,7 @@ async function pollChat() {
     // Plan chờ xác nhận? (PAGENT_CONFIRM) — dựng gate Run/Edit/Cancel trước khi agent sửa file.
     const plan = await j(`/api/projects/${encodeURIComponent(proj)}/plan/${encodeURIComponent(tid)}`);
     if (stale()) return;
-    renderPlanGate(bubble, tid, plan);
+    renderPlanGate(bubble, tid, plan, pinned);
     const live = await j(`/api/projects/${encodeURIComponent(proj)}/live`);
     if (stale()) return;
     const hit = live.find(t => t.task_id === tid);
@@ -523,7 +528,7 @@ async function pollChat() {
       // chưa có trong live và chưa done → pagent đang khởi chạy, tiếp tục poll
     }
   } catch (e) { /* transient; keep polling */ }
-  if (!stale()) scrollStream();
+  if (!stale() && pinned) scrollStream(true);   // pinned đã chốt ở đầu tick → force, đừng để recheck post-append vô hiệu hoá
 }
 
 // Tail log per-task: fetch từ logOffset, append text (esc tự nhiên qua text node) vào khối terminal.
