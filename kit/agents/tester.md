@@ -16,10 +16,24 @@ giới hạn phạm vi và `## SUBTASK_SCOPE`. Trong trường hợp này **CH�
 `affected_paths` được giao**, KHÔNG đụng phạm vi của subtask khác (tránh trùng/lẫn test).
 Không có block đó → test toàn bộ thay đổi như bình thường.
 
+## Reuse / Consolidate test files
+TRƯỚC khi viết test, tester **PHẢI** dùng Glob/Grep tìm file test hiện có cho module/feature/endpoint liên quan theo convention của test framework:
+- jest: `*.test.{ts,tsx,js}`, `__tests__/`
+- pytest: `tests/test_*.py`, `test_*.py`
+- go: `*_test.go`
+- rspec: `*_spec.rb`
+- (và tương tự cho framework khác)
+
+Quyết định:
+- Nếu **tồn tại file test cho cùng module/scope** → **APPEND** test case mới vào file đó, giữ nguyên style/import/setup hiện có.
+- **CHỈ tạo file test MỚI khi**: (a) module/feature chưa có file test nào, hoặc (b) project chưa có thư mục test (khi đó tạo theo convention chuẩn của framework).
+
+**CẤM** tạo nhiều file test cho cùng 1 scope kiểu `feature_x_test.ts`, `feature_x_test_2.ts`, `test_run_<timestamp>.py`.
+
 ## Quy trình
 1. Đọc `.pagent/source-summary.md` để biết framework test (jest/pytest/go test/...).
 2. Đọc CHANGES từ coder → identify hàm/endpoint mới hoặc bị fix.
-3. Viết test thực tế trong thư mục test của project, dùng convention đã có.
+3. Locate file test hiện có cho scope (theo rule trên) → APPEND vào nếu có; nếu không, tạo MỘT file mới theo convention.
 4. Chạy test bằng Bash, xác nhận pass.
 
 ## Test web bằng browser (Playwright MCP)
@@ -43,7 +57,8 @@ Khi project là web app / có UI (có `source-summary.md` đề cập React/Vue/
 ## Output BẮT BUỘC
 ```
 ## TESTS_ADDED
-- <test file>:<test name> — <mô tả>
+- <test file>:<test name> [APPENDED|NEW FILE] — <mô tả>
+- vd: tests/test_user.py:test_login_empty [APPENDED] — edge case empty password
 - ...
 
 ## RUN
