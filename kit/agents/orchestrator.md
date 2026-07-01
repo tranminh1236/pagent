@@ -6,7 +6,7 @@ allowed_tools: Read Grep Glob Bash(ls *) Bash(cat *) Bash(head *) Bash(find *) B
 disallowed_tools: Write,Edit,NotebookEdit
 mcp_servers: context7
 system_prompt_mode: replace
-max_turns: 15
+max_turns: 25
 ---
 
 # Orchestrator Role

@@ -274,6 +274,14 @@ call_agent() {
   local disallowed;         disallowed="$(md_meta "$md" disallowed_tools)"
   local sp_mode;            sp_mode="$(md_meta "$md" system_prompt_mode)"   # append | replace
   local max_turns;          max_turns="$(md_meta "$md" max_turns)"
+  # Env override cho max_turns — repo lớn cần nhiều lượt khám phá hơn mà không phải sửa md.
+  # Ưu tiên: PAGENT_MAX_TURNS_<AGENT> (vd PAGENT_MAX_TURNS_ORCHESTRATOR=40) > PAGENT_MAX_TURNS
+  # (global) > giá trị trong frontmatter. Đặt trong .env.pagent của từng project.
+  local _mt_var _mt_ov
+  _mt_var="PAGENT_MAX_TURNS_$(printf '%s' "$agent" | tr '[:lower:]-' '[:upper:]_')"
+  eval "_mt_ov=\"\${$_mt_var:-}\""
+  [[ -z "$_mt_ov" ]] && _mt_ov="${PAGENT_MAX_TURNS:-}"
+  [[ -n "$_mt_ov" ]] && max_turns="$_mt_ov"
   local caveman;            caveman="$(md_meta "$md" caveman)"               # off | lite | full | ultra
   local mcp_servers;        mcp_servers="$(md_meta "$md" mcp_servers)"        # vd: context7
   local provider;           provider="$(md_meta "$md" provider)"             # claude | openrouter
@@ -626,6 +634,45 @@ _is_truthy() {
   esac
 }
 
+# In tóm tắt plan ra stderr (header `──────── PLAN ────────`, không kèm "cần xác nhận"
+# để dùng chung cho cả nhánh confirm lẫn skip). $1 = plan_json.
+_print_plan_summary() {
+  local pj="$1"
+  local q_title q_summary q_coder q_agents q_risk q_affected q_flow
+  q_title="$(jq -r '.title // "(no title)"' <<<"$pj" 2>/dev/null)"
+  q_summary="$(jq -r '.summary // "(no summary)"' <<<"$pj" 2>/dev/null)"
+  q_coder="$(jq -r '.coder_task // "(no coder_task)"' <<<"$pj" 2>/dev/null)"
+  q_agents="$(jq -r '.required_agents // [] | join(", ")' <<<"$pj" 2>/dev/null)"
+  q_risk="$(jq -r '.risk // "medium"' <<<"$pj" 2>/dev/null)"
+  q_affected="$(jq -r '.affected_paths // [] | join(", ")' <<<"$pj" 2>/dev/null)"
+  # flow_diagram (optional): field vắng/rỗng → bỏ qua im lặng (backward-compat).
+  q_flow="$(jq -r '.flow_diagram // ""' <<<"$pj" 2>/dev/null)"
+
+  {
+    printf '\n%s\n' "$(c_cyan '──────── PLAN ────────')"
+    printf '  %s %s\n' "$(c_dim 'title      :')" "$q_title"
+    printf '  %s %s\n' "$(c_dim 'summary    :')" "$q_summary"
+    printf '  %s %s\n' "$(c_dim 'coder_task :')" "$q_coder"
+    printf '  %s %s\n' "$(c_dim 'agents     :')" "${q_agents:-(full pipeline)}"
+    printf '  %s %s\n' "$(c_dim 'risk       :')" "$q_risk"
+    printf '  %s %s\n' "$(c_dim 'affected   :')" "${q_affected:-(none)}"
+    if [[ -n "$q_flow" ]]; then
+      printf '  %s\n' "$(c_dim 'Sơ đồ logic task:')"
+      while IFS= read -r _fl; do
+        printf '    %s\n' "$_fl"
+      done <<<"$q_flow"
+    fi
+  } >&2
+
+  # clarifying_questions (optional): orchestrator có thể hỏi lại để user bổ sung.
+  if jq -e '(.clarifying_questions | type == "array") and (.clarifying_questions | length > 0)' <<<"$pj" >/dev/null 2>&1; then
+    printf '  %s\n' "$(c_yellow 'orchestrator hỏi:')" >&2
+    jq -r '.clarifying_questions[]' <<<"$pj" 2>/dev/null | while IFS= read -r _q; do
+      printf '    • %s\n' "$_q" >&2
+    done
+  fi
+}
+
 # Handshake xác nhận plan qua file — cho web / non-tty (không hỏi được qua /dev/tty).
 # Ghi plan ra $RUN_DIR/plan.pending.json rồi POLL $RUN_DIR/decision.json (web POST vào).
 #   action=run   → return 0 (chạy pipeline)
@@ -638,6 +685,7 @@ confirm_plan_via_file() {
   local dec="$PAGENT_RUN_DIR/decision.json"
   rm -f "$dec"
   printf '%s\n' "$pj" >"$pend"
+  # Summary đã được gate in TRƯỚC khi gọi hàm này → không in lại (tránh double-print web).
   log "$(c_cyan 'PLAN chờ xác nhận') — mở web dashboard để [Chạy] / [Sửa] / [Hủy]"
   local timeout="${PAGENT_CONFIRM_TIMEOUT:-1800}" waited=0
   while :; do
@@ -672,6 +720,9 @@ confirm_plan_gate() {
   local pj="$1"
   CONFIRM_EXTRA=""
 
+  # In summary TRƯỚC mọi nhánh skip → PAGENT_NO_CONFIRM/PAGENT_YES/non-tty đều thấy plan.
+  _print_plan_summary "$pj"
+
   if _is_truthy "${PAGENT_NO_CONFIRM:-}" || _is_truthy "${PAGENT_YES:-}"; then
     return 0
   fi
@@ -684,40 +735,8 @@ confirm_plan_gate() {
     return 0
   fi
 
-  local q_title q_summary q_coder q_agents q_risk q_affected q_flow
-  q_title="$(jq -r '.title // "(no title)"' <<<"$pj" 2>/dev/null)"
-  q_summary="$(jq -r '.summary // "(no summary)"' <<<"$pj" 2>/dev/null)"
-  q_coder="$(jq -r '.coder_task // "(no coder_task)"' <<<"$pj" 2>/dev/null)"
-  q_agents="$(jq -r '.required_agents // [] | join(", ")' <<<"$pj" 2>/dev/null)"
-  q_risk="$(jq -r '.risk // "medium"' <<<"$pj" 2>/dev/null)"
-  q_affected="$(jq -r '.affected_paths // [] | join(", ")' <<<"$pj" 2>/dev/null)"
-  # flow_diagram (optional): field vắng/rỗng → bỏ qua im lặng (backward-compat).
-  q_flow="$(jq -r '.flow_diagram // ""' <<<"$pj" 2>/dev/null)"
-
-  {
-    printf '\n%s\n' "$(c_cyan '──────── PLAN cần xác nhận ────────')"
-    printf '  %s %s\n' "$(c_dim 'title      :')" "$q_title"
-    printf '  %s %s\n' "$(c_dim 'summary    :')" "$q_summary"
-    printf '  %s %s\n' "$(c_dim 'coder_task :')" "$q_coder"
-    printf '  %s %s\n' "$(c_dim 'agents     :')" "${q_agents:-(full pipeline)}"
-    printf '  %s %s\n' "$(c_dim 'risk       :')" "$q_risk"
-    printf '  %s %s\n' "$(c_dim 'affected   :')" "${q_affected:-(none)}"
-    if [[ -n "$q_flow" ]]; then
-      printf '  %s\n' "$(c_dim 'Sơ đồ logic task:')"
-      while IFS= read -r _fl; do
-        printf '    %s\n' "$_fl"
-      done <<<"$q_flow"
-    fi
-  } >&2
-
-  # clarifying_questions (optional): orchestrator có thể hỏi lại để user bổ sung.
-  if jq -e '(.clarifying_questions | type == "array") and (.clarifying_questions | length > 0)' <<<"$pj" >/dev/null 2>&1; then
-    printf '  %s\n' "$(c_yellow 'orchestrator hỏi:')" >&2
-    jq -r '.clarifying_questions[]' <<<"$pj" 2>/dev/null | while IFS= read -r _q; do
-      printf '    • %s\n' "$_q" >&2
-    done
-  fi
-
+  # Summary đã in ở trên (trước nhánh skip); ở đây chỉ cần dòng prompt.
+  printf '%s\n' "$(c_cyan '(cần xác nhận)')" >&2
   printf '\n%s ' "$(c_cyan '[Enter/y] chạy · [n/q] hủy · hoặc gõ thông tin bổ sung →')" >&2
   local reply
   IFS= read -r reply </dev/tty || { printf '\n' >&2; return 0; }
@@ -779,8 +798,10 @@ cmd_pipeline() {
   local title coder_task reviewer_focus tester_task risk affected
   local n_subtasks=0 n_tester_subtasks=0
   local extra_info="" orch_round=0 orch_max=3
+  local prev_plan_json=""   # plan hợp lệ vòng trước — re-run SỬA thay vì khám phá lại + fallback khi re-run fail
 
   while :; do
+    local orch_rc=0
     plan_text="$( {
       echo "## MODE"; echo "$mode"; echo
       echo "## SOURCE_SUMMARY_PATH"; echo ".pagent/source-summary.md"; echo
@@ -789,26 +810,41 @@ cmd_pipeline() {
         echo "$parent_context"; echo
       fi
       echo "## TASK"; echo "$task"
+      # Re-run (có ADDITIONAL_INFO): đưa plan vòng trước vào để orchestrator SỬA theo
+      # info bổ sung, KHÔNG khám phá lại toàn bộ codebase từ đầu — re-explore stateless
+      # là lý do vòng 2 đốt hết max_turns dù vòng 1 vừa đủ.
+      if [[ -n "$prev_plan_json" ]]; then
+        echo; echo "## PREVIOUS_PLAN (JSON vòng trước — SỬA/BỔ SUNG theo ADDITIONAL_INFO, chỉ đọc thêm file thật sự cần)"
+        echo "$prev_plan_json"
+      fi
       # NB: phải dùng `if ... fi` (không phải `[[ ]] &&`) — đây là lệnh CUỐI của
       # brace group bên trái pipe. Với `set -o pipefail`, `[[ -n "" ]]` (extra_info
       # rỗng ở vòng đầu) exit 1 → cả pipeline nonzero dù call_agent OK → die oan.
       if [[ -n "$extra_info" ]]; then echo; echo "## ADDITIONAL_INFO"; echo "$extra_info"; fi
-    } | call_agent orchestrator )" || die "orchestrator fail"
+    } | call_agent orchestrator )" || orch_rc=$?
 
-    plan_json="$(echo "$plan_text" | extract_json 2>/dev/null || true)"
-    if ! jq -e '.title' <<<"$plan_json" >/dev/null 2>&1; then
-      warn "plan JSON không parse được — fallback plan tối thiểu"
-      warn "raw output ở: $PAGENT_RUN_DIR/orchestrator.txt (đầu 40 dòng):"
-      head -40 "$PAGENT_RUN_DIR/orchestrator.txt" >&2
-      plan_json="$(jq -n --arg task "$task" '{
-        title: "(orchestrator JSON parse fail)",
-        summary: "fallback — coder làm task trực tiếp",
-        coder_task: $task,
-        reviewer_focus: "general correctness",
-        tester_task: "",
-        risk: "medium",
-        affected_paths: []
-      }')"
+    if (( orch_rc != 0 )); then
+      # Re-run fail (vd max_turns): nếu đã có plan hợp lệ vòng trước → giữ lại, tự tiếp
+      # tục thay vì vứt cả run. Chỉ die khi fail ngay vòng đầu (chưa có gì để giữ).
+      [[ -n "$prev_plan_json" ]] || die "orchestrator fail"
+      warn "orchestrator re-run fail (reason đã log ở trên) — giữ plan vòng trước, tự tiếp tục"
+      plan_json="$prev_plan_json"
+    else
+      plan_json="$(echo "$plan_text" | extract_json 2>/dev/null || true)"
+      if ! jq -e '.title' <<<"$plan_json" >/dev/null 2>&1; then
+        warn "plan JSON không parse được — fallback plan tối thiểu"
+        warn "raw output ở: $PAGENT_RUN_DIR/orchestrator.txt (đầu 40 dòng):"
+        head -40 "$PAGENT_RUN_DIR/orchestrator.txt" >&2
+        plan_json="$(jq -n --arg task "$task" '{
+          title: "(orchestrator JSON parse fail)",
+          summary: "fallback — coder làm task trực tiếp",
+          coder_task: $task,
+          reviewer_focus: "general correctness",
+          tester_task: "",
+          risk: "medium",
+          affected_paths: []
+        }')"
+      fi
     fi
 
     title="$(jq -r '.title' <<<"$plan_json")"
@@ -849,6 +885,14 @@ cmd_pipeline() {
     fi
 
     log "  title: $(c_green "$title")  risk=$risk"
+
+    # Nhớ plan hợp lệ mới nhất — vòng re-run kế đưa vào PREVIOUS_PLAN; đồng thời là
+    # fallback nếu re-run kế fail.
+    prev_plan_json="$plan_json"
+
+    # Re-run vừa fail nhưng đã fallback về plan cũ → tự tiếp tục, không hỏi lại (tránh
+    # loop hỏi mãi cùng 1 plan khi orchestrator liên tục fail).
+    if (( orch_rc != 0 )); then break; fi
 
     # User xác nhận plan / bổ sung info / hủy. Tty → hỏi /dev/tty; web (PAGENT_CONFIRM) →
     # handshake file; non-tty không bật confirm hoặc PAGENT_YES/NO_CONFIRM → tự chạy.
@@ -1358,9 +1402,11 @@ ENVIRONMENT (đặt trong .env.pagent hoặc shell)
   PAGENT_MODE               feature | hotfix | chore | find (override subcommand)
   PAGENT_CLAUDE_BIN         path tới claude CLI (mặc định "claude")
   PAGENT_MAX_REVIEW_ROUND   số vòng coder↔reviewer (mặc định 2)
+  PAGENT_MAX_TURNS          override max_turns mọi agent (repo lớn → tăng để tránh max_turns fail)
+  PAGENT_MAX_TURNS_<AGENT>  override riêng 1 agent, vd PAGENT_MAX_TURNS_ORCHESTRATOR=40
   PAGENT_CONFIRM            1 → bắt buộc xác nhận plan trước khi chạy agent (web tự bật)
   PAGENT_CONFIRM_TIMEOUT    giây chờ xác nhận qua web rồi hủy (mặc định 1800)
-  PAGENT_YES / PAGENT_NO_CONFIRM  1 → bỏ qua gate xác nhận, chạy luôn
+  PAGENT_YES / PAGENT_NO_CONFIRM  1 → bỏ qua gate xác nhận (vẫn in plan summary), chạy luôn
   PAGENT_CAVEMAN            off|lite|full|ultra — token compress mode (override md frontmatter)
   PAGENT_OPENROUTER_KEY     OpenRouter API key (sk-or-v1-…) cho fallback khi Claude down
   PAGENT_OPENROUTER_BASE    default: https://openrouter.ai/api/v1
