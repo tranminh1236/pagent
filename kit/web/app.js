@@ -25,8 +25,26 @@ const fmtAgo = (ts) => {
 };
 
 let project = null;
+// Phân trang History client-side: số row mỗi trang + trang hiện đang xem.
+const PAGE_SIZE = 20;
+let historyPage = 1;
 // task_id (thuần) → stem report (date-taskid) để mở report cha từ modal. Nạp ở renderHistory.
 const taskStemById = {};
+
+// Tính toán phân trang thuần (không đụng DOM) — dễ test độc lập.
+function paginate(tasks, page, size) {
+  const pageCount = Math.max(1, Math.ceil(tasks.length / size));
+  const cur = page > pageCount ? 1 : page;   // trang vượt số trang → reset về 1
+  const start = (cur - 1) * size;
+  const rows = tasks.slice(start, start + size);
+  return {
+    page: cur, pageCount, start, rows,
+    total: tasks.length,
+    showPager: tasks.length > size,
+    hasPrev: cur > 1,
+    hasNext: cur < pageCount,
+  };
+}
 
 // Copy @<task_id> để dán vào task sau (referencing → pagent tra ngược lineage gốc→con).
 async function copyText(text, btn) {
@@ -83,6 +101,7 @@ async function switchProject(newProj) {
   }
   stopChatPoll();
   project = newProj;
+  historyPage = 1;   // đổi project → về trang History đầu
   const st = getChatState(newProj);
   $('#chat-stream').innerHTML = st.streamHTML != null ? st.streamHTML : CHAT_PLACEHOLDER;
   activeTaskId = st.activeTaskId;
@@ -282,11 +301,20 @@ function renderAgents(agents) {
     : '<div class="idle-msg">Chưa có hoạt động nào.</div>';
 }
 
+// Tasks đang hiển thị (giữ để Prev/Next re-render không cần refetch).
+let historyTasks = [];
+
 function renderHistory(tasks) {
+  historyTasks = tasks;
   $('#history-count').textContent = tasks.length ? `(${tasks.length})` : '';
+  // taskStemById phải phủ TẤT CẢ tasks (để mở report cha), không chỉ trang hiển thị.
   tasks.forEach(t => { taskStemById[t.task_id] = t.id; });
-  $('#history-tbody').innerHTML = tasks.length
-    ? tasks.map(t => `
+
+  const pg = paginate(tasks, historyPage, PAGE_SIZE);
+  historyPage = pg.page;   // đồng bộ sau khi clamp (tasks đổi → có thể reset về 1)
+
+  $('#history-tbody').innerHTML = pg.rows.length
+    ? pg.rows.map(t => `
         <tr class="row" data-id="${esc(t.id)}">
           <td><span title="${esc(new Date(t.mtime*1000).toLocaleString())}">${esc(fmtAgo(new Date(t.mtime*1000).toISOString()))}</span></td>
           <td><span class="kind-tag ${t.kind}">${esc(KIND_LABEL[t.kind] || t.kind)}</span></td>
@@ -303,6 +331,25 @@ function renderHistory(tasks) {
       if (e.target.closest('.copy-id')) return;   // click nút copy → đừng mở modal
       showDetail(tr.dataset.id);
     }));
+  renderHistoryPager(pg);
+}
+
+// Thanh điều hướng trang: Prev / 'trang X/Y' (tổng count) / Next. Ẩn khi chỉ 1 trang.
+function renderHistoryPager(pg) {
+  const pager = $('#history-pager');
+  if (!pager) return;
+  if (!pg.showPager) { pager.innerHTML = ''; pager.classList.add('hidden'); return; }
+  pager.classList.remove('hidden');
+  pager.innerHTML = `
+    <button class="pager-btn" data-nav="prev"${pg.hasPrev ? '' : ' disabled'}>← Prev</button>
+    <span class="pager-info">trang ${pg.page}/${pg.pageCount} · ${pg.total} report</span>
+    <button class="pager-btn" data-nav="next"${pg.hasNext ? '' : ' disabled'}>Next →</button>`;
+}
+
+// Đổi trang (không refetch — dùng lại historyTasks đã render).
+function gotoHistoryPage(delta) {
+  historyPage += delta;
+  renderHistory(historyTasks);
 }
 
 async function showDetail(id) {
@@ -692,7 +739,8 @@ function reuseWorkflow(title) {
   $('#chat-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
-// wiring
+// wiring — chỉ chạy trong trình duyệt; guard để require() ở node (test) không đụng DOM.
+if (typeof document !== 'undefined') {
 newDraftId();
 $('#mode-toggle').querySelectorAll('.mode-opt').forEach(b => b.addEventListener('click', () => setMode(b.dataset.mode)));
 $('#task-input').addEventListener('input', () => { autoGrow(); updateSendState(); });
@@ -714,6 +762,11 @@ $('#chat-stream').addEventListener('click', (e) => {
   if (e.target.closest('.plan-gate')) onPlanGateClick(e);
 });
 $('#refresh-btn').addEventListener('click', () => { refresh(); loadWorkflows(project); });
+$('#history-pager').addEventListener('click', (e) => {
+  const btn = e.target.closest('.pager-btn');
+  if (!btn || btn.disabled) return;
+  gotoHistoryPage(btn.dataset.nav === 'next' ? 1 : -1);
+});
 // Delegation toàn cục: nút copy id (history/live/modal) + link mở report cha trong modal.
 document.addEventListener('click', (e) => {
   const cp = e.target.closest('.copy-id');
@@ -744,3 +797,7 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('#modal'
 
 loadProjects();
 setInterval(refresh, 3000);
+}
+
+// Export cho test node (browser bỏ qua).
+if (typeof module !== 'undefined' && module.exports) module.exports = { paginate, PAGE_SIZE };

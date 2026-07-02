@@ -427,6 +427,74 @@ git_diff_full() {
 }
 
 #─────────────────────────────────────────────
+# Context planning (bước [0]) — cache brief keyed git + workflow + knowledge hash
+#─────────────────────────────────────────────
+# Chọn 1 lần công cụ hash (shasum trên darwin; fallback sha1sum/md5sum/cksum).
+_SHA_BIN="$(command -v shasum || command -v sha1sum || command -v md5sum || command -v cksum)"
+_sha() { "${_SHA_BIN:-cksum}" 2>/dev/null | awk '{print $1}'; }
+# Hash 1 file — thiếu/rỗng → "none" (để key ổn định khi knowledge chưa có).
+_hash_file() { [[ -f "$1" ]] && _sha <"$1" || echo none; }
+
+# git state: HEAD commit + working-tree diff → bắt cả thay đổi chưa commit.
+context_git_hash() {
+  ( cd "$PAGENT_SOURCE" && { git rev-parse HEAD 2>/dev/null; git diff 2>/dev/null; } ) | _sha
+}
+# workflow spec: agent-workflow.md (spec điều phối feed vào knowledge builder).
+context_workflow_hash() { _hash_file "$PAGENT_REPORT_DIR/$PAGENT_PROJECT/agent-workflow.md"; }
+# knowledge: gộp 3 file tri thức đã chưng cất (workflow/domain/decisions).
+context_knowledge_hash() {
+  local k="$PAGENT_SOURCE/.pagent/knowledge"
+  { _hash_file "$k/workflow.md"; _hash_file "$k/domain.md"; _hash_file "$k/decisions.md"; } | _sha
+}
+# Cache key = sha(mode + task + git + workflow + knowledge). Task nằm trong key vì
+# brief là context ĐÃ LỌC theo task; đổi bất kỳ tầng nào (code/spec/knowledge) → invalidate.
+context_cache_key() {
+  printf '%s\0%s\0%s\0%s\0%s' "$1" "$2" \
+    "$(context_git_hash)" "$(context_workflow_hash)" "$(context_knowledge_hash)" | _sha
+}
+
+# Sinh CONTEXT_BRIEF cho orchestrator qua skill context-planning; cache theo key ở trên.
+# stdout: nội dung brief (rỗng nếu degrade). Graceful: thiếu skill / call fail → return 1.
+build_context_brief() {
+  local mode="$1" task="$2"
+  local cp_md=""
+  for cand in "$PAGENT_SOURCE/.pagent/skills/context-planning.md" "$KIT_DIR/skills/context-planning.md"; do
+    [[ -f "$cand" ]] && { cp_md="$cand"; break; }
+  done
+  [[ -n "$cp_md" ]] || { warn "context-planning skill thiếu — degrade (bỏ qua CONTEXT_BRIEF)"; return 1; }
+
+  local cache_dir="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/cache"
+  mkdir -p "$cache_dir"
+  local key; key="$(context_cache_key "$mode" "$task")"
+  local cache_file="$cache_dir/context-brief-$key.md"
+  if [[ -s "$cache_file" ]]; then
+    log "  context-planning: $(c_green 'cache hit') (${key:0:12})"
+    cat "$cache_file"; return 0
+  fi
+
+  local kdir="$PAGENT_SOURCE/.pagent/knowledge"
+  local reports_root="$PAGENT_REPORT_DIR/$PAGENT_PROJECT"
+  local brief
+  brief="$( {
+    echo "## MODE"; echo "$mode"; echo
+    echo "## TASK"; echo "$task"; echo
+    echo "## SOURCE_SUMMARY_PATH"; echo ".pagent/source-summary.md"; echo
+    echo "## KNOWLEDGE_PATHS"
+    echo "workflow:  $kdir/workflow.md"
+    echo "domain:    $kdir/domain.md"
+    echo "decisions: $kdir/decisions.md"; echo
+    echo "## FEATURE_REPORTS_DIR"; echo "$reports_root/features"; echo
+    echo "## BUG_REPORTS_DIR"; echo "$reports_root/bugs"; echo
+    echo "## GIT_DIFF (thay đổi chưa commit — chạy \`git diff\` để xem chi tiết)"
+    git_diff_summary
+  } | call_agent context-planning )" || { warn "context-planning fail — degrade (bỏ qua CONTEXT_BRIEF)"; return 1; }
+
+  [[ -n "$brief" ]] || return 1
+  printf '%s\n' "$brief" >"$cache_file"
+  printf '%s' "$brief"
+}
+
+#─────────────────────────────────────────────
 # Run-lock theo project: cảnh báo khi có run khác đang active trên cùng
 # $PAGENT_SOURCE. Coder ghi file thật + git diff sẽ LẪN thay đổi của 2 task
 # chạy song song. Warn-only (không block) — lock-file dùng để phát hiện.
@@ -790,6 +858,17 @@ cmd_pipeline() {
   fi
   export PAGENT_PARENT
 
+  #────── 0. Context planning (feature/hotfix) — lọc bối cảnh → CONTEXT_BRIEF ──────
+  # Chạy TRƯỚC orchestrator: đọc knowledge/report/git diff theo tầng, xuất brief đã
+  # lọc theo task để orchestrator lập plan nhanh. Cache theo git+workflow+knowledge hash.
+  # PAGENT_KNOWLEDGE=0 → tắt hẳn (backward-compat). Fail/thiếu → degrade, brief rỗng.
+  local context_brief=""
+  if { [[ "$mode" == "feature" || "$mode" == "hotfix" ]]; } && _is_truthy "${PAGENT_KNOWLEDGE:-1}"; then
+    log "$(c_cyan '[0]') context-planning → lọc bối cảnh liên quan"
+    context_brief="$(build_context_brief "$mode" "$task")" || context_brief=""
+    [[ -n "$context_brief" ]] && log "  context brief: $(c_green "$(printf '%s' "$context_brief" | wc -l | tr -d ' ') dòng")"
+  fi
+
   #────── 1. Orchestrator (confirm gate → có thể re-run với info bổ sung) ──────
   local step_total=4
   [[ "$mode" == "find" ]] && step_total=2
@@ -810,6 +889,12 @@ cmd_pipeline() {
         echo "$parent_context"; echo
       fi
       echo "## TASK"; echo "$task"
+      # CONTEXT_BRIEF: bối cảnh liên quan do bước [0] context-planning lọc sẵn. Rỗng
+      # (degrade / mode chore-find / tắt) → bỏ qua im lặng (orchestrator tự đọc summary).
+      if [[ -n "$context_brief" ]]; then
+        echo; echo "## CONTEXT_BRIEF (bối cảnh liên quan đã lọc sẵn ở bước [0] — dùng để lập plan nhanh, ĐỪNG khám phá lại rộng)"
+        echo "$context_brief"
+      fi
       # Re-run (có ADDITIONAL_INFO): đưa plan vòng trước vào để orchestrator SỬA theo
       # info bổ sung, KHÔNG khám phá lại toàn bộ codebase từ đầu — re-explore stateless
       # là lý do vòng 2 đốt hết max_turns dù vòng 1 vừa đủ.
@@ -1174,6 +1259,23 @@ cmd_pipeline() {
   write_report "$report_file" "$title" "$task" "$risk" "$affected"
   log "$(c_green 'Report:') $report_file"
 
+  #────── 5c. Decision log (ADR) — feature/hotfix: append 1 quyết định vào knowledge ──────
+  # Append-only log. Gate PAGENT_KNOWLEDGE (mặc định bật). Cần coder.txt làm RATIONALE.
+  if { [[ "$mode" == "feature" || "$mode" == "hotfix" ]]; } && _is_truthy "${PAGENT_KNOWLEDGE:-1}" \
+     && [[ -s "$PAGENT_RUN_DIR/coder.txt" ]]; then
+    log "$(c_cyan '[+]') decision-log → knowledge/decisions.md"
+    local kdir="$PAGENT_SOURCE/.pagent/knowledge"; mkdir -p "$kdir"
+    local ref_rel="${report_file#"$PAGENT_REPORT_DIR/$PAGENT_PROJECT/"}"
+    {
+      echo "## DECISION_DATE"; echo "$date_str"; echo
+      echo "## DECISION_TITLE"; echo "$title"; echo
+      echo "## TASK"; echo "$task"; echo
+      echo "## RATIONALE"; cat "$PAGENT_RUN_DIR/coder.txt"; echo
+      echo "## REF"; echo "$ref_rel"; echo
+      echo "## EXISTING_DECISIONS_PATH"; echo "$kdir/decisions.md"
+    } | call_agent decision-log >/dev/null || warn "decision-log fail (tiếp tục)"
+  fi
+
   # Auto-compact: gộp tóm tắt vào CHANGELOG-style, giữ run_dir nhưng nén
   ( cd "$PAGENT_RUN_DIR" && tar czf bundle.tar.gz ./*.json ./*.txt ./*.err 2>/dev/null && \
     find . -maxdepth 1 -type f \( -name '*.json' -o -name '*.err' \) -delete ) || true
@@ -1366,6 +1468,73 @@ HELP
   esac
 }
 
+# Gộp features + bugs report thành khối REPORT_HISTORY cho knowledge builder (cap 40).
+_report_history() {
+  local root="$PAGENT_REPORT_DIR/$PAGENT_PROJECT" n=0 f
+  for f in $(ls -1t "$root/features/"*.md "$root/bugs/"*.md 2>/dev/null); do
+    [[ -e "$f" ]] || continue
+    (( n++ >= 40 )) && break
+    printf '\n### %s\n' "${f#"$root/"}"; cat "$f"
+  done
+  [[ "$n" -eq 0 ]] && echo "(chưa có report history)"
+}
+
+# pagent knowledge [refresh|show] — điều phối 3 skill knowledge:
+#   refresh → workflow-knowledge + domain-knowledge (tài liệu SỐNG, merge idempotent)
+#   show    → in .pagent/knowledge/{workflow,domain,decisions}.md
+# decision-log (append-only) chạy tự động cuối pipeline feature/hotfix, không ở đây.
+cmd_knowledge() {
+  local action="${1:-show}"; [[ "$#" -gt 0 ]] && shift
+  local kdir="$PAGENT_SOURCE/.pagent/knowledge"
+
+  case "$action" in
+    refresh)
+      mkdir -p "$kdir"
+      PAGENT_TASK_ID="$(new_task_id)"; PAGENT_MODE="knowledge"
+      PAGENT_RUN_DIR="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/runs/$PAGENT_TASK_ID"
+      mkdir -p "$PAGENT_RUN_DIR"
+      export PAGENT_TASK_ID PAGENT_MODE PAGENT_RUN_DIR PAGENT_PROJECT PAGENT_REPORT_DIR
+      local ss=".pagent/source-summary.md"
+      local wf="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/agent-workflow.md"
+
+      log "$(c_cyan 'knowledge refresh') → workflow-knowledge (.pagent/knowledge/workflow.md)"
+      {
+        echo "## AGENT_WORKFLOW_PATH"; echo "$wf"; echo
+        echo "## SOURCE_SUMMARY_PATH"; echo "$ss"; echo
+        echo "## REPORT_HISTORY"; _report_history; echo
+        echo "## EXISTING_KNOWLEDGE_PATH"; echo "$kdir/workflow.md"
+      } | call_agent workflow-knowledge >/dev/null || warn "workflow-knowledge fail (tiếp tục)"
+
+      log "$(c_cyan 'knowledge refresh') → domain-knowledge (.pagent/knowledge/domain.md)"
+      {
+        echo "## SOURCE_SUMMARY_PATH"; echo "$ss"; echo
+        echo "## REPORT_HISTORY"; _report_history; echo
+        echo "## EXISTING_KNOWLEDGE_PATH"; echo "$kdir/domain.md"
+      } | call_agent domain-knowledge >/dev/null || warn "domain-knowledge fail (tiếp tục)"
+
+      log "$(c_green 'OK') — knowledge refreshed tại $kdir"
+      ;;
+    show)
+      local which="${1:-all}" name f
+      for name in workflow domain decisions; do
+        [[ "$which" == "all" || "$which" == "$name" ]] || continue
+        f="$kdir/$name.md"
+        printf '%s\n' "$(c_green "═══ $name.md ═══")"
+        if [[ -s "$f" ]]; then cat "$f"; else echo "(chưa có $f — chạy: pagent knowledge refresh)"; fi
+        echo
+      done
+      ;;
+    *)
+      cat <<'HELP'
+pagent knowledge <action>
+  refresh                             Rebuild .pagent/knowledge/{workflow,domain}.md
+                                      (workflow-knowledge + domain-knowledge; merge idempotent)
+  show [workflow|domain|decisions]    In file knowledge (mặc định: cả 3)
+HELP
+      ;;
+  esac
+}
+
 cmd_env() {
   cat <<EOF
 kit:           $KIT_DIR
@@ -1392,6 +1561,7 @@ USAGE
   pagent find    "question..."         Đọc source trả lời câu hỏi (alias: query): orchestrator→reviewer (read-only)
   pagent report  [project]             Tóm tắt features/bugs + cost theo ngày
   pagent workflow [show|list|run|new|file]   Quản lý workflow.md (xem 'pagent workflow' để biết)
+  pagent knowledge [refresh|show]      Rebuild/xem .pagent/knowledge/{workflow,domain,decisions}.md
   pagent skills                        Liệt kê skills/agents project-local + global
   pagent skill new <name>              Scaffold skill mới trong .pagent/skills/
   pagent env                           In biến môi trường đang dùng
@@ -1426,14 +1596,15 @@ ENVIRONMENT (đặt trong .env.pagent hoặc shell)
   PAGENT_CONFIRM_TIMEOUT    giây chờ xác nhận qua web rồi hủy (mặc định 1800)
   PAGENT_YES / PAGENT_NO_CONFIRM  1 → bỏ qua gate xác nhận (vẫn in plan summary), chạy luôn
   PAGENT_CAVEMAN            off|lite|full|ultra — token compress mode (override md frontmatter)
+  PAGENT_KNOWLEDGE          1 (mặc định) → bật context-planning bước [0] + decision-log; 0 → tắt
   PAGENT_OPENROUTER_KEY     OpenRouter API key (sk-or-v1-…) cho fallback khi Claude down
   PAGENT_OPENROUTER_BASE    default: https://openrouter.ai/api/v1
   PAGENT_PROVIDER           claude|openrouter — ép provider toàn pipeline
   PAGENT_KIT_DIR            override kit/ folder
 
 PIPELINE
-  feature: orchestrator → (designer) → coder → reviewer (loop) → tester → workflow-extractor
-  hotfix:  orchestrator → coder → reviewer (loop) → tester regression → orchestrator (root cause)
+  feature: context-planning[0] → orchestrator → (designer) → coder → reviewer (loop) → tester → workflow-extractor → decision-log
+  hotfix:  context-planning[0] → orchestrator → coder → reviewer (loop) → tester regression → orchestrator (root cause) → decision-log
   chore:   orchestrator → coder → reviewer (loop)  [tester nếu plan yêu cầu; KHÔNG workflow-extractor]
   find:    orchestrator → reviewer (read-only, đọc source trả lời câu hỏi — KHÔNG coder/tester)
   Pre/post hook → ghi token+cost vào tokens/<date>.jsonl
@@ -1463,6 +1634,7 @@ case "$cmd" in
   find|query)     cmd_pipeline find "${*:-}" ;;
   report)    cmd_report "${1:-}" ;;
   workflow)  cmd_workflow "$@" ;;
+  knowledge) cmd_knowledge "$@" ;;
   env)       cmd_env ;;
   web)
     port="${1:-8765}"; host="${2:-127.0.0.1}"

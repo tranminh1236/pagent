@@ -73,9 +73,13 @@ section h2 {
 .agent-card .stats { color: var(--dim); font-size: 11px; margin-top: 4px; line-height: 1.5; }
 
 /* ── history table ── */
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow: auto; max-height: 60vh; }
 table { width: 100%; border-collapse: collapse; }
-th { text-align: left; padding: 8px 10px; font-size: 11px; color: var(--dim); border-bottom: 1px solid var(--border); text-transform: uppercase; letter-spacing: 0.5px; }
+th {
+  text-align: left; padding: 8px 10px; font-size: 11px; color: var(--dim);
+  border-bottom: 1px solid var(--border); text-transform: uppercase; letter-spacing: 0.5px;
+  position: sticky; top: 0; z-index: 1; background: var(--panel);   /* header không cuộn mất */
+}
 th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 td { padding: 10px; border-bottom: 1px solid var(--panel-2); font-size: 13px; vertical-align: top; }
 tr.row { cursor: pointer; }
@@ -85,6 +89,13 @@ tr.row:hover { background: var(--panel-2); }
 .kind-tag.bugs { background: rgba(248,113,113,0.15); color: var(--bug); }
 .kind-tag.chores { background: rgba(251,191,36,0.15); color: var(--warn); }
 .kind-tag.findings { background: rgba(125,211,252,0.15); color: var(--accent); }
+
+/* ── history pager ── */
+#history-pager { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 12px; }
+#history-pager.hidden { display: none; }
+.pager-btn { font-family: var(--mono); font-size: 12px; padding: 4px 10px; }
+.pager-btn:disabled { opacity: 0.4; cursor: default; border-color: var(--border); }
+.pager-info { font-family: var(--mono); font-size: 12px; color: var(--dim); }
 
 /* ── modal ── */
 #modal { position: fixed; inset: 0; background: rgba(0,0,0,0.75); display: flex; align-items: center; justify-content: center; z-index: 100; padding: 24px; }
