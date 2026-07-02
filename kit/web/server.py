@@ -192,6 +192,57 @@ def task_detail(proj, task_filename):
             return {"kind": kind, "content": content, "timeline": timeline, "task_id": tid}
     return {"error": "not found"}
 
+def read_workflow(proj):
+    """Đọc + parse REPORTS/<proj>/workflow.md thành list section có cấu trúc.
+    Trả {exists, path, workflows:[{title, trigger, preconditions, flow[], expected,
+    smoke_cmd, related[], added}]}. File thiếu / proj traversal → exists=False.
+    Chỉ đọc + parse; smoke_cmd chỉ để hiển thị (web không chạy)."""
+    path = _safe_join(REPORTS, proj, "workflow.md")
+    if not path or not os.path.isfile(path):
+        return {"exists": False, "path": path or "", "workflows": []}
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+
+    def _field(line, label):
+        m = re.match(r"^\*\*" + re.escape(label) + r":\*\*\s*(.*)$", line)
+        return m.group(1).strip() if m else None
+
+    workflows, cur, in_flow = [], None, False
+    for line in lines:
+        h = re.match(r"^##\s+(.*)$", line)
+        if h:
+            cur = {"title": h.group(1).strip(), "trigger": "", "preconditions": "",
+                   "flow": [], "expected": "", "smoke_cmd": "", "related": [], "added": ""}
+            workflows.append(cur)
+            in_flow = False
+            continue
+        if cur is None:
+            continue  # bỏ preamble (# Workflow Log …)
+        for label, key in (("Trigger", "trigger"), ("Preconditions", "preconditions"),
+                           ("Expected outcome", "expected"), ("Added", "added")):
+            v = _field(line, label)
+            if v is not None:
+                cur[key] = v; in_flow = False; break
+        else:
+            v = _field(line, "Smoke test command")
+            if v is not None:
+                mb = re.search(r"`([^`]+)`", v)
+                cur["smoke_cmd"] = mb.group(1).strip() if mb else v.strip("` ")
+                in_flow = False; continue
+            v = _field(line, "Related files")
+            if v is not None:
+                cur["related"] = [x.strip() for x in v.split(",") if x.strip()]
+                in_flow = False; continue
+            if re.match(r"^\*\*Flow:\*\*", line):
+                in_flow = True; continue
+            if in_flow:
+                fm = re.match(r"^\s*\d+\.\s+(.*)$", line)
+                if fm:
+                    cur["flow"].append(fm.group(1).strip())
+                elif line.strip() != "":
+                    in_flow = False
+    return {"exists": True, "path": path, "workflows": workflows}
+
 def read_chat_log(proj, tid, offset=0):
     """Đọc tail log per-task (REPORTS/<proj>/logs/<tid>.log) kể từ byte `offset`.
     Trả {data, offset}: offset mới = vị trí đọc tiếp theo để client tail incremental."""
@@ -703,6 +754,7 @@ class H(BaseHTTPRequestHandler):
                 (r"/plan/(.+)",    lambda p, t: self._j(plan_pending(p, t))),
                 (r"/live",         lambda p:    self._j(live_tasks(p))),
                 (r"/agents",       lambda p:    self._j(agent_stats(p))),
+                (r"/workflow",     lambda p:    self._j(read_workflow(p))),
             ):
                 if with_proj(fn): return
             self._j({"error": "not found"}, 404)
