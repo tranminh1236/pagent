@@ -89,6 +89,7 @@ async function switchProject(newProj) {
   logOffset = st.logOffset || 0;
   updateSendState();
   refresh();
+  loadWorkflows(newProj);
   await attachLive(newProj);                       // phát hiện task còn chạy → dựng bubble + poll
   // attachLive đã startChatPoll() nếu tìm thấy task running. Guard project===newProj phòng
   // re-entrant switch: user đổi project lần nữa trong lúc await → đừng arm poll cho project cũ.
@@ -643,6 +644,54 @@ function autoGrow() {
   ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
 }
 
+// ───────── Workflows ─────────
+async function loadWorkflows(proj) {
+  if (!proj) return;
+  try {
+    const data = await j(`/api/projects/${encodeURIComponent(proj)}/workflow`);
+    renderWorkflows(data);
+  } catch (e) { /* transient; bỏ qua */ }
+}
+
+function renderWorkflows(data) {
+  const list = $('#workflow-list');
+  const count = $('#workflow-count');
+  const wfs = (data && data.workflows) || [];
+  if (!data || !data.exists || !wfs.length) {
+    list.innerHTML = '<div class="idle-msg">Chưa có workflow — chạy 1 feature để sinh.</div>';
+    count.textContent = '';
+    return;
+  }
+  count.textContent = wfs.length;
+  list.innerHTML = wfs.map((w, i) => {
+    const flow = (w.flow || []).map(s => `<li>${esc(s)}</li>`).join('');
+    const related = (w.related || []).map(r => `<code>${esc(r)}</code>`).join(' ');
+    return `<div class="wf-card">
+      <div class="wf-head">
+        <span class="wf-title">${esc(w.title)}</span>
+        <span class="wf-added dim">${esc(w.added || '')}</span>
+        <button class="wf-reuse" data-title="${esc(w.title)}" title="Prefill composer để chạy task tương tự">Dùng lại ↑</button>
+      </div>
+      ${w.trigger ? `<div class="wf-trigger"><b>Trigger:</b> ${esc(w.trigger)}</div>` : ''}
+      ${flow ? `<button class="wf-flow-toggle" data-i="${i}">Flow (${(w.flow||[]).length}) ▸</button>
+                <ol class="wf-flow hidden" data-i="${i}">${flow}</ol>` : ''}
+      ${w.smoke_cmd ? `<div class="wf-smoke"><b>Smoke:</b> <code>${esc(w.smoke_cmd)}</code></div>` : ''}
+      ${related ? `<div class="wf-related dim">${related}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function reuseWorkflow(title) {
+  setMode('feature');
+  const ta = $('#task-input');
+  ta.value = `Làm tương tự "${title}". Cụ thể: `;
+  autoGrow();
+  updateSendState();
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  $('#chat-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
 // wiring
 newDraftId();
 $('#mode-toggle').querySelectorAll('.mode-opt').forEach(b => b.addEventListener('click', () => setMode(b.dataset.mode)));
@@ -664,7 +713,7 @@ $('#chat-stream').addEventListener('click', (e) => {
   if (a) { e.preventDefault(); showDetail(a.dataset.reportId); return; }
   if (e.target.closest('.plan-gate')) onPlanGateClick(e);
 });
-$('#refresh-btn').addEventListener('click', refresh);
+$('#refresh-btn').addEventListener('click', () => { refresh(); loadWorkflows(project); });
 // Delegation toàn cục: nút copy id (history/live/modal) + link mở report cha trong modal.
 document.addEventListener('click', (e) => {
   const cp = e.target.closest('.copy-id');
@@ -678,6 +727,15 @@ $('#live-list').addEventListener('click', onSubagentToggle);
 $('#live-list').addEventListener('click', (e) => {
   const c = e.target.closest('.live-cancel');
   if (c) cancelLiveTask(c.dataset.taskId, c);
+});
+$('#workflow-list').addEventListener('click', (e) => {
+  const reuse = e.target.closest('.wf-reuse');
+  if (reuse) { reuseWorkflow(reuse.dataset.title); return; }
+  const tog = e.target.closest('.wf-flow-toggle');
+  if (tog) {
+    const ol = $(`#workflow-list .wf-flow[data-i="${tog.dataset.i}"]`);
+    if (ol) { ol.classList.toggle('hidden'); tog.textContent = tog.textContent.replace(/[▸▾]/, ol.classList.contains('hidden') ? '▸' : '▾'); }
+  }
 });
 $('#modal-timeline').addEventListener('click', onSubagentToggle);
 $('#modal-close').addEventListener('click', () => $('#modal').classList.add('hidden'));
