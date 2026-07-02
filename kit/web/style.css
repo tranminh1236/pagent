@@ -299,7 +299,7 @@ tr.row:hover { background: var(--panel-2); }
 .live-cancel:disabled { opacity: 0.55; cursor: default; color: var(--dim); border-color: var(--border); }
 
 /* ───────── Workflows ───────── */
-#workflow-list { display: flex; flex-direction: column; gap: 8px; }
+#workflow-list { display: flex; flex-direction: column; gap: 8px; max-height: 60vh; overflow-y: auto; }
 .wf-card {
   background: var(--panel-2); border: 1px solid var(--border);
   border-left: 3px solid var(--feature); border-radius: 6px; padding: 10px 14px;

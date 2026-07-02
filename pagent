@@ -1123,12 +1123,12 @@ cmd_pipeline() {
     fi
   fi
 
-  #────── 5. Workflow extractor (feature only) ──────
+  #────── 5. Agent orchestration workflow extractor (feature only) ──────
   if [[ "$mode" == "feature" && -f "$PAGENT_RUN_DIR/tester.txt" ]]; then
-    log "$(c_cyan '[+]') workflow extractor → workflow.md"
-    local wf="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/workflow.md"
+    log "$(c_cyan '[+]') workflow extractor → agent-workflow.md"
+    local wf="$PAGENT_REPORT_DIR/$PAGENT_PROJECT/agent-workflow.md"
     mkdir -p "$(dirname "$wf")"
-    _init_wf() { [[ -f "$wf" ]] || printf '# Workflow Log — %s\n\n' "$PAGENT_PROJECT" >"$wf"; }
+    _init_wf() { [[ -f "$wf" ]] || printf '# Agent Orchestration Workflow — %s\n\n' "$PAGENT_PROJECT" >"$wf"; }
     with_lock "$wf" _init_wf
 
     {
@@ -1136,6 +1136,24 @@ cmd_pipeline() {
       echo "## TASK"; echo "$task"; echo
       echo "## CODER_CHANGES"; cat "$PAGENT_RUN_DIR/coder.txt"; echo
       echo "## TESTS_ADDED"; cat "$PAGENT_RUN_DIR/tester.txt"; echo
+      echo "## REPORT_HISTORY"
+      local _rf _rn=0
+      for _rf in $(ls -1t "$PAGENT_REPORT_DIR/$PAGENT_PROJECT/features/"*.md \
+                          "$PAGENT_REPORT_DIR/$PAGENT_PROJECT/bugs/"*.md 2>/dev/null); do
+        [[ -e "$_rf" ]] || continue
+        (( _rn++ >= 40 )) && break   # cap để tránh input quá dài
+        printf '\n### %s\n' "${_rf#"$PAGENT_REPORT_DIR/$PAGENT_PROJECT/"}"
+        cat "$_rf"
+      done
+      [[ "$_rn" -eq 0 ]] && echo "(chưa có report history)"
+      echo
+      echo "## PROJECT_PROMPT"
+      if [[ -f "$PAGENT_SOURCE/.pagent/source-summary.md" ]]; then
+        cat "$PAGENT_SOURCE/.pagent/source-summary.md"
+      else
+        echo "(không có source-summary.md)"
+      fi
+      echo
       echo "## EXISTING_WORKFLOW_PATH"; echo "$wf"
     } | call_agent workflow-extractor >/dev/null || warn "workflow extractor fail"
   fi

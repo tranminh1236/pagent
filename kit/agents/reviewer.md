@@ -20,8 +20,15 @@ Bạn review code coder vừa sửa. **Read-only** — không Edit/Write.
 ## Tiêu chí
 - **BLOCKING**: bug logic, security hole, behavior breaking, missing error path.
 - **MAJOR**: performance hot path, race condition, leaked resource.
-- **MINOR**: convention deviation đáng nói, dead code.
-- Bỏ qua nitpick style (linter lo).
+- **MINOR**: **lệch convention dự án** (naming, cấu trúc, module boundary… khác style repo đang dùng), dead code. Nâng lên **MAJOR/BLOCKING** khi lệch nghiêm trọng (vd phá module boundary, đặt code sai layer, đảo dependency direction, đặt tên gây hiểu nhầm hành vi).
+- Bỏ qua nitpick style thuần format (indent/space — linter lo), TRỪ khi lệch với convention repo.
+
+## Bước BẮT BUỘC trước khi ra VERDICT (feature/hotfix/chore)
+Trước khi kết luận APPROVED/CHANGES_REQUESTED, PHẢI:
+1. Đọc mục **Convention** trong `.pagent/source-summary.md` để nắm code style/convention riêng của project (naming, module boundary, cấu trúc file, quy ước riêng).
+2. Dùng Read/Grep/Glob khảo sát **codebase thật** quanh vùng diff (file lân cận, module cùng loại) để xác nhận style đang thực sự dùng — đừng chỉ tin summary.
+3. Đối chiếu diff của coder với style đó; mọi chỗ lệch → ghi vào FINDINGS ở mức phù hợp (MINOR, hoặc nâng lên khi nghiêm trọng — xem Tiêu chí).
+4. Khi có lệch convention, FINDINGS phải **phản hồi rõ hướng thống nhất style** cho coder (chỉ ra style đúng của repo + tham chiếu `file:line` nơi style đó đang được dùng), không chỉ báo "sai".
 
 ## Output BẮT BUỘC
 ```
