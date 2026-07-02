@@ -40,10 +40,16 @@ class ReadWorkflowTest(unittest.TestCase):
         self.assertEqual(a["smoke_cmd"], "bash tests/test_a.sh")
         self.assertEqual(a["related"], ["kit/foo.md", "pagent", "tests/test_a.sh"])
         self.assertEqual(a["added"], "2026-06-01")
+        self.assertEqual(a["preconditions"], "File `foo.md` tồn tại; gate bật.")
+        self.assertEqual(a["expected"], "Kết quả đúng; 10/10 test pass.")
         b = r["workflows"][1]
         self.assertEqual(b["title"], "Sửa bug B")
         self.assertEqual(b["flow"], ["Chỉ một bước."])
         self.assertEqual(b["related"], ["bar.sh"])
+        self.assertEqual(b["preconditions"], "")
+        self.assertEqual(b["expected"], "Bug hết.")
+        self.assertEqual(b["smoke_cmd"], "echo ok")
+        self.assertEqual(b["added"], "2026-06-02")
 
     def test_preamble_ignored(self):
         # Dòng "# Workflow Log — demo" trước section đầu không tạo workflow rỗng.
@@ -68,13 +74,19 @@ class WorkflowRouteTest(unittest.TestCase):
         self.port = self.s.server_address[1]
 
     def tearDown(self):
-        self.s.shutdown(); shutil.rmtree(self.tmp, ignore_errors=True)
+        self.s.shutdown()
+        self.s.server_close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _get(self, path):
         c = http.client.HTTPConnection("127.0.0.1", self.port)
-        c.request("GET", path); resp = c.getresponse()
-        import json
-        return resp.status, json.loads(resp.read())
+        try:
+            c.request("GET", path)
+            resp = c.getresponse()
+            import json
+            return resp.status, json.loads(resp.read())
+        finally:
+            c.close()
 
     def test_route_returns_workflows(self):
         st, body = self._get("/api/projects/demo/workflow")
