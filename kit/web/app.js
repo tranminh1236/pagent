@@ -117,6 +117,7 @@ async function switchProject(newProj) {
   logOffset = st.logOffset || 0;
   updateSendState();
   refresh();
+  loadBackendSettings();   // công tắc backend per-project (opencode ↔ claude direct)
   loadWorkflows(newProj);
   loadAgentWorkflow(newProj);
   await attachLive(newProj);                       // phát hiện task còn chạy → dựng bubble + poll
@@ -146,6 +147,13 @@ async function refresh() {
     j(`/api/projects/${encodeURIComponent(project)}/tasks`),
     j(`/api/projects/${encodeURIComponent(project)}/agents`),
   ]);
+  // Agent đang dừng chờ cấp thêm lượt (max_turns)? Chỉ hỏi cho task live (thường 0-2).
+  await Promise.all(live.map(async (t) => {
+    try {
+      const r = await j(`/api/projects/${encodeURIComponent(project)}/resume/${encodeURIComponent(t.task_id)}`);
+      t.resume_pending = (r && r.pending) || [];
+    } catch { t.resume_pending = []; }
+  }));
   renderLive(live);
   renderHistory(tasks);
   renderAgents(agents);
@@ -176,7 +184,7 @@ function liveSignature(live) {
   return live.map(t =>
     `${t.task_id}|${t.mode}|${(t.timeline || []).map(s =>
       `${s.agent}:${s.running ? 1 : 0}:${s.is_error ? 1 : 0}:${(s.subagents || []).map(c => `${c.running ? 1 : 0}${c.is_error ? 1 : 0}`).join('')}:${s.terminal_reason ? 1 : 0}`
-    ).join('+')}`
+    ).join('+')}|r:${(t.resume_pending || []).map(p => p.agent).join(',')}`
   ).join('||');
 }
 
@@ -209,6 +217,67 @@ function retryControlHtml(t) {
             <input type="number" class="live-retry-turns" min="1" placeholder="lượt (mặc định)" aria-label="Số lượt tối đa cho lần chạy tiếp">
             <button class="live-retry-btn" data-task-id="${esc(t.task_id)}" title="Spawn lại pipeline với ngân sách lượt cao hơn">↻ Tăng lượt &amp; chạy tiếp</button>
           </div>`;
+}
+
+// Selector backend (công tắc việc nhỏ/lớn — settings per-project, persist server-side):
+// opencode·9router cho việc nhỏ, claude·subscription (direct) cho việc lớn. Đổi ở đây
+// áp cho MỌI run kế tiếp của project — không phải chọn lại mỗi message.
+function backendSelectorHtml(s) {
+  const st = s || {};
+  const prov = st.provider === 'claude' ? 'claude' : 'opencode';
+  const curModel = String(st.claude_model || 'sonnet');
+  const models = ['sonnet', 'opus'].includes(curModel) ? ['sonnet', 'opus'] : ['sonnet', 'opus', curModel];
+  const modelOpts = models.map(m =>
+    `<option value="${esc(m)}"${m === curModel ? ' selected' : ''}>${esc(m)}</option>`).join('');
+  return `
+    <select id="backend-select" title="Backend cho MỌI run kế tiếp của project này (persist server-side)">
+      <option value="opencode"${prov === 'opencode' ? ' selected' : ''}>⚡ opencode · 9router (việc nhỏ)</option>
+      <option value="claude"${prov === 'claude' ? ' selected' : ''}>🧠 claude · subscription (việc lớn)</option>
+    </select>
+    <select id="backend-claude-model" class="${prov === 'claude' ? '' : 'hidden'}" title="Model claude (tên trần — direct subscription)">${modelOpts}</select>`;
+}
+
+async function loadBackendSettings() {
+  if (!project) return;
+  try {
+    const s = await j(`/api/projects/${encodeURIComponent(project)}/settings`);
+    const wrap = $('#backend-wrap');
+    if (wrap) wrap.innerHTML = backendSelectorHtml(s);
+  } catch { /* endpoint lỗi → giữ UI cũ, không chặn composer */ }
+}
+
+async function saveBackendSettings() {
+  const sel = $('#backend-select');
+  if (!sel || !project) return;
+  const body = { provider: sel.value };
+  const ms = $('#backend-claude-model');
+  if (ms && sel.value === 'claude') body.claude_model = ms.value;
+  try {
+    const r = await parseJson(await fetch(
+      `/api/projects/${encodeURIComponent(project)}/settings`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }));
+    if (r.error) { alert(r.error); return; }
+    const wrap = $('#backend-wrap');
+    if (wrap) wrap.innerHTML = backendSelectorHtml(r);   // đồng bộ hiện model select khi đổi sang claude
+  } catch (e) { alert(String(e)); }
+}
+
+// Khối Resume cho agent đang DỪNG CHỜ vì cạn max_turns (run còn sống — pagent poll
+// decision file, xem kit/lib/resume.sh). Khác retry: tiếp tục ĐÚNG session claude cũ,
+// không spawn lại pipeline. Mỗi agent pending 1 khối (audits song song có thể cạn cùng lúc).
+function resumeControlHtml(t) {
+  const pend = (t && t.resume_pending) || [];
+  if (!pend.length) return '';
+  return pend.map(p => {
+    const def = Number.isFinite(+p.default_turns) && +p.default_turns >= 1 ? +p.default_turns : 20;
+    return `
+          <div class="live-resume">
+            <span class="resume-label">⏸ <b>${esc(p.agent)}</b> cạn lượt (đã dùng ${esc(String(p.used_turns ?? '?'))}) — cấp thêm để làm tiếp:</span>
+            <input type="number" class="live-resume-turns" min="1" value="${esc(String(def))}" aria-label="Số lượt cấp thêm cho ${esc(p.agent)}">
+            <button class="live-resume-btn" data-task-id="${esc(t.task_id)}" data-agent="${esc(p.agent)}" title="Tiếp tục đúng session agent với số lượt mới">▶ Resume làm tiếp</button>
+            <button class="live-resume-stop" data-task-id="${esc(t.task_id)}" data-agent="${esc(p.agent)}" title="Không cấp thêm — agent fail như hết lượt bình thường">✕ Bỏ</button>
+          </div>`;
+  }).join('');
 }
 
 function renderLive(live) {
@@ -258,7 +327,7 @@ function renderLive(live) {
             <button class="live-cancel" data-task-id="${esc(t.task_id)}" title="Dừng task này">✕ Cancel</button>
             <div class="live-task-text">${esc(t.task || '(no task text)')}</div>
           </div>
-          <div class="live-dag" data-task-id="${esc(t.task_id)}">${renderTimeline(t.timeline || [], t.task_id)}</div>${retryControlHtml(t)}
+          <div class="live-dag" data-task-id="${esc(t.task_id)}">${renderTimeline(t.timeline || [], t.task_id)}</div>${resumeControlHtml(t)}${retryControlHtml(t)}
         </div>
       `).join('')
     : '<div class="idle-msg">No active tasks. Run <code>pagent feature "..."</code> trong terminal.</div>';
@@ -302,6 +371,31 @@ async function cancelLiveTask(tid, btn) {
   } catch (e) {
     alert(String(e));
     if (btn) { btn.disabled = false; btn.textContent = '✕ Cancel'; }
+  }
+}
+
+// Resume agent đang dừng chờ vì max_turns: POST decision → pagent (đang poll) tiếp tục
+// ĐÚNG session claude với số lượt mới. action=stop → agent fail như hết lượt bình thường.
+async function resumeLiveTask(tid, agent, btn, action) {
+  const body = { agent, action };
+  if (action === 'resume') {
+    const wrap = btn.closest('.live-resume');
+    const turnsEl = wrap && wrap.querySelector('.live-resume-turns');
+    const n = parseInt(turnsEl ? turnsEl.value.trim() : '', 10);
+    if (Number.isFinite(n) && n >= 1) body.extra_turns = n;
+  }
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await parseJson(await fetch(
+      `/api/projects/${encodeURIComponent(project)}/resume/${encodeURIComponent(tid)}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }));
+    if (r.error) { alert(r.error); btn.disabled = false; btn.textContent = old; return; }
+    btn.textContent = action === 'resume' ? '✓ đang làm tiếp…' : '✓ đã bỏ';
+    refresh();   // pending biến mất → signature đổi → khối resume tự gỡ
+  } catch (e) {
+    alert(String(e));
+    btn.disabled = false; btn.textContent = old;
   }
 }
 
@@ -929,7 +1023,15 @@ $('#live-list').addEventListener('click', (e) => {
   const c = e.target.closest('.live-cancel');
   if (c) { cancelLiveTask(c.dataset.taskId, c); return; }
   const rt = e.target.closest('.live-retry-btn');
-  if (rt) retryLiveTask(rt.dataset.taskId, rt);
+  if (rt) { retryLiveTask(rt.dataset.taskId, rt); return; }
+  const rs = e.target.closest('.live-resume-btn');
+  if (rs) { resumeLiveTask(rs.dataset.taskId, rs.dataset.agent, rs, 'resume'); return; }
+  const rx = e.target.closest('.live-resume-stop');
+  if (rx) resumeLiveTask(rx.dataset.taskId, rx.dataset.agent, rx, 'stop');
+});
+// Delegation: đổi backend / model claude trong composer → persist settings server-side.
+document.addEventListener('change', (e) => {
+  if (e.target.id === 'backend-select' || e.target.id === 'backend-claude-model') saveBackendSettings();
 });
 $('#workflow-list').addEventListener('click', (e) => {
   const reuse = e.target.closest('.wf-reuse');
@@ -950,4 +1052,4 @@ setInterval(refresh, 3000);
 }
 
 // Export cho test node (browser bỏ qua).
-if (typeof module !== 'undefined' && module.exports) module.exports = { paginate, PAGE_SIZE, fmtCompact, fmtSpend, computeStats, aiWorkflowModel, renderAgentWorkflow, liveMaxTurnsHit, retryControlHtml };
+if (typeof module !== 'undefined' && module.exports) module.exports = { paginate, PAGE_SIZE, fmtCompact, fmtSpend, computeStats, aiWorkflowModel, renderAgentWorkflow, liveMaxTurnsHit, retryControlHtml, resumeControlHtml, liveSignature, backendSelectorHtml };

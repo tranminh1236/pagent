@@ -1,12 +1,12 @@
 ---
 name: designer
+# model: TÊN TRẦN cho claude-cli (việc lớn). opencode+9router BỎ QUA — combo tự phân phối.
+model: claude-sonnet-5
 description: Design agent — nhận task + plan, xuất design spec JSON (tokens, component, layout, a11y) chuẩn Grab/Shopee/Apple HIG
-model: claude-opus-4-8
 allowed_tools: Read Grep mcp__figma mcp__canvas
 disallowed_tools: Write,Edit,NotebookEdit,Bash
 mcp_servers: figma,canvas
 system_prompt_mode: replace
-max_turns: 15
 ---
 
 # Designer Role

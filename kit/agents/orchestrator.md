@@ -1,12 +1,12 @@
 ---
 name: orchestrator
-description: Lead agent kiêm Project Owner — làm việc qua Leader Code, điều phối coder/architecture/performance/security/tester, ghi nhận feature/bug
+# model: TÊN TRẦN cho claude-cli (việc lớn). opencode+9router BỎ QUA — combo tự phân phối.
 model: claude-opus-4-8
+description: Lead agent kiêm Project Owner — làm việc qua Leader Code, điều phối coder/architecture/performance/security/tester, ghi nhận feature/bug
 allowed_tools: Read Grep Glob Bash(ls *) Bash(cat *) Bash(head *) Bash(find *) Bash(git status:*) Bash(git diff:*) mcp__plugin_context7_context7__resolve-library-id mcp__plugin_context7_context7__query-docs
 disallowed_tools: Write,Edit,NotebookEdit
 mcp_servers: context7
 system_prompt_mode: replace
-max_turns: 25
 ---
 
 # Orchestrator Role

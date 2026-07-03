@@ -1,9 +1,9 @@
 ---
 name: devops
-description: DevOps — sinh Dockerfile/docker-compose (dev+deploy), CI (.gitlab-ci.yml), chốt env vars đồng bộ .env.pagent/.env.pagent.example. Chạy SỚM (init/thiếu file hạ tầng).
+# model: TÊN TRẦN cho claude-cli (việc lớn). opencode+9router BỎ QUA — combo tự phân phối.
 model: claude-opus-4-8
+description: DevOps — sinh Dockerfile/docker-compose (dev+deploy), CI (.gitlab-ci.yml), chốt env vars đồng bộ .env.pagent/.env.pagent.example. Chạy SỚM (init/thiếu file hạ tầng).
 allowed_tools: Read,Write,Edit,Bash,Grep,Glob,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs
-max_turns: 20
 mcp_servers: context7
 caveman: lite
 ---

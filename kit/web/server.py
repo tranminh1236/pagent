@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """pagent web dashboard — single-file HTTP server, Python stdlib only."""
-import os, json, re, sys, random, shutil, subprocess, signal
+import os, json, re, sys, random, shutil, subprocess, signal, threading, time
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote, parse_qs
@@ -360,6 +360,54 @@ def plan_pending(proj, tid):
         return {"pending": False}     # đang ghi dở / hỏng → coi như chưa sẵn sàng
     return {"pending": True, "plan": plan}
 
+_AGENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# ───────── Settings per-project (công tắc backend web: opencode ↔ claude direct) ─────────
+_SETTINGS_DEFAULTS = {"provider": "opencode", "claude_model": "sonnet"}
+_PROVIDER_WHITELIST = {"opencode", "claude"}
+_CLAUDE_MODEL_RE = re.compile(r"^[A-Za-z0-9.-]{1,64}$")   # tên trần, KHÔNG provider/model
+
+def _settings_path(proj):
+    return _safe_join(REPORTS, proj, "settings.json")
+
+def read_settings(proj):
+    """Settings per-project — merge default. File hỏng/thiếu → default êm."""
+    out = dict(_SETTINGS_DEFAULTS)
+    p = _settings_path(proj)
+    if p and os.path.isfile(p):
+        try:
+            with open(p) as f:
+                d = json.load(f)
+            for k in _SETTINGS_DEFAULTS:
+                if k in d:
+                    out[k] = d[k]
+        except Exception:
+            pass
+    return out
+
+def resume_pending(proj, tid):
+    """Agents đang chờ cấp thêm lượt sau max_turns (pagent ghi runs/<tid>/
+    resume.pending.<agent>.json rồi poll decision — xem kit/lib/resume.sh).
+    {pending: [{agent, session_id, used_turns, default_turns}...]}."""
+    if not _valid_rawtid(tid):
+        return {"pending": []}
+    rundir = _safe_join(REPORTS, proj, "runs", tid)
+    if not rundir or not os.path.isdir(rundir):
+        return {"pending": []}
+    out = []
+    for name in sorted(os.listdir(rundir)):
+        if not (name.startswith("resume.pending.") and name.endswith(".json")):
+            continue
+        try:
+            with open(os.path.join(rundir, name)) as f:
+                d = json.load(f)
+            out.append({"agent": d["agent"], "session_id": d.get("session_id", ""),
+                        "used_turns": d.get("used_turns", 0),
+                        "default_turns": d.get("default_turns", 20)})
+        except Exception:
+            continue      # đang ghi dở / hỏng → bỏ qua, poll sau sẽ thấy
+    return {"pending": out}
+
 def _step_models(e):
     """Danh sách TẤT CẢ model 1 lượt agent đã dùng. Ưu tiên field `models` (post.sh mới);
     fallback model đơn (event cũ) để không vỡ timeline lịch sử."""
@@ -555,6 +603,34 @@ def agent_stats(proj):
                     "by_model": by_model})
     return out
 
+def _tail_log_to_stdout(logpath, is_done, tag, out=None, interval=0.5):
+    """Tail log file của 1 run → in ra terminal server (prefix [tag]) để lỗi agent
+    hiện ngay nơi chạy `pagent web`. Child ghi TRỰC TIẾP vào file (không pipe) —
+    server chết không làm run nghẽn; log file vẫn là nguồn chính cho web UI.
+    Kết thúc: is_done() true VÀ đã drain hết phần còn lại của file."""
+    out = out or sys.stdout
+    pos = 0
+    while True:
+        done = is_done()          # snapshot TRƯỚC khi đọc — tránh mất dòng ghi xen kẽ
+        chunk = b""
+        try:
+            with open(logpath, "rb") as f:
+                f.seek(pos)
+                chunk = f.read()
+                pos = f.tell()
+        except OSError:
+            pass                  # file chưa tồn tại / bị xoá → coi như chưa có gì mới
+        if chunk:
+            for line in chunk.decode("utf-8", "replace").splitlines():
+                try:
+                    print(f"[{tag}] {line}", file=out, flush=True)
+                except Exception:
+                    return        # stdout đóng (server tắt) → dừng êm
+        if done and not chunk:
+            return
+        time.sleep(interval)
+
+
 def _spawn_pagent(proj, source, mode, full_task, tid, env_extra=None):
     """Dựng env + spawn pagent (Popen, start_new_session, log per-task). DÙNG CHUNG cho
     _chat và retry để KHÔNG nhân bản 2 đường spawn (chống drift). env_extra bổ sung/ghi
@@ -567,8 +643,20 @@ def _spawn_pagent(proj, source, mode, full_task, tid, env_extra=None):
     env["PAGENT_REPORT_DIR"] = REPORTS
     env["PAGENT_SOURCE"] = source
     env["PAGENT_TASK_ID"] = tid
+    # Công tắc backend từ web (settings.json) — ý định user ĐÈ env kế thừa của shell
+    # (bài học PAGENT_MODEL=9router/Claude rơi rớt); env_extra nội bộ vẫn đè được ở dưới.
+    sp = _settings_path(proj)
+    if sp and os.path.isfile(sp):
+        st = read_settings(proj)
+        env["PAGENT_PROVIDER"] = st["provider"]
+        env["PAGENT_CLAUDE_MODEL"] = st["claude_model"]
     for k, v in (env_extra or {}).items():
         env[k] = v
+    # Web spawn luôn bật resume gate (max_turns → chờ user cấp thêm lượt qua button
+    # Live view) — trừ khi env tắt tường minh (PAGENT_RESUME=0).
+    env.setdefault("PAGENT_RESUME", "1")
+    # Backend mặc định là opencode CLI: PAGENT_MODEL dạng provider/model ("9router/Claude")
+    # là format ĐÚNG — không validate model ở đây (provider claude ẩn tự chịu model hợp lệ).
     logdir = _safe_join(REPORTS, proj, "logs")
     if not logdir:
         return {"error": "đường dẫn log không hợp lệ"}, 400
@@ -578,11 +666,18 @@ def _spawn_pagent(proj, source, mode, full_task, tid, env_extra=None):
         return {"error": "đường dẫn log không hợp lệ"}, 400
     try:
         with open(logpath, "ab") as logf:
-            subprocess.Popen([pbin, mode, full_task], cwd=source, env=env,
-                             stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
-                             start_new_session=True)
+            proc = subprocess.Popen([pbin, mode, full_task], cwd=source, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                                    start_new_session=True)
     except Exception as e:
         return {"error": f"không spawn được pagent: {e}"}, 500
+    # Tail log run ra terminal server — lỗi agent hiện ngay nơi chạy `pagent web`
+    # thay vì nằm câm trong logs/<tid>.log. PAGENT_WEB_QUIET=1 → tắt.
+    if os.environ.get("PAGENT_WEB_QUIET") != "1":
+        tag = tid.rsplit("-", 1)[-1]
+        threading.Thread(target=_tail_log_to_stdout,
+                         args=(logpath, lambda: proc.poll() is not None, tag),
+                         daemon=True).start()
     return None, None
 
 def _died_of_max_turns(proj, tid):
@@ -663,6 +758,18 @@ class H(BaseHTTPRequestHandler):
                 if not _valid_proj(proj):
                     return self._j({"error": "invalid or unknown project"}, 400)
                 return self._retry(proj, unquote(mr.group(2)))
+            mz = re.match(r"^/api/projects/([^/]+)/resume/(.+)$", path)
+            if mz:
+                proj = unquote(mz.group(1))
+                if not _valid_proj(proj):
+                    return self._j({"error": "invalid or unknown project"}, 400)
+                return self._resume_decision(proj, unquote(mz.group(2)))
+            ms = re.match(r"^/api/projects/([^/]+)/settings$", path)
+            if ms:
+                proj = unquote(ms.group(1))
+                if not _valid_proj(proj):
+                    return self._j({"error": "invalid or unknown project"}, 400)
+                return self._settings_post(proj)
             m = re.match(r"^/api/projects/([^/]+)/(chat|upload)$", path)
             if not m:
                 return self._j({"error": "not found"}, 404)
@@ -703,6 +810,82 @@ class H(BaseHTTPRequestHandler):
             json.dump({"action": action, "extra": extra}, f)
         os.replace(tmp, decpath)   # atomic — pagent không bao giờ đọc file ghi dở
         return self._j({"ok": True, "action": action})
+
+    def _settings_post(self, proj):
+        """POST {provider?, claude_model?} → merge vào REPORTS/<proj>/settings.json
+        (atomic). Whitelist chặt — field lạ bị bỏ; giá trị sai → 400 không ghi gì."""
+        raw = self._read_body()
+        if raw is None:
+            return self._j({"error": "body quá lớn"}, 413)
+        try:
+            data = json.loads(raw or b"{}")
+        except Exception:
+            return self._j({"error": "JSON không hợp lệ"}, 400)
+        cur = read_settings(proj)
+        if "provider" in data:
+            p = data["provider"]
+            if not isinstance(p, str) or p not in _PROVIDER_WHITELIST:
+                return self._j({"error": "provider phải là opencode|claude"}, 400)
+            cur["provider"] = p
+        if "claude_model" in data:
+            m = data["claude_model"]
+            if not isinstance(m, str) or not _CLAUDE_MODEL_RE.fullmatch(m):
+                return self._j({"error": "claude_model phải là tên trần (vd sonnet, opus) — không phải provider/model"}, 400)
+            cur["claude_model"] = m
+        path = _settings_path(proj)
+        if not path:
+            return self._j({"error": "đường dẫn không hợp lệ"}, 400)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cur, f)
+        os.replace(tmp, path)
+        return self._j(cur)
+
+    def _resume_decision(self, proj, tid):
+        """POST {agent, extra_turns?, action?} → ghi runs/<tid>/resume.decision.<agent>.json
+        (atomic) cho pagent đang poll (kit/lib/resume.sh). Chỉ chấp nhận agent ĐANG có
+        pending file — không tin client tạo decision tuỳ ý; extra_turns clamp server-side."""
+        if not _valid_rawtid(tid):
+            return self._j({"error": "task id không hợp lệ"}, 400)
+        raw = self._read_body()
+        if raw is None:
+            return self._j({"error": "body quá lớn"}, 413)
+        try:
+            data = json.loads(raw or b"{}")
+        except Exception:
+            return self._j({"error": "JSON không hợp lệ"}, 400)
+        agent = data.get("agent") or ""
+        if not isinstance(agent, str) or not _AGENT_RE.fullmatch(agent):
+            return self._j({"error": "agent không hợp lệ"}, 400)
+        action = data.get("action", "resume")
+        if action not in ("resume", "stop"):
+            return self._j({"error": "action phải là resume|stop"}, 400)
+        rundir = _safe_join(REPORTS, proj, "runs", tid)
+        pend = _safe_join(rundir or "", f"resume.pending.{agent}.json") if rundir else None
+        if not pend or not os.path.isfile(pend):
+            return self._j({"error": f"agent '{agent}' không chờ resume (đã xử lý hoặc chưa cạn lượt?)"}, 409)
+        # extra_turns: thiếu/rỗng → default_turns của pending; không phải số → 400; clamp [1, ceiling]
+        ceiling = int(os.environ.get("PAGENT_MAX_TURNS_CEILING", "60"))
+        turns = data.get("extra_turns")
+        if turns is None or turns == "":
+            try:
+                with open(pend) as f:
+                    turns = int(json.load(f).get("default_turns", 20))
+            except Exception:
+                turns = 20
+        if isinstance(turns, bool) or not isinstance(turns, int):
+            try:
+                turns = int(str(turns).strip())
+            except (ValueError, TypeError):
+                return self._j({"error": "extra_turns phải là số nguyên"}, 400)
+        turns = max(1, min(turns, ceiling))
+        dec = os.path.join(rundir, f"resume.decision.{agent}.json")
+        tmp = dec + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"action": action, "extra_turns": turns}, f)
+        os.replace(tmp, dec)   # atomic — pagent không bao giờ đọc file ghi dở
+        return self._j({"ok": True, "agent": agent, "action": action, "extra_turns": turns})
 
     def _retry(self, proj, tid):
         """Retry 1 run chết vì max_turns: đọc task+mode TỪ ĐĨA (runs/<tid>/), clamp
@@ -906,6 +1089,8 @@ class H(BaseHTTPRequestHandler):
                 (r"/tasks/(.+)",   lambda p, t: self._j(task_detail(p, t))),
                 (r"/chat-log/(.+)",lambda p, t: self._j(read_chat_log(p, t, (qs.get("offset") or ["0"])[0]))),
                 (r"/plan/(.+)",    lambda p, t: self._j(plan_pending(p, t))),
+                (r"/resume/(.+)",  lambda p, t: self._j(resume_pending(p, t))),
+                (r"/settings",     lambda p:    self._j(read_settings(p))),
                 (r"/live",         lambda p:    self._j(live_tasks(p))),
                 (r"/agents",       lambda p:    self._j(agent_stats(p))),
                 (r"/workflow",     lambda p:    self._j(read_workflow(p))),

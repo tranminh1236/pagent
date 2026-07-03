@@ -40,8 +40,11 @@ md_meta() {
 echo "=== devops.md — frontmatter + writer tools ==="
 if [[ -f "$DEVOPS" ]]; then ok "devops.md tồn tại"; else fail "devops.md thiếu"; fi
 [[ "$(md_meta "$DEVOPS" name)" == "devops" ]] && ok "devops: name khớp file" || fail "devops: name sai"
-[[ -n "$(md_meta "$DEVOPS" model)" ]] && ok "devops: model khai báo" || fail "devops: model rỗng"
-[[ "$(md_meta "$DEVOPS" max_turns)" =~ ^[0-9]+$ ]] && ok "devops: max_turns là số" || fail "devops: max_turns thiếu/không phải số"
+# model = tên trần cho claude-cli; opencode/9router bỏ qua; max_turns optional (claude mới dùng)
+_m="$(md_meta "$DEVOPS" model)"
+[[ -n "$_m" && "$_m" != */* ]] && ok "devops: model tên trần claude ($_m)" || fail "devops: model phải tên trần claude (got '${_m:-<unset>}')"
+_mt="$(md_meta "$DEVOPS" max_turns)"
+[[ -z "$_mt" || "$_mt" =~ ^[0-9]+$ ]] && ok "devops: max_turns rỗng hoặc là số" || fail "devops: max_turns không phải số ($_mt)"
 DEV_TOOLS="$(md_meta "$DEVOPS" allowed_tools)"
 for _t in Write Edit Bash; do
   echo "$DEV_TOOLS" | grep -qE "(^|[,[:space:]])$_t([,[:space:]]|\$)" \
@@ -80,7 +83,8 @@ echo ""
 echo "=== docs.md — scope hẹp, chặn code runtime ==="
 if [[ -f "$DOCS" ]]; then ok "docs.md tồn tại"; else fail "docs.md thiếu"; fi
 [[ "$(md_meta "$DOCS" name)" == "docs" ]] && ok "docs: name khớp file" || fail "docs: name sai"
-[[ -n "$(md_meta "$DOCS" model)" ]] && ok "docs: model khai báo" || fail "docs: model rỗng"
+_m="$(md_meta "$DOCS" model)"
+[[ -n "$_m" && "$_m" != */* ]] && ok "docs: model tên trần claude ($_m)" || fail "docs: model phải tên trần claude (got '${_m:-<unset>}')"
 DOC_TOOLS="$(md_meta "$DOCS" allowed_tools)"
 for _t in Read Edit Write; do
   echo "$DOC_TOOLS" | grep -qE "(^|[,[:space:]])$_t([,[:space:]]|\$)" \

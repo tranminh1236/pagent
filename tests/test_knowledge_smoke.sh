@@ -57,6 +57,7 @@ make_stub "$SB/claude_bad" bad
 export FAKE_CALLS="$SB/calls"; : >"$FAKE_CALLS"
 export PAGENT_SOURCE="$SRC" PAGENT_PROJECT="proj" PAGENT_REPORT_DIR="$REP" PAGENT_KIT_DIR="$ROOT/kit"
 export PAGENT_CLAUDE_BIN="$SB/claude"
+export PAGENT_PROVIDER=claude   # test stub backend claude (backend mặc định giờ là opencode)
 cp_calls() { grep -c context-planning "$FAKE_CALLS" 2>/dev/null || echo 0; }
 
 # ─── 1. Parse ────────────────────────────────────────────────────────────────

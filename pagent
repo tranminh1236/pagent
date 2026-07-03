@@ -18,6 +18,8 @@ KIT_DIR="${PAGENT_KIT_DIR:-$SCRIPT_DIR/kit}"
 
 # Portable file lock (flock/mkdir) — chống interleave khi chạy song song
 if [[ -f "$KIT_DIR/lib/lock.sh" ]]; then . "$KIT_DIR/lib/lock.sh"; else with_lock() { shift; "$@"; }; fi
+# Resume gate khi agent chạm max_turns (xem call_agent). Thiếu lib → gate off êm.
+if [[ -f "$KIT_DIR/lib/resume.sh" ]]; then . "$KIT_DIR/lib/resume.sh"; else resume_gate() { return 1; }; fi
 
 #─────────────────────────────────────────────
 # Auto-load .env.pagent từ cwd hoặc parents
@@ -46,8 +48,21 @@ detect_source() {
 PAGENT_SOURCE="${PAGENT_SOURCE:-$(detect_source)}"
 PAGENT_PROJECT="${PAGENT_PROJECT:-$(basename "$PAGENT_SOURCE")}"
 PAGENT_REPORT_DIR="${PAGENT_REPORT_DIR:-$HOME/.pagent-reports}"
-PAGENT_MODEL="${PAGENT_MODEL:-sonnet}"
+# PAGENT_MODEL dạng provider/model của opencode (vd "9router/Claude"). Rỗng → opencode
+# dùng model default trong config (~/.config/opencode/opencode.json). Nhánh claude ẩn
+# tự fallback "sonnet" nội bộ.
+PAGENT_MODEL="${PAGENT_MODEL:-}"
 PAGENT_CLAUDE_BIN="${PAGENT_CLAUDE_BIN:-claude}"
+# Provider claude = việc LỚN đi thẳng subscription Anthropic (mặc định direct: gỡ
+# ANTHROPIC_BASE_URL/API_KEY khi invoke — không dính gateway). Model tên trần.
+PAGENT_CLAUDE_DIRECT="${PAGENT_CLAUDE_DIRECT:-1}"
+PAGENT_CLAUDE_MODEL="${PAGENT_CLAUDE_MODEL:-sonnet}"
+PAGENT_OPENCODE_BIN="${PAGENT_OPENCODE_BIN:-opencode}"
+# XDG home riêng cho opencode do pagent spawn: né ~/.local/share|state / ~/.cache/opencode
+# bị root chiếm (di sản chạy sudo) + cô lập session pagent khỏi opencode dùng tay.
+PAGENT_OC_HOME="${PAGENT_OC_HOME:-$PAGENT_REPORT_DIR/.opencode}"
+# opencode không có max_turns → guard treo bằng trần thời gian 1 lượt agent (giây).
+PAGENT_AGENT_TIMEOUT="${PAGENT_AGENT_TIMEOUT:-3600}"
 PAGENT_MAX_REVIEW_ROUND="${PAGENT_MAX_REVIEW_ROUND:-2}"
 PAGENT_OPENROUTER_BASE="${PAGENT_OPENROUTER_BASE:-https://openrouter.ai/api/v1}"
 PAGENT_OPENROUTER_KEY="${PAGENT_OPENROUTER_KEY:-${OPENROUTER_API_KEY:-}}"
@@ -65,7 +80,8 @@ warn() { printf '%s %s\n' "$(c_yellow '⚠')" "$*" >&2; }
 die()  { printf '%s %s\n' "$(c_red 'error:')" "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || die "thiếu công cụ: $1"; }
 need jq
-need "$PAGENT_CLAUDE_BIN"
+# Binary backend check lazy theo provider trong call_agent — backend mặc định là
+# opencode; claude/openrouter là provider phụ, chỉ cần binary khi thật sự dùng.
 
 # YAML frontmatter parse
 md_body() {
@@ -203,6 +219,124 @@ call_openrouter() {
   ' >"$resp_file"
 }
 
+# Sinh agent file opencode từ agent md của kit — .opencode/agents/pagent-<agent>.md
+# (opencode đọc theo project dir). Body = system prompt SAU mọi injection (caveman/TDD).
+# permission map thô từ allowed/disallowed_tools: Write|Edit → edit, Bash → bash,
+# WebFetch → webfetch (mất allow-list chi tiết kiểu `Bash(cat *)` — chấp nhận theo spec).
+# Args: $1=agent $2=system_prompt $3=allowed $4=disallowed
+oc_agent_file() {
+  local agent="$1" system_prompt="$2" allowed="$3" disallowed="$4"
+  local dir="$PAGENT_SOURCE/.opencode/agents"
+  mkdir -p "$dir"
+  local p_edit=deny p_bash=deny p_webfetch=deny
+  [[ "$allowed" == *Write* || "$allowed" == *Edit* ]] && p_edit=allow
+  [[ "$disallowed" == *Write* || "$disallowed" == *Edit* ]] && p_edit=deny
+  [[ "$allowed" == *Bash* ]] && p_bash=allow
+  [[ "$disallowed" == *Bash* ]] && p_bash=deny
+  [[ "$allowed" == *WebFetch* || "$allowed" == *webfetch* ]] && p_webfetch=allow
+  cat >"$dir/pagent-$agent.md" <<EOF
+---
+description: pagent agent '$agent' (auto-generated mỗi run — đừng sửa tay, thêm .opencode/agents/pagent-*.md vào .gitignore)
+mode: primary
+permission:
+  edit: $p_edit
+  bash: $p_bash
+  webfetch: $p_webfetch
+---
+$system_prompt
+EOF
+}
+
+# Sinh MCP config opencode từ kit/mcp/*.json (dạng claude {mcpServers}) → merge vào
+# $PAGENT_SOURCE/.opencode/opencode.json key `mcp`. CHỈ ghi khi file chưa tồn tại hoặc
+# do pagent sinh (marker _pagent_generated) — không clobber config opencode riêng của user.
+# Args: các path kit/mcp/*.json
+oc_mcp_config() {
+  local out="$PAGENT_SOURCE/.opencode/opencode.json"
+  if [[ -f "$out" ]] && ! jq -e '._pagent_generated == true' "$out" >/dev/null 2>&1; then
+    warn "$out là config user tự quản — bỏ qua sinh mcp (tự thêm server vào đó nếu cần)"
+    return 0
+  fi
+  mkdir -p "$PAGENT_SOURCE/.opencode"
+  # claude http server → opencode remote {type:"remote",url}; stdio {command,args} →
+  # local {type:"local",command:[...]}
+  jq -s '
+    {_pagent_generated: true,
+     mcp: (map(.mcpServers | to_entries) | add | map({
+       key: .key,
+       value: (if .value.url then {type: "remote", url: .value.url}
+               else {type: "local",
+                     command: ([.value.command] + (.value.args // [])),
+                     environment: (.value.env // {})} end)
+     }) | from_entries)}
+  ' "$@" >"$out"
+}
+
+# Gọi opencode CLI (backend MẶC ĐỊNH), transform NDJSON events → format claude CLI JSON
+# (post.sh/web/_resp_ok dùng chung 1 shape cho mọi provider).
+# Stdin: user prompt. Args: $1=agent $2=model ("" → default config opencode) $3=resp_file
+# Env: PAGENT_RUN_DIR (events + err ghi cạnh resp), PAGENT_OC_HOME, PAGENT_AGENT_TIMEOUT
+call_opencode() {
+  local agent="$1" model="$2" resp_file="$3"
+  local prompt; prompt="$(cat)"
+  local ev_file="$PAGENT_RUN_DIR/$agent.oc.jsonl"
+
+  mkdir -p "$PAGENT_OC_HOME/data" "$PAGENT_OC_HOME/state" "$PAGENT_OC_HOME/cache"
+  local oc_args=(run --dir "$PAGENT_SOURCE" --format json --auto \
+                 --title "pagent-$PAGENT_TASK_ID-$agent" --agent "pagent-$agent")
+  [[ -n "$model" ]] && oc_args+=(-m "$model")
+
+  local t_start t_end dur_ms rc=0
+  t_start="$(python3 -c 'import time;print(int(time.time()*1000))')"
+  # alarm = trần thời gian 1 lượt (opencode không có max_turns). Prompt qua argv
+  # (message positional của opencode run) — trần ARG_MAX ~256KB, lỗi spawn sẽ lộ rõ.
+  XDG_DATA_HOME="$PAGENT_OC_HOME/data" XDG_STATE_HOME="$PAGENT_OC_HOME/state" \
+  XDG_CACHE_HOME="$PAGENT_OC_HOME/cache" \
+    perl -e 'alarm shift @ARGV; exec @ARGV or die "exec fail: $!"' -- \
+    "$PAGENT_AGENT_TIMEOUT" "$PAGENT_OPENCODE_BIN" "${oc_args[@]}" "$prompt" \
+    >"$ev_file" 2>>"$PAGENT_RUN_DIR/$agent.err" </dev/null || rc=$?
+  t_end="$(python3 -c 'import time;print(int(time.time()*1000))')"
+  dur_ms=$((t_end - t_start))
+
+  # Transform events → claude shape. .result = text event CUỐI (response chốt của agent);
+  # lỗi → nhét message vào .result để nhánh fail warn đúng reason (xem _resp_ok).
+  jq -s --argjson rc "$rc" --argjson dur "$dur_ms" --arg m "${model:-opencode/default}" '
+    (map(select(.type == "text")) | if length > 0 then last.part.text else null end) as $text
+    | [.[] | select(.type == "step_finish").part] as $steps
+    | (map(select(.type == "error")) | if length > 0 then last.error else null end) as $err
+    | (($err != null) or ($rc != 0)) as $bad
+    | {
+        type: "result",
+        subtype: (if $bad then "error" else "success" end),
+        is_error: $bad,
+        result: (if $bad
+                 then (($err.data.message // $err.name // "opencode fail rc=\($rc)"))
+                 else ($text // "") end),
+        session_id: ((map(.sessionID) | map(select(. != null)) | first) // ""),
+        num_turns: ($steps | length),
+        duration_ms: $dur,
+        total_cost_usd: ([$steps[].cost // 0] | add // 0),
+        usage: {
+          input_tokens:                ([$steps[].tokens.input // 0] | add // 0),
+          output_tokens:               ([$steps[].tokens.output // 0] | add // 0),
+          cache_read_input_tokens:     ([$steps[].tokens.cache.read // 0] | add // 0),
+          cache_creation_input_tokens: ([$steps[].tokens.cache.write // 0] | add // 0)
+        },
+        modelUsage: { ($m): {
+          inputTokens:              ([$steps[].tokens.input // 0] | add // 0),
+          outputTokens:             ([$steps[].tokens.output // 0] | add // 0),
+          cacheReadInputTokens:     ([$steps[].tokens.cache.read // 0] | add // 0),
+          cacheCreationInputTokens: ([$steps[].tokens.cache.write // 0] | add // 0),
+          costUSD:                  ([$steps[].cost // 0] | add // 0)
+        } },
+        terminal_reason: (if $bad then (($err.data.message // $err.name // "error")) else "completed" end),
+        provider: "opencode"
+      }
+  ' "$ev_file" >"$resp_file" 2>>"$PAGENT_RUN_DIR/$agent.err" \
+    || printf '{"type":"result","subtype":"error","is_error":true,"result":"opencode events parse fail (rc=%s) — xem %s","provider":"opencode"}\n' \
+         "$rc" "$ev_file" >"$resp_file"
+}
+
 # Trích JSON object đầu tiên hợp lệ từ text bất kỳ (xử lý fence, preamble, postamble).
 # Stdin: text thô. Stdout: JSON. Exit 0 nếu thành công.
 extract_json() {
@@ -265,6 +399,11 @@ spinner() {
   eval "${_old_exit_trap:-trap - EXIT}"
 }
 
+# Response agent OK? = có .result VÀ is_error != true. claude CLI nhét lỗi API
+# ("API Error: 401 ...") vào .result với is_error=true nhưng subtype vẫn "success" —
+# chỉ check .result tồn tại là agent chết CÂM: bước sau nhận chuỗi lỗi làm output.
+_resp_ok() { jq -e '(.result != null) and (.is_error != true)' "$1" >/dev/null 2>&1; }
+
 #─────────────────────────────────────────────
 # Gọi 1 agent qua claude CLI
 # stdin: prompt text
@@ -304,7 +443,7 @@ call_agent() {
   local caveman;            caveman="$(md_meta "$md" caveman)"               # off | lite | full | ultra
   local mcp_servers;        mcp_servers="$(md_meta "$md" mcp_servers)"        # vd: context7
   local provider;           provider="$(md_meta "$md" provider)"             # claude | openrouter
-  provider="${provider:-${PAGENT_PROVIDER:-claude}}"
+  provider="${provider:-${PAGENT_PROVIDER:-opencode}}"
 
   # MCP config: nạp config server cho từng MCP mà agent khai báo dùng
   # (mcp_servers chứa tên server, hoặc allowed_tools tham chiếu tool server đó).
@@ -395,12 +534,38 @@ $tdd_body"
       printf '%s' "$prompt" | call_openrouter "$model" "$system_prompt" "$resp_file"
     ) 2>"$PAGENT_RUN_DIR/$agent.err" &
     backend_pid=$!
+  elif [[ "$provider" == "opencode" ]]; then
+    command -v "$PAGENT_OPENCODE_BIN" >/dev/null || die "thiếu opencode CLI ($PAGENT_OPENCODE_BIN — set PAGENT_OPENCODE_BIN)"
+    # Frontmatter model là của claude-cli (tên trần, việc lớn) — opencode KHÔNG dùng:
+    # để 9router combo tự phân phối model tối ưu. Chỉ nhận PAGENT_MODEL (provider/model)
+    # hoặc rỗng → default config opencode.
+    local oc_model="$PAGENT_MODEL"
+    [[ "$oc_model" == */* ]] || oc_model=""
+    label="$(c_cyan "[$agent]") via opencode (${oc_model:-config-default})…"
+    oc_agent_file "$agent" "$system_prompt" "$allowed" "$disallowed"
+    [[ ${#mcp_configs[@]} -gt 0 ]] && oc_mcp_config "${mcp_configs[@]}"
+    ( printf '%s' "$prompt" | call_opencode "$agent" "$oc_model" "$resp_file"
+    ) 2>>"$PAGENT_RUN_DIR/$agent.err" &
+    backend_pid=$!
   else
+    # Provider claude = việc LỚN (PAGENT_PROVIDER=claude / settings web / frontmatter).
+    command -v "$PAGENT_CLAUDE_BIN" >/dev/null || die "thiếu claude CLI ($PAGENT_CLAUDE_BIN — set PAGENT_CLAUDE_BIN)"
+    # Model dạng provider/model (opencode-form) vô nghĩa với claude → bỏ, dùng tên trần.
+    [[ "$model" == */* ]] && model=""
+    model="${model:-$PAGENT_CLAUDE_MODEL}"
+    # Direct mode (mặc định): gỡ route gateway để claude CLI dùng thẳng subscription.
+    # `env` không -u = passthrough (giữ gateway khi PAGENT_CLAUDE_DIRECT=0).
+    local -a _cl_env=(env)
+    if _is_truthy "$PAGENT_CLAUDE_DIRECT"; then
+      _cl_env+=(-u ANTHROPIC_BASE_URL -u ANTHROPIC_API_KEY)
+      label="$(c_cyan "[$agent]") via claude direct ($model)…"
+    fi
     # --setting-sources project,local: KHÔNG nạp ~/.claude/settings.json (user scope).
     # Hook PreToolUse global (vd rtk) rewrite `cat`→`rtk read`, `grep`→`rtk grep`… TRƯỚC
     # khi check permission → lệnh đã rewrite không khớp allowed_tools của agent (Bash(cat *)…)
     # → mọi bash bị deny → agent đốt hết max_turns → JSON parse fail. Loại user hook để
     # agent chạy đúng allowlist tự khai trong frontmatter.
+    # args KHÔNG gồm --max-turns — vòng resume tái dùng nguyên args + budget mới
     local args=(-p --output-format json --model "$model" --setting-sources project,local)
     if [[ "$sp_mode" == "replace" ]]; then
       args+=(--system-prompt "$system_prompt")
@@ -409,13 +574,14 @@ $tdd_body"
     fi
     [[ -n "$allowed" ]] && args+=(--allowed-tools "$allowed")
     [[ -n "$disallowed" ]] && args+=(--disallowed-tools "$disallowed")
-    [[ -n "$max_turns" ]] && args+=(--max-turns "$max_turns")
     local mc
     if [[ ${#mcp_configs[@]} -gt 0 ]]; then
       for mc in "${mcp_configs[@]}"; do args+=(--mcp-config "$mc"); done
     fi
+    local first_args=("${args[@]}")
+    [[ -n "$max_turns" ]] && first_args+=(--max-turns "$max_turns")
     ( cd "$PAGENT_SOURCE"
-      printf '%s' "$prompt" | "$PAGENT_CLAUDE_BIN" "${args[@]}"
+      printf '%s' "$prompt" | "${_cl_env[@]}" "$PAGENT_CLAUDE_BIN" "${first_args[@]}"
     ) >"$resp_file" 2>"$PAGENT_RUN_DIR/$agent.err" &
     backend_pid=$!
   fi
@@ -425,9 +591,43 @@ $tdd_body"
   # Post-hook LUÔN chạy (kể cả khi agent fail) — tránh orphan start event trong tokens log
   [[ -x "$KIT_DIR/hooks/post.sh" ]] && "$KIT_DIR/hooks/post.sh" "$resp_file" || true
 
-  if ! jq -e '.result' "$resp_file" >/dev/null 2>&1; then
-    local reason; reason="$(jq -r '.terminal_reason // .error // "unknown"' "$resp_file" 2>/dev/null)"
-    warn "agent $agent fail (reason=$reason) — xem $PAGENT_RUN_DIR/$agent.err"
+  # Resume gate: chạm max_turns → dừng chờ user cấp thêm lượt (web button qua file
+  # handshake / tty prompt) rồi tiếp tục ĐÚNG session (--resume) — pipeline không chết.
+  # Chỉ provider claude (openrouter không có session resume). Không ai duyệt trong
+  # timeout / cap PAGENT_MAX_RESUME vòng → rơi xuống nhánh fail như hành vi cũ.
+  # Spec: docs/superpowers/specs/2026-07-03-resume-max-turns-design.md
+  local resume_round=0 max_resume="${PAGENT_MAX_RESUME:-3}"
+  while [[ "$provider" == "claude" ]] && ! _resp_ok "$resp_file"; do
+    local _subtype _sid _used _extra
+    _subtype="$(jq -r '.subtype // ""' "$resp_file" 2>/dev/null)"
+    _sid="$(jq -r '.session_id // ""' "$resp_file" 2>/dev/null)"
+    [[ "$_subtype" == "error_max_turns" && -n "$_sid" ]] || break
+    if (( resume_round >= max_resume )); then
+      warn "agent $agent đã resume $max_resume lần — không cấp thêm lượt"
+      break
+    fi
+    _used="$(jq -r '.num_turns // 0' "$resp_file" 2>/dev/null)"
+    log "$(c_yellow '⏸') $(c_cyan "[$agent]") cạn lượt (đã dùng $_used) — chờ cấp thêm để resume session"
+    _extra="$(resume_gate "$agent" "$_sid" "$_used" "${max_turns:-20}")" || break
+    resume_round=$((resume_round + 1))
+    log "$(c_cyan "[$agent]") resume vòng $resume_round/$max_resume (+$_extra lượt, session ${_sid:0:8}…)"
+    local resume_prompt="Bạn bị dừng vì hết lượt (max turns). Tiếp tục từ chỗ đang dở, hoàn thành đúng yêu cầu và format output ban đầu."
+    [[ -x "$KIT_DIR/hooks/pre.sh" ]] && "$KIT_DIR/hooks/pre.sh" "$resume_prompt" || true
+    ( cd "$PAGENT_SOURCE"
+      printf '%s' "$resume_prompt" | "${_cl_env[@]}" "$PAGENT_CLAUDE_BIN" "${args[@]}" --max-turns "$_extra" --resume "$_sid"
+    ) >"$resp_file" 2>>"$PAGENT_RUN_DIR/$agent.err" &
+    backend_pid=$!
+    spinner "$backend_pid" "$(c_cyan "[$agent]") resuming…"
+    wait "$backend_pid" || true
+    [[ -x "$KIT_DIR/hooks/post.sh" ]] && "$KIT_DIR/hooks/post.sh" "$resp_file" || true
+  done
+
+  if ! _resp_ok "$resp_file"; then
+    # is_error=true → reason thật nằm trong .result (vd "API Error: 401 ..."); case khác
+    # giữ terminal_reason/error như cũ.
+    local reason
+    reason="$(jq -r '.terminal_reason // .error // (if .is_error == true then .result else null end) // "unknown"' "$resp_file" 2>/dev/null)"
+    warn "agent $agent fail (reason=${reason:0:300}) — xem $PAGENT_RUN_DIR/$agent.err"
     tail -20 "$resp_file" >&2
     return 1
   fi
@@ -1749,10 +1949,14 @@ kit:           $KIT_DIR
 PAGENT_SOURCE:        $PAGENT_SOURCE
 PAGENT_PROJECT:       $PAGENT_PROJECT
 PAGENT_REPORT_DIR:    $PAGENT_REPORT_DIR
-PAGENT_MODEL:         $PAGENT_MODEL
+PAGENT_MODEL:         ${PAGENT_MODEL:-(default opencode config)}
+PAGENT_PROVIDER:      ${PAGENT_PROVIDER:-opencode}
 PAGENT_MODE:          ${PAGENT_MODE:-(per-command)}
-PAGENT_CLAUDE_BIN:    $PAGENT_CLAUDE_BIN
+PAGENT_OPENCODE_BIN:  $PAGENT_OPENCODE_BIN
+PAGENT_OC_HOME:       $PAGENT_OC_HOME
+PAGENT_CLAUDE_BIN:    $PAGENT_CLAUDE_BIN (provider claude ẩn)
 PAGENT_MAX_REVIEW_ROUND: $PAGENT_MAX_REVIEW_ROUND
+opencode version:     $("$PAGENT_OPENCODE_BIN" --version 2>/dev/null | head -1)
 claude version:       $("$PAGENT_CLAUDE_BIN" --version 2>/dev/null | head -1)
 EOF
 }
@@ -1794,15 +1998,31 @@ ENVIRONMENT (đặt trong .env.pagent hoặc shell)
   PAGENT_SOURCE             folder source code (mặc định $PWD)
   PAGENT_PROJECT            tên project (mặc định basename của SOURCE)
   PAGENT_REPORT_DIR         nơi lưu report (mặc định ~/.pagent-reports)
-  PAGENT_MODEL              claude model (mặc định claude-sonnet-4-6)
+  PAGENT_MODEL              model dạng provider/model của opencode (vd 9router/Claude);
+                            rỗng → dùng model default trong opencode.json
+  PAGENT_PROVIDER           opencode (mặc định) | claude (ẩn) | openrouter
+  PAGENT_OPENCODE_BIN       path tới opencode CLI (mặc định "opencode")
+  PAGENT_OC_HOME            XDG data/state/cache riêng cho opencode do pagent spawn
+                            (mặc định $PAGENT_REPORT_DIR/.opencode — né dir bị root chiếm)
+  PAGENT_AGENT_TIMEOUT      trần giây 1 lượt agent, guard treo vì opencode không có
+                            max_turns (mặc định 3600)
   PAGENT_MODE               feature | hotfix | chore | find (override subcommand)
-  PAGENT_CLAUDE_BIN         path tới claude CLI (mặc định "claude")
+  PAGENT_CLAUDE_BIN         path tới claude CLI cho provider claude (mặc định "claude")
+  PAGENT_CLAUDE_DIRECT      1 (mặc định) → provider claude đi THẲNG subscription Anthropic
+                            (gỡ ANTHROPIC_BASE_URL/API_KEY khi invoke); 0 → giữ gateway
+  PAGENT_CLAUDE_MODEL       model tên trần cho provider claude (mặc định sonnet; việc
+                            cực lớn → opus). Web settings per-project set biến này.
   PAGENT_MAX_REVIEW_ROUND   số vòng coder↔review DÙNG CHUNG (mặc định 2); reviewer.md có thể
                             override qua frontmatter max_review_round (Leader Code giữ ngân sách chung)
   PAGENT_MAX_TURNS          override max_turns mọi agent (repo lớn → tăng để tránh max_turns fail)
   PAGENT_MAX_TURNS_<AGENT>  override riêng 1 agent, vd PAGENT_MAX_TURNS_ORCHESTRATOR=40
   PAGENT_CONFIRM            1 → bắt buộc xác nhận plan trước khi chạy agent (web tự bật)
   PAGENT_CONFIRM_TIMEOUT    giây chờ xác nhận qua web rồi hủy (mặc định 1800)
+  PAGENT_RESUME             1 → agent cạn max_turns thì DỪNG CHỜ cấp thêm lượt (button Resume
+                            trên web Live) rồi tiếp tục ĐÚNG session; 0 → tắt cả tty prompt.
+                            Non-tty không bật → fail ngay như cũ. Web spawn tự bật.
+  PAGENT_RESUME_TIMEOUT     giây chờ quyết định resume rồi fail như cũ (mặc định 900)
+  PAGENT_MAX_RESUME         số vòng resume tối đa mỗi agent mỗi run (mặc định 3)
   PAGENT_YES / PAGENT_NO_CONFIRM  1 → bỏ qua gate xác nhận (vẫn in plan summary), chạy luôn
   PAGENT_CAVEMAN            off|lite|full|ultra — token compress mode (override md frontmatter)
   PAGENT_KNOWLEDGE          1 (mặc định) → bật context-planning bước [0] + decision-log; 0 → tắt

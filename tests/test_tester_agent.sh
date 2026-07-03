@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Tests for kit/agents/tester.md — validates Playwright MCP integration additions
+# Tests for kit/agents/tester.md — backend opencode (2026-07-04).
+# Lịch sử: tester từng khai 15 tool mcp__plugin_playwright_playwright__* — đó là MCP của
+# plugin USER-SCOPE Claude Code, chưa bao giờ được nạp qua pagent (call_agent dùng
+# --setting-sources project,local và kit/mcp/ không có playwright.json) → dead-weight
+# đốt system prompt mỗi run. Đã DỌN khỏi tester.md; muốn browser test thật thì thêm
+# kit/mcp/playwright.json + mcp_servers: playwright rồi khôi phục section.
 
 FILE="kit/agents/tester.md"
 PASS=0
@@ -32,56 +37,32 @@ assert_not_contains() {
 
 cd "$(dirname "$0")/.." || exit 1
 
-echo "=== tester.md — Playwright MCP integration ==="
+echo "=== tester.md — tool playwright chết đã được dọn ==="
 
-# --- allowed_tools: all 15 Playwright tools present ---
-TOOLS=(
-  "mcp__plugin_playwright_playwright__browser_navigate"
-  "mcp__plugin_playwright_playwright__browser_click"
-  "mcp__plugin_playwright_playwright__browser_type"
-  "mcp__plugin_playwright_playwright__browser_fill_form"
-  "mcp__plugin_playwright_playwright__browser_select_option"
-  "mcp__plugin_playwright_playwright__browser_press_key"
-  "mcp__plugin_playwright_playwright__browser_hover"
-  "mcp__plugin_playwright_playwright__browser_snapshot"
-  "mcp__plugin_playwright_playwright__browser_take_screenshot"
-  "mcp__plugin_playwright_playwright__browser_wait_for"
-  "mcp__plugin_playwright_playwright__browser_console_messages"
-  "mcp__plugin_playwright_playwright__browser_network_requests"
-  "mcp__plugin_playwright_playwright__browser_close"
-  "mcp__plugin_playwright_playwright__browser_resize"
-  "mcp__plugin_playwright_playwright__browser_evaluate"
-)
-for tool in "${TOOLS[@]}"; do
-  assert_contains "allowed_tools contains $tool" "$tool"
-done
+# --- không còn bất kỳ tham chiếu MCP playwright plugin nào (frontmatter LẪN body) ---
+assert_not_contains "không còn tool mcp playwright plugin" "mcp__plugin_playwright_playwright__"
+assert_not_contains "không còn section browser flow Playwright MCP" "## Test web bằng browser (Playwright MCP)"
+assert_not_contains "không còn block ## BROWSER trong output template" "## BROWSER"
+assert_not_contains "không còn yêu cầu PLAYWRIGHT_HEADLESS" "PLAYWRIGHT_HEADLESS"
 
-# --- core tools still present ---
+# --- core tools còn đủ ---
+TOOLS_LINE="$(awk '/^allowed_tools:/{print; exit}' "$FILE")"
 for core in Read Write Edit Bash Grep Glob; do
-  assert_contains "allowed_tools still has core tool: $core" "$core"
+  if grep -qE "(:|,)[[:space:]]*$core(,|[[:space:]]|$)" <<<"$TOOLS_LINE"; then
+    echo "PASS: allowed_tools còn core tool: $core"; ((PASS++))
+  else
+    echo "FAIL: allowed_tools thiếu core tool: $core — $TOOLS_LINE"; ((FAIL++))
+  fi
 done
 
-# --- web browser section exists ---
-assert_contains "section: Test web bằng browser (Playwright MCP)" \
-  "## Test web bằng browser (Playwright MCP)"
+# --- ghi chú browser-test để lại dấu vết (biết đường khôi phục khi có MCP) ---
+assert_contains "có ghi chú browser test tạm không khả dụng" "Browser test"
 
-# --- navigate step references correct tool name ---
-assert_contains "navigate step uses mcp__plugin_playwright_playwright__browser_navigate" \
-  "mcp__plugin_playwright_playwright__browser_navigate"
-
-# --- headless=false requirement ---
-assert_contains "headless=false requirement present" "headless=false"
-assert_contains "explicit ban on headless mode" "KHÔNG headless"
-assert_contains "PLAYWRIGHT_HEADLESS=false env var example" "PLAYWRIGHT_HEADLESS=false"
-
-# --- BROWSER block in output template ---
-assert_contains "output template has ## BROWSER block" "## BROWSER"
-assert_contains "output template mentions headless confirmation" "headless=false"
-
-# --- edge: headless=true must NOT appear as a positive instruction ---
-# The file may mention it in the negation context, so check the actual negation is present
-assert_contains "negation of headless: Tester KHÔNG được dùng chế độ headless" \
-  "Tester KHÔNG được dùng chế độ headless"
+# --- các phần nghiệp vụ cốt lõi giữ nguyên ---
+assert_contains "quy trình đọc source-summary còn" ".pagent/source-summary.md"
+assert_contains "phối hợp performance/security còn" "PERFORMANCE_REPORT"
+assert_contains "output template TESTS_ADDED còn" "## TESTS_ADDED"
+assert_contains "output template RUN còn" "## RUN"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

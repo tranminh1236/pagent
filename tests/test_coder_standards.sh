@@ -52,7 +52,14 @@ echo "=== coder.md — Coding Standards verification ==="
 
 # --- YAML frontmatter fields intact ---
 assert_meta "name = coder" "name" "coder"
-assert_meta "model = opus" "model" "opus"
+# Quy ước model (2026-07-04): frontmatter model = TÊN TRẦN cho claude-cli (việc lớn);
+# opencode/9router BỎ QUA field này — combo tự phân phối model tối ưu.
+_m=$(awk -v k="model" '/^---$/{p++; next} p==1 && $1==k":"{sub("^[^:]+:[[:space:]]*",""); print; exit}' "$FILE")
+if [[ -n "$_m" && "$_m" != */* ]]; then
+  echo "PASS: model là tên trần claude-cli (got '$_m')"; ((PASS++))
+else
+  echo "FAIL: model phải là tên trần claude (vd opus, sonnet) — got '${_m:-<unset>}'"; ((FAIL++))
+fi
 assert_meta "caveman = lite" "caveman" "lite"
 assert_meta "mcp_servers = context7" "mcp_servers" "context7"
 

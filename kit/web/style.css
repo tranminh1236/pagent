@@ -336,6 +336,40 @@ tr.row:hover { background: var(--panel-2); }
 .live-retry-btn:hover { background: rgba(251,191,36,0.12); }
 .live-retry-btn:disabled { opacity: 0.55; cursor: default; color: var(--dim); border-color: var(--border); }
 
+/* Resume gate: agent dừng chờ cấp thêm lượt (max_turns) — run còn sống, tiếp tục đúng session */
+.live-resume {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px;
+  padding: 6px 8px; border: 1px dashed var(--warn); border-radius: 6px;
+}
+.live-resume .resume-label { font-size: 11px; color: var(--warn); }
+.live-resume-turns {
+  width: 80px; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 3px 8px; font-family: var(--mono); font-size: 11px;
+}
+.live-resume-turns:focus { outline: none; border-color: var(--accent); }
+.live-resume-btn {
+  cursor: pointer; font-size: 11px; font-weight: 600;
+  padding: 3px 10px; border-radius: 6px;
+  background: var(--panel); color: var(--ok, #34d399); border: 1px solid var(--ok, #34d399);
+}
+.live-resume-btn:hover { background: rgba(52,211,153,0.12); }
+.live-resume-btn:disabled { opacity: 0.55; cursor: default; color: var(--dim); border-color: var(--border); }
+.live-resume-stop {
+  cursor: pointer; font-size: 11px; padding: 3px 10px; border-radius: 6px;
+  background: var(--panel); color: var(--dim); border: 1px solid var(--border);
+}
+.live-resume-stop:hover { color: var(--text); }
+
+/* Công tắc backend (composer): opencode·9router (việc nhỏ) ↔ claude·subscription (việc lớn) */
+.backend-wrap { display: flex; gap: 6px; align-items: center; margin-right: auto; }
+.backend-wrap select {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 3px 6px; font-size: 11px; font-family: var(--mono);
+  cursor: pointer; max-width: 240px;
+}
+.backend-wrap select:focus { outline: none; border-color: var(--accent); }
+.backend-wrap select.hidden { display: none; }
+
 /* ───────── Workflows ───────── */
 #workflow-list { display: flex; flex-direction: column; gap: 8px; max-height: 60vh; overflow-y: auto; }
 .wf-card {

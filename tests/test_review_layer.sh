@@ -181,7 +181,9 @@ for _a in architecture performance security; do
   [[ "$(md_meta "$_md" name)" == "$_a" ]] \
     && ok "$_a: name khớp file (frontmatter parse được)" \
     || fail "$_a: name không parse ra '$_a'"
-  [[ -n "$(md_meta "$_md" model)" ]]       && ok "$_a: model parse được"       || fail "$_a: model rỗng"
+  # model = tên trần cho claude-cli; opencode/9router bỏ qua (combo tự phân phối)
+  _mdl="$(md_meta "$_md" model)"
+  [[ -n "$_mdl" && "$_mdl" != */* ]]        && ok "$_a: model tên trần claude ($_mdl)" || fail "$_a: model phải là tên trần claude (got '${_mdl:-<unset>}')"
   _tools="$(md_meta "$_md" allowed_tools)"
   [[ -n "$_tools" ]]                        && ok "$_a: allowed_tools parse được" || fail "$_a: allowed_tools rỗng"
   # (2) read-only: allowed_tools KHÔNG chứa công cụ ghi
@@ -259,10 +261,12 @@ for _a in architecture performance security reviewer; do
       fail "$_a: disallowed_tools thiếu backstop $_wt ($_disallowed)"
     fi
   done
-  # perf SHOULD: auditor/reviewer khai max_turns (chặn token/vòng)
-  [[ "$(md_meta "$_md" max_turns)" =~ ^[0-9]+$ ]] \
-    && ok "$_a: max_turns khai báo (chặn token/vòng)" \
-    || fail "$_a: max_turns thiếu/không phải số"
+  # opencode không có max_turns — field OPTIONAL (chỉ còn nghĩa cho provider claude ẩn);
+  # NẾU khai thì phải là số.
+  _mt="$(md_meta "$_md" max_turns)"
+  [[ -z "$_mt" || "$_mt" =~ ^[0-9]+$ ]] \
+    && ok "$_a: max_turns rỗng hoặc là số" \
+    || fail "$_a: max_turns không phải số ($_mt)"
 done
 
 echo ""
