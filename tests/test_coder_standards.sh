@@ -92,7 +92,36 @@ assert_section_order \
 assert_contains "CHANGES template present" "## CHANGES"
 assert_contains "RATIONALE template present" "## RATIONALE"
 assert_contains "ASSUMPTIONS template present" "## ASSUMPTIONS"
-assert_contains "reviewer reference intact" "Reviewer sẽ đọc đúng block này"
+assert_contains "Leader Code reference intact" "Leader Code (reviewer) sẽ đọc"
+
+# --- CODE_RULES compliance section (wording mới: Leader Code chưng luật MUST/SHOULD) ---
+assert_contains "CODE_RULES section heading" "## Tuân thủ RULE của Leader Code (BẮT BUỘC)"
+assert_contains "references ## CODE_RULES block" "## CODE_RULES"
+assert_contains "MUST rule mandatory wording" "Luật \`MUST\` phải tuân"
+assert_contains "SHOULD rule wording" "Luật \`SHOULD\` tuân trừ khi"
+assert_contains "MUST violation → CHANGES_REQUESTED" "vi phạm 1 luật MUST"
+assert_contains "no-CODE_RULES fallback to Coding Standards" "Không có khối \`## CODE_RULES\`"
+
+# --- CHANGES_REQUESTED review-loop handling (wording mới) ---
+assert_contains "verdict-loop section heading" "## Xử lý verdict CHANGES_REQUESTED"
+assert_contains "reads PREVIOUS_REVIEW block" "## PREVIOUS_REVIEW"
+assert_contains "reads VERDICT token" "## VERDICT"
+assert_contains "FINDINGS as mandatory fix list" "## FINDINGS"
+assert_contains "must fix all BLOCKING/MAJOR" "Sửa **HẾT** \`BLOCKING\` và \`MAJOR\`"
+assert_contains "no regression rule" "KHÔNG regression"
+assert_contains "re-emit CHANGES each round" "Xuất lại block \`## CHANGES\`"
+
+# --- UNIT_TESTS template block (coder tự sinh test) ---
+assert_contains "UNIT_TESTS section heading" "### 6. Unit test cho function tự sinh (BẮT BUỘC)"
+assert_contains "UNIT_TESTS output block in template" "## UNIT_TESTS"
+assert_contains "coder runs tests via Bash" "Chạy test thật bằng Bash"
+
+# --- Section order: CODE_RULES → verdict-loop → Coding Standards ---
+assert_section_order \
+  "order: CODE_RULES < verdict-loop < Coding Standards" \
+  "## Tuân thủ RULE của Leader Code" \
+  "## Xử lý verdict CHANGES_REQUESTED" \
+  "## Coding Standards"
 
 # --- md_body starts with # Coder Role ---
 body_first=$(awk 'BEGIN{p=0} /^---$/{p++; next} p>=2{print; exit}' "$FILE")

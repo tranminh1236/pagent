@@ -12,7 +12,16 @@ const j = async (u) => parseJson(await fetch(u));
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtMs = (ms) => ms ? (ms < 1000 ? `${ms}ms` : `${(ms/1000).toFixed(1)}s`) : '—';
 const fmtCost = (n) => '$' + (n || 0).toFixed(4);
+const fmtSpend = (n) => '$' + (Number(n) || 0).toFixed(2);
 const fmtNum = (n) => (n || 0).toLocaleString();
+// Rút gọn số lớn: 1_090_000 → '1.09M'. Giữ K/M/B (strip .00 thừa); số < 1000 dùng fmtNum.
+function fmtCompact(n) {
+  const x = Number(n) || 0;
+  const abs = Math.abs(x);
+  const unit = abs >= 1e9 ? ['B', 1e9] : abs >= 1e6 ? ['M', 1e6] : abs >= 1e3 ? ['K', 1e3] : null;
+  if (!unit) return fmtNum(x);
+  return (x / unit[1]).toFixed(2).replace(/\.?0+$/, '') + unit[0];
+}
 const KIND_LABEL = { features: 'feat', bugs: 'bug', chores: 'chore', findings: 'find' };
 const fmtAgo = (ts) => {
   if (!ts) return '';
@@ -73,7 +82,7 @@ const decidedPlans = new Set();
 // chatState[proj] = { streamHTML, activeTaskId, logOffset }
 const chatState = {};
 const CHAT_PLACEHOLDER =
-  '<div class="idle-msg">Nhập task để khởi chạy pipeline. Đính kèm ảnh/figma → bật designer.</div>';
+  '<div class="idle-msg">Nhập task để khởi chạy pipeline: orchestrator → (devops: hạ tầng/CI/Docker) → coder → architecture‖performance‖security (song song) → Leader Code → tester → (docs: swagger/admin khi đụng API). Đính kèm ảnh/figma → bật designer.</div>';
 
 function getChatState(proj) {
   if (!chatState[proj]) chatState[proj] = { streamHTML: null, activeTaskId: null, logOffset: 0 };
@@ -109,6 +118,7 @@ async function switchProject(newProj) {
   updateSendState();
   refresh();
   loadWorkflows(newProj);
+  loadAgentWorkflow(newProj);
   await attachLive(newProj);                       // phát hiện task còn chạy → dựng bubble + poll
   // attachLive đã startChatPoll() nếu tìm thấy task running. Guard project===newProj phòng
   // re-entrant switch: user đổi project lần nữa trong lúc await → đừng arm poll cho project cũ.
@@ -139,6 +149,7 @@ async function refresh() {
   renderLive(live);
   renderHistory(tasks);
   renderAgents(agents);
+  renderStats(tasks, agents);
   $('#refresh-info').textContent = `↻ ${new Date().toLocaleTimeString()}`;
 }
 
@@ -181,6 +192,23 @@ function stepMetaHtml(s) {
 // Đoạn .sub-meta cho 1 subagent — đồng bộ format với renderSubagent (tick-only, dùng cho patch tại chỗ).
 function subMetaHtml(c) {
   return `${fmtMs(c.duration_ms)} · ${fmtCost(c.cost_usd)} · out ${fmtNum(c.output_tokens)}`;
+}
+
+// Run chết vì cạn ngân sách lượt? true khi CÓ step terminal_reason chứa 'max_turns'
+// (giá trị có thể là 'max_turns' hoặc 'max_turns (N)') — điều kiện DUY NHẤT để hiện nút retry.
+function liveMaxTurnsHit(t) {
+  return !!(t && (t.timeline || []).some(s => String(s && s.terminal_reason || '').includes('max_turns')));
+}
+
+// Markup control retry cho 1 live-item: ô nhập max_turns (tuỳ chọn) + nút. Rỗng khi chưa cạn lượt.
+// data-task-id trên nút để event delegation (mẫu wf-reuse); input để trống → server dùng bump mặc định.
+function retryControlHtml(t) {
+  if (!liveMaxTurnsHit(t)) return '';
+  return `
+          <div class="live-retry">
+            <input type="number" class="live-retry-turns" min="1" placeholder="lượt (mặc định)" aria-label="Số lượt tối đa cho lần chạy tiếp">
+            <button class="live-retry-btn" data-task-id="${esc(t.task_id)}" title="Spawn lại pipeline với ngân sách lượt cao hơn">↻ Tăng lượt &amp; chạy tiếp</button>
+          </div>`;
 }
 
 function renderLive(live) {
@@ -230,7 +258,7 @@ function renderLive(live) {
             <button class="live-cancel" data-task-id="${esc(t.task_id)}" title="Dừng task này">✕ Cancel</button>
             <div class="live-task-text">${esc(t.task || '(no task text)')}</div>
           </div>
-          <div class="live-dag" data-task-id="${esc(t.task_id)}">${renderTimeline(t.timeline || [], t.task_id)}</div>
+          <div class="live-dag" data-task-id="${esc(t.task_id)}">${renderTimeline(t.timeline || [], t.task_id)}</div>${retryControlHtml(t)}
         </div>
       `).join('')
     : '<div class="idle-msg">No active tasks. Run <code>pagent feature "..."</code> trong terminal.</div>';
@@ -277,7 +305,67 @@ async function cancelLiveTask(tid, btn) {
   }
 }
 
+// Tăng lượt & chạy tiếp: spawn lại pipeline (kiến trúc single-shot → không resume mid-agent) với
+// ngân sách lượt cao hơn. Body gửi max_turns nếu user nhập; để trống → server dùng bump mặc định.
+// Optimistic UI: disable nút khi gửi; ok → refresh() để live poll hiện run tid mới.
+async function retryLiveTask(tid, btn) {
+  const wrap = btn.closest('.live-retry');
+  const turnsEl = wrap && wrap.querySelector('.live-retry-turns');
+  const raw = turnsEl ? turnsEl.value.trim() : '';
+  const body = {};
+  if (raw) {
+    const n = parseInt(raw, 10);
+    if (!Number.isFinite(n) || n < 1) { alert('Số lượt phải là số nguyên ≥ 1.'); return; }
+    body.max_turns = n;
+  }
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '… đang gửi';
+  try {
+    const r = await parseJson(await fetch(
+      `/api/projects/${encodeURIComponent(project)}/retry/${encodeURIComponent(tid)}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }));
+    if (r.error) { alert(r.error); btn.disabled = false; btn.textContent = old; return; }
+    btn.textContent = '✓ đã tạo run mới';
+    refresh();   // live poll hiện run tid mới; re-render reset trạng thái nút
+  } catch (e) {
+    alert(String(e));
+    btn.disabled = false; btn.textContent = old;
+  }
+}
+
+// Gom số liệu stat cards (thuần, không đụng DOM). tokens_out fallback total_tokens_out
+// (endpoint /agents phát total_tokens_out — server.py:529).
+function computeStats(tasks, agents, workflowCount) {
+  const ags = agents || [];
+  return {
+    spend: ags.reduce((s, a) => s + (a.cost_usd || 0), 0),
+    runs: ags.reduce((s, a) => s + (a.runs || 0), 0),
+    tokensOut: ags.reduce((s, a) => s + (a.tokens_out ?? a.total_tokens_out ?? 0), 0),
+    agents: ags.length,
+    workflows: workflowCount || 0,
+    tasks: (tasks || []).length,
+  };
+}
+
+// Số workflow hiện tại + agents gần nhất — cache để re-render stats khi chỉ 1 nguồn đổi
+// (loadWorkflows chỉ có count; renderStats cần cả tasks+agents).
+let workflowCount = 0;
+let lastAgents = [];
+
+function renderStats(tasks, agents, wfCount) {
+  if (typeof wfCount === 'number') workflowCount = wfCount;
+  const s = computeStats(tasks, agents, workflowCount);
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  set('stat-spend', fmtSpend(s.spend));
+  set('stat-runs', fmtNum(s.runs));
+  set('stat-tokens', fmtCompact(s.tokensOut));
+  set('stat-agents', fmtNum(s.agents));
+  set('stat-workflows', fmtNum(s.workflows));
+  set('stat-tasks', fmtNum(s.tasks));
+}
+
 function renderAgents(agents) {
+  lastAgents = agents || [];
   $('#agent-grid').innerHTML = agents.length
     ? agents.map(a => {
         const models = (a.by_model || []).map(m => {
@@ -707,9 +795,11 @@ function renderWorkflows(data) {
   if (!data || !data.exists || !wfs.length) {
     list.innerHTML = '<div class="idle-msg">Chưa có workflow — chạy 1 feature để sinh.</div>';
     count.textContent = '';
+    renderStats(historyTasks, lastAgents, 0);
     return;
   }
   count.textContent = wfs.length;
+  renderStats(historyTasks, lastAgents, wfs.length);
   list.innerHTML = wfs.map((w, i) => {
     const flow = (w.flow || []).map(s => `<li>${esc(s)}</li>`).join('');
     const related = (w.related || []).map(r => `<code>${esc(r)}</code>`).join(' ');
@@ -726,6 +816,64 @@ function renderWorkflows(data) {
       ${related ? `<div class="wf-related dim">${related}</div>` : ''}
     </div>`;
   }).join('');
+}
+
+// ───────── AI Workflow (agent-workflow.md — spec điều phối AI, nguồn RIÊNG với log trên) ─────────
+// Chuẩn hoá payload /agent-workflow thành render-model. Pure (không đụng DOM) → testable ở node.
+function aiWorkflowModel(data) {
+  if (!data || !data.exists) return { state: 'empty', path: '', blocks: [], content: '' };
+  const path = data.path || '';
+  const blocks = (data.blocks || []).filter(b => b && ((b.heading || '').trim() || (b.body || '').trim()));
+  if (blocks.length) return { state: 'blocks', path, blocks, content: '' };
+  const content = data.content || '';
+  if (content.trim()) return { state: 'raw', path, blocks: [], content };
+  return { state: 'empty2', path, blocks: [], content: '' };
+}
+
+async function loadAgentWorkflow(proj) {
+  if (!proj) return;
+  try {
+    const data = await j(`/api/projects/${encodeURIComponent(proj)}/agent-workflow`);
+    renderAgentWorkflow(data);
+  } catch (e) { /* transient; bỏ qua */ }
+}
+
+// Render qua textContent (KHÔNG innerHTML cho nội dung file) → chống XSS + không vỡ khi format lệch.
+function renderAgentWorkflow(data) {
+  const body = $('#ai-workflow-body');
+  const pathEl = $('#ai-workflow-path');
+  if (!body) return;
+  const m = aiWorkflowModel(data);
+  if (pathEl) pathEl.textContent = m.path;
+  body.innerHTML = '';
+  if (m.state === 'empty') {
+    body.innerHTML = '<div class="idle-msg">Chưa có AI workflow — chạy workflow-extractor.</div>';
+    return;
+  }
+  if (m.state === 'empty2') {
+    body.innerHTML = '<div class="idle-msg">AI workflow rỗng.</div>';
+    return;
+  }
+  const cards = m.state === 'blocks'
+    ? m.blocks.map(b => ({ heading: b.heading || '', text: b.body || '' }))
+    : [{ heading: '', text: m.content }];
+  for (const c of cards) {
+    const card = document.createElement('div');
+    card.className = 'ai-wf-block';
+    if (c.heading) {
+      const h = document.createElement('h3');
+      h.className = 'ai-wf-heading';
+      h.textContent = c.heading;
+      card.appendChild(h);
+    }
+    if ((c.text || '').trim()) {
+      const pre = document.createElement('pre');
+      pre.className = 'ai-wf-body';
+      pre.textContent = c.text;
+      card.appendChild(pre);
+    }
+    body.appendChild(card);
+  }
 }
 
 function reuseWorkflow(title) {
@@ -761,7 +909,7 @@ $('#chat-stream').addEventListener('click', (e) => {
   if (a) { e.preventDefault(); showDetail(a.dataset.reportId); return; }
   if (e.target.closest('.plan-gate')) onPlanGateClick(e);
 });
-$('#refresh-btn').addEventListener('click', () => { refresh(); loadWorkflows(project); });
+$('#refresh-btn').addEventListener('click', () => { refresh(); loadWorkflows(project); loadAgentWorkflow(project); });
 $('#history-pager').addEventListener('click', (e) => {
   const btn = e.target.closest('.pager-btn');
   if (!btn || btn.disabled) return;
@@ -779,7 +927,9 @@ $('#live-list').addEventListener('click', onSubagentToggle);
 // Delegation: nút Cancel mỗi live-item.
 $('#live-list').addEventListener('click', (e) => {
   const c = e.target.closest('.live-cancel');
-  if (c) cancelLiveTask(c.dataset.taskId, c);
+  if (c) { cancelLiveTask(c.dataset.taskId, c); return; }
+  const rt = e.target.closest('.live-retry-btn');
+  if (rt) retryLiveTask(rt.dataset.taskId, rt);
 });
 $('#workflow-list').addEventListener('click', (e) => {
   const reuse = e.target.closest('.wf-reuse');
@@ -800,4 +950,4 @@ setInterval(refresh, 3000);
 }
 
 // Export cho test node (browser bỏ qua).
-if (typeof module !== 'undefined' && module.exports) module.exports = { paginate, PAGE_SIZE };
+if (typeof module !== 'undefined' && module.exports) module.exports = { paginate, PAGE_SIZE, fmtCompact, fmtSpend, computeStats, aiWorkflowModel, renderAgentWorkflow, liveMaxTurnsHit, retryControlHtml };

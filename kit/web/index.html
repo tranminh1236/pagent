@@ -33,8 +33,17 @@
       </div>
     </div>
 
+    <div class="stat-cards">
+      <div class="stat-card stat-spend"><div class="stat-label">Total Spend</div><div class="stat-value" id="stat-spend">—</div></div>
+      <div class="stat-card"><div class="stat-label">Runs</div><div class="stat-value" id="stat-runs">—</div></div>
+      <div class="stat-card"><div class="stat-label">Tokens Out</div><div class="stat-value" id="stat-tokens">—</div></div>
+      <div class="stat-card"><div class="stat-label">Agents</div><div class="stat-value" id="stat-agents">—</div></div>
+      <div class="stat-card"><div class="stat-label">Workflows</div><div class="stat-value" id="stat-workflows">—</div></div>
+      <div class="stat-card"><div class="stat-label">Tasks</div><div class="stat-value" id="stat-tasks">—</div></div>
+    </div>
+
     <div id="chat-stream" class="chat-stream" aria-live="polite">
-      <div class="idle-msg">Nhập task để khởi chạy pipeline. Đính kèm ảnh/figma → bật designer.</div>
+      <div class="idle-msg">Nhập task để khởi chạy pipeline: orchestrator → (devops: hạ tầng/CI/Docker) → coder → architecture‖performance‖security (song song) → Leader Code → tester → (docs: swagger/admin khi đụng API). Đính kèm ảnh/figma → bật designer.</div>
     </div>
 
     <div class="composer">
@@ -55,6 +64,14 @@
     </div>
   </section>
 
+  <section id="live-section">
+    <div class="section-head">
+      <h2><span class="dot" id="live-dot"></span>Live</h2>
+      <span id="live-count" class="badge"></span>
+    </div>
+    <div id="live-list"></div>
+  </section>
+
   <section id="workflow-section">
     <div class="section-head">
       <h2>Workflows <small class="dim" id="workflow-count"></small></h2>
@@ -62,12 +79,11 @@
     <div id="workflow-list"></div>
   </section>
 
-  <section id="live-section">
+  <section id="ai-workflow-section">
     <div class="section-head">
-      <h2><span class="dot" id="live-dot"></span>Live</h2>
-      <span id="live-count" class="badge"></span>
+      <h2>AI Workflow <small class="dim af-path" id="ai-workflow-path"></small></h2>
     </div>
-    <div id="live-list"></div>
+    <div id="ai-workflow-body"></div>
   </section>
 
   <section id="agent-section">

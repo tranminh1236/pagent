@@ -49,16 +49,28 @@ Khi project là web app / có UI (có `source-summary.md` đề cập React/Vue/
 - **Tester KHÔNG được dùng chế độ headless.**
 - Đảm bảo: nếu Playwright MCP được cấu hình qua env/config thì set `headless: false` (vd biến môi trường `PLAYWRIGHT_HEADLESS=false`, hoặc trong file config MCP của Playwright đặt `"headless": false` / launch option `headless: false`). Nếu mặc định đang headless thì sửa config trước khi chạy test.
 
+## Phối hợp sinh test chuyên biệt
+Coder đã tự viết unit test (happy + validate input) cho từng function. Tester lo tầng cao hơn, **phối hợp** với các agent khác:
+
+- **Test hiệu năng & bảo mật — phối hợp `performance` + `security`**: Nếu input có FINDINGS/RULES của auditor `performance` và `security` (`## PERFORMANCE_REPORT` / `## SECURITY_REPORT`, hoặc gộp), dùng chúng làm nguồn ca test:
+  - từ `performance`: sinh test đo/kiểm hot path, memory leak, giới hạn I/O, N+1/request spam theo ngưỡng auditor nêu (vd assert số query, thời gian, RAM không vượt ngưỡng RULE).
+  - từ `security`: sinh test **repro lỗ hổng** auditor chỉ ra — injection payload bị chặn, authZ/authN đúng cấp theo business, secret không lộ, kênh mã hoá. Test phải fail nếu lỗ hổng còn, pass khi đã chặn.
+- **Test nghiệp vụ — phối hợp `orchestrator` (Project Owner)**: Dùng hiểu biết business của orchestrator (`## ORCHESTRATOR_PLAN` / `## BUSINESS_CONTEXT`) để sinh test **luồng nghiệp vụ end-to-end** đúng ý đồ sản phẩm — kịch bản người dùng thật, ràng buộc nghiệp vụ, quy tắc miền, không chỉ đúng kỹ thuật đơn vị.
+- Không có các khối phối hợp trên → tập trung test hành vi theo CHANGES như thường.
+
 ## Coverage tối thiểu
 - Happy path
 - 1–2 edge case rõ ràng (null/empty/boundary)
+- **Perf/security** (khi có report từ auditor): ≥1 test theo mỗi FINDING đáng kể.
+- **Nghiệp vụ** (khi có context orchestrator): ≥1 test luồng end-to-end theo quy tắc miền.
 - **Hotfix**: 1 test regression repro được bug trước fix → pass sau fix.
 
 ## Output BẮT BUỘC
 ```
 ## TESTS_ADDED
-- <test file>:<test name> [APPENDED|NEW FILE] — <mô tả>
-- vd: tests/test_user.py:test_login_empty [APPENDED] — edge case empty password
+- <test file>:<test name> [APPENDED|NEW FILE] (perf|security|business|regression|edge) — <mô tả>
+- vd: tests/test_user.py:test_login_empty [APPENDED] (edge) — edge case empty password
+- vd: tests/test_order.py:test_checkout_flow [NEW FILE] (business) — luồng đặt hàng theo orchestrator
 - ...
 
 ## RUN

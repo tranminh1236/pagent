@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # pagent — orchestrator dùng claude CLI làm backend
-# Flow feature: orchestrator → coder → reviewer (loop) → tester → workflow extractor
-# Flow hotfix:  orchestrator → coder → reviewer (loop) → tester regression
+# Tầng review: architecture‖performance‖security chạy SONG SONG (2 pha), Leader Code
+# (reviewer) chưng CODE_RULES ở PHA 0 + cân đối verdict ở PHA 1. Orchestrator điều phối
+# QUA Leader Code — không gọi trực tiếp coder/auditor.
+# Flow feature: orchestrator → (devops) → [PHA0 audit‖ → Leader Code=CODE_RULES] → coder → [PHA1 audit‖ → Leader Code verdict] (loop) → tester → (docs) → workflow extractor
+# Flow hotfix:  orchestrator → (devops) → [PHA0 audit‖ → CODE_RULES] → coder → [PHA1 audit‖ → verdict+root cause] (loop) → tester regression → (docs)
 # Reports:      $PAGENT_REPORT_DIR/<project>/{features,bugs}/<date>-<taskid>.md
 # Tokens:       $PAGENT_REPORT_DIR/<project>/tokens/<date>.jsonl
 set -euo pipefail
@@ -88,6 +91,22 @@ agent_enabled() {
 }
 # Log skip rõ ràng: prefix text "[skip]" là tín hiệu chính, màu chỉ phụ trợ.
 log_skip() { printf '%s %s\n' "$(c_yellow '[skip]')" "$*" >&2; }
+
+# Resolve md path của 1 agent (project-local override global — cùng thứ tự call_agent).
+# Stdout: path. Exit 1 nếu không tìm thấy.
+resolve_agent_md() {
+  local agent="$1" cand
+  for cand in \
+    "$PAGENT_SOURCE/.pagent/skills/$agent.md" \
+    "$PAGENT_SOURCE/.pagent/agents/$agent.md" \
+    "$KIT_DIR/skills/$agent.md" \
+    "$KIT_DIR/agents/$agent.md"; do
+    [[ -f "$cand" ]] && { printf '%s' "$cand"; return 0; }
+  done
+  return 1
+}
+# Đọc 1 field frontmatter của agent (resolve md trước). Rỗng nếu thiếu md/field.
+agent_meta() { local md; md="$(resolve_agent_md "$1")" || return 0; md_meta "$md" "$2"; }
 
 # Phát hiện plugin Superpowers của claude CLI (chứa skill brainstorming + writing-plans).
 # Im lặng, KHÔNG lỗi nếu thiếu — echo "1" khi có CẢ 2 skill, ngược lại "0".
@@ -838,6 +857,10 @@ cmd_pipeline() {
   log "project=$PAGENT_PROJECT mode=$mode task_id=$PAGENT_TASK_ID"
   log "source=$PAGENT_SOURCE"
   echo "$task" >"$PAGENT_RUN_DIR/task.txt"
+  # Persist mode (từ vựng ĐÃ-dispatch: feature|hotfix|chore|find) để web retry tái dựng
+  # đúng loại run gốc TỪ ĐĨA — không tin client. Atomic tmp+mv (như decision.json/cancelled).
+  printf '%s\n' "$PAGENT_MODE" >"$PAGENT_RUN_DIR/mode.txt.tmp" \
+    && mv -f "$PAGENT_RUN_DIR/mode.txt.tmp" "$PAGENT_RUN_DIR/mode.txt"
 
   # Đảm bảo có source-summary
   if [[ ! -f "$PAGENT_SOURCE/.pagent/source-summary.md" ]]; then
@@ -874,7 +897,7 @@ cmd_pipeline() {
   [[ "$mode" == "find" ]] && step_total=2
   log "$(c_cyan "[1/$step_total]") orchestrator → lập plan"
   local plan_text plan_json
-  local title coder_task reviewer_focus tester_task risk affected
+  local title coder_task reviewer_focus tester_task risk affected business_context=""
   local n_subtasks=0 n_tester_subtasks=0
   local extra_info="" orch_round=0 orch_max=3
   local prev_plan_json=""   # plan hợp lệ vòng trước — re-run SỬA thay vì khám phá lại + fallback khi re-run fail
@@ -938,6 +961,7 @@ cmd_pipeline() {
     tester_task="$(jq -r '.tester_task // ""' <<<"$plan_json")"
     risk="$(jq -r '.risk // "medium"' <<<"$plan_json")"
     affected="$(jq -r '.affected_paths // [] | join(", ")' <<<"$plan_json")"
+    business_context="$(jq -r '.business_context // ""' <<<"$plan_json" 2>/dev/null || true)"
 
     # coder_subtasks (optional): plan lớn tách ≥2 task con độc lập → fan-out coder.
     # Thiếu field / không phải mảng / rỗng → 0 (giữ luồng coder đơn — backward-compat).
@@ -991,6 +1015,27 @@ cmd_pipeline() {
     log "  re-run orchestrator (vòng $((orch_round + 1))/$orch_max) với thông tin bổ sung…"
   done
 
+  # Tầng review mới: architecture/performance/security chạy SONG SONG, Leader Code
+  # (reviewer) chưng RULE (PHA 0) + cân đối verdict (PHA 1). Auditor enabled = giao
+  # required_agents (khi PAGENT_GATE=1); gate off → cả 3 (full pipeline backward-compat).
+  local -a ENABLED_AUDITORS=()
+  local _aud
+  for _aud in architecture performance security; do
+    agent_enabled "$_aud" && ENABLED_AUDITORS+=("$_aud")
+  done
+
+  # Ngân sách vòng review: CHUNG là PAGENT_MAX_REVIEW_ROUND; Leader Code (reviewer) giữ
+  # ngân sách chung → đọc override riêng nếu reviewer.md khai báo field max_review_round.
+  local eff_max_round="$PAGENT_MAX_REVIEW_ROUND"
+  local _rv_mrr; _rv_mrr="$(agent_meta reviewer max_review_round 2>/dev/null | tr -d '[:space:]')"
+  [[ "$_rv_mrr" =~ ^[0-9]+$ ]] && { eff_max_round="$_rv_mrr"; log "$(c_dim "  max_review_round override (reviewer.md): $eff_max_round")"; }
+  # Clamp ngân sách vòng vào [1, cap] (cap mặc định 5) — chặn env/frontmatter set số lớn đốt
+  # token, và chặn giá trị rác/0 khiến vòng coder↔review không chạy lần nào.
+  local _round_cap="${PAGENT_MAX_REVIEW_ROUND_CAP:-5}"
+  [[ "$eff_max_round" =~ ^[0-9]+$ ]] || eff_max_round=1
+  (( eff_max_round < 1 )) && eff_max_round=1
+  (( eff_max_round > _round_cap )) && { log "$(c_dim "  eff_max_round $eff_max_round > cap $_round_cap → clamp $_round_cap")"; eff_max_round="$_round_cap"; }
+
   #────── 1b. Designer (feature, khi task động đến UI) ──────
   # Gating: nếu plan có required_agents → theo list; nếu không → fallback keyword-detect.
   local design_spec="" want_designer=0
@@ -1026,6 +1071,36 @@ cmd_pipeline() {
     fi
   fi
 
+  #────── 1c. DevOps (SỚM — init/thiếu file hạ tầng) ──────
+  # Chạy TRƯỚC coder: sinh Dockerfile/docker-compose (dev+deploy), CI (.gitlab-ci.yml),
+  # chốt env vars đồng bộ .env.pagent/.env.pagent.example. Gating: plan có required_agents
+  # → theo list (mirror ENABLED_AUDITORS/designer); gate off → fallback keyword+phát hiện
+  # thiếu file hạ tầng (Dockerfile/compose/.gitlab-ci.yml). Skip ở mode=find (read-only).
+  local want_devops=0
+  if [[ "$mode" != "find" ]]; then
+    if [[ "${PAGENT_GATE}" == "1" ]]; then
+      agent_enabled devops && want_devops=1
+    elif printf '%s\n%s' "$task" "$coder_task" \
+           | grep -qiE 'docker|dockerfile|compose|ci/cd|gitlab-ci|pipeline ci|deploy|hạ tầng|infra|khởi tạo|init project|env var|biến môi trường' \
+         && { [[ ! -f "$PAGENT_SOURCE/Dockerfile" ]] || [[ ! -f "$PAGENT_SOURCE/.gitlab-ci.yml" ]] \
+              || { [[ ! -f "$PAGENT_SOURCE/docker-compose.yml" ]] && [[ ! -f "$PAGENT_SOURCE/docker-compose.yaml" ]]; }; }; then
+      want_devops=1
+    fi
+  fi
+  if [[ "$mode" != "find" && "${PAGENT_GATE}" == "1" ]] && ! agent_enabled devops; then
+    log_skip "devops — không nằm trong required_agents"
+  fi
+  if (( want_devops )); then
+    log "$(c_cyan '[+]') devops → Dockerfile/compose/CI + chốt env"
+    {
+      echo "## MODE"; echo "$mode"; echo
+      echo "## TASK"; echo "$task"; echo
+      echo "## PLAN"; cat "$PAGENT_RUN_DIR/orchestrator.txt"; echo
+      [[ -n "$business_context" ]] && { echo "## BUSINESS_CONTEXT"; echo "$business_context"; echo; }
+      echo "## CODER_TASK"; echo "$coder_task"
+    } | call_agent devops >/dev/null || warn "devops fail (tiếp tục không có hạ tầng mới)"
+  fi
+
   #────── 2. Coder ↔ Reviewer loop (skip toàn bộ khi mode=find — chỉ đọc + trả lời) ──────
   local round=1 verdict="CHANGES_REQUESTED" coder_input="$coder_task"
   local review_enabled=1
@@ -1050,7 +1125,53 @@ cmd_pipeline() {
     } | call_agent reviewer >/dev/null || die "reviewer fail"
     verdict="ANSWERED"
   else
-  while (( round <= PAGENT_MAX_REVIEW_ROUND )) && [[ "$verdict" != "APPROVED" ]]; do
+  #────── 2·PHA 0. Baseline audit (architecture/performance/security SONG SONG) ──────
+  # TRƯỚC khi coder code: các auditor enabled audit baseline SONG SONG → Leader Code
+  # (reviewer) chưng CODE_RULES thống nhất, inject vào coder. Chỉ chạy khi review bật +
+  # có ≥1 auditor; không auditor → Leader Code review một mình ở PHA 1 (không có RULE).
+  rm -f "$PAGENT_RUN_DIR/code_rules.txt"
+  if (( review_enabled )) && (( ${#ENABLED_AUDITORS[@]} > 0 )); then
+    log "$(c_cyan '[2·pha0]') baseline audit SONG SONG: ${ENABLED_AUDITORS[*]} → Leader Code chưng CODE_RULES"
+    local _a _focus _p; local -a _pids=()
+    for _a in "${ENABLED_AUDITORS[@]}"; do
+      _focus="$(jq -r --arg k "$_a" '.audit_focus[$k] // ""' <<<"$plan_json" 2>/dev/null || true)"
+      ( {
+          echo "## PHASE"; echo 0; echo
+          echo "## MODE"; echo "$mode"; echo
+          echo "## TASK"; echo "$task"; echo
+          echo "## SOURCE_SUMMARY_PATH"; echo ".pagent/source-summary.md"; echo
+          [[ -n "$business_context" ]] && { echo "## BUSINESS_CONTEXT"; echo "$business_context"; echo; }
+          [[ -n "$_focus" ]] && { echo "## AUDIT_FOCUS"; echo "$_focus"; }
+        } | call_agent "$_a" >/dev/null 2>>"$PAGENT_RUN_DIR/$_a.baseline.err" ) &
+      _pids+=($!)
+    done
+    for _p in "${_pids[@]}"; do wait "$_p" || warn "baseline auditor (pid $_p) fail (tiếp tục)"; done
+    log "$(c_cyan '[2·pha0]') Leader Code (reviewer) → CODE_RULES"
+    {
+      echo "## PHASE"; echo 0; echo
+      echo "## MODE"; echo "$mode"; echo
+      echo "## TASK"; echo "$task"; echo
+      [[ -n "$business_context" ]] && { echo "## BUSINESS_CONTEXT"; echo "$business_context"; echo; }
+      [[ -n "$reviewer_focus" ]] && { echo "## REVIEWER_FOCUS"; echo "$reviewer_focus"; echo; }
+      for _a in "${ENABLED_AUDITORS[@]}"; do
+        case "$_a" in
+          architecture) echo "## ARCHITECTURE_REPORT" ;;
+          performance)  echo "## PERFORMANCE_REPORT" ;;
+          security)     echo "## SECURITY_REPORT" ;;
+        esac
+        [[ -s "$PAGENT_RUN_DIR/$_a.txt" ]] && cat "$PAGENT_RUN_DIR/$_a.txt" || echo "(auditor $_a không có baseline)"
+        echo
+      done
+    } | call_agent reviewer >/dev/null || warn "Leader Code PHA 0 fail (coder chạy không có CODE_RULES)"
+    if [[ -s "$PAGENT_RUN_DIR/reviewer.txt" ]]; then
+      cp "$PAGENT_RUN_DIR/reviewer.txt" "$PAGENT_RUN_DIR/code_rules.txt"
+      # Đếm luật CHỈ trong block "## CODE_RULES" — không phồng vì bullet trong TRADEOFFS/NOTES.
+      local _n_rules; _n_rules="$(awk '/^##[[:space:]]+CODE_RULES/{f=1;next} /^##[[:space:]]/{f=0} f&&/^-[[:space:]]/{c++} END{print c+0}' "$PAGENT_RUN_DIR/code_rules.txt" 2>/dev/null || echo 0)"
+      log "  CODE_RULES: $(c_green "$_n_rules luật")"
+    fi
+  fi
+
+  while (( round <= eff_max_round )) && [[ "$verdict" != "APPROVED" ]]; do
     if (( n_subtasks > 1 && round == 1 )); then
       # Plan lớn: spawn 1 coder cho mỗi subtask độc lập, gộp output → coder.txt.
       # Subtask không đụng cùng file (orchestrator đảm bảo) nên chạy tuần tự an toàn,
@@ -1072,6 +1193,7 @@ cmd_pipeline() {
         sub_out="$( {
           echo "## TASK"; echo "$sub_task"; echo
           [[ -n "$sub_paths" ]] && { echo "## AFFECTED_PATHS"; echo "$sub_paths"; echo; }
+          [[ -s "$PAGENT_RUN_DIR/code_rules.txt" ]] && { cat "$PAGENT_RUN_DIR/code_rules.txt"; echo; }
           if [[ -n "$design_spec" ]]; then
             echo "## DESIGN_SPEC"
             echo "Tuân thủ design spec JSON dưới (design tokens, component, layout, accessibility). Dùng token thay vì hardcode màu/spacing."
@@ -1091,6 +1213,7 @@ cmd_pipeline() {
       log "$(c_cyan "[2/4]") coder round $round"
       {
         echo "## TASK"; echo "$coder_input"; echo
+        [[ -s "$PAGENT_RUN_DIR/code_rules.txt" ]] && { cat "$PAGENT_RUN_DIR/code_rules.txt"; echo; }
         if [[ -n "$design_spec" ]]; then
           echo "## DESIGN_SPEC"
           echo "Tuân thủ design spec JSON dưới (design tokens, component, layout, accessibility). Dùng token thay vì hardcode màu/spacing."
@@ -1108,22 +1231,78 @@ cmd_pipeline() {
       break
     fi
 
-    log "$(c_cyan "[3/4]") reviewer (focus: $reviewer_focus)"
+    # Snapshot diff 1 LẦN/vòng → mọi auditor SONG SONG + Leader Code cùng `cat` lại (read-only,
+    # không đua ghi), bỏ 3× `git diff` chạy song song. Cap head -500 chốt token; nếu bị cắt thì
+    # LOG cảnh báo (đừng cắt im lặng) và giữ bản đầy đủ ở diff.full để tra sau.
+    local _diff_full="$PAGENT_RUN_DIR/diff.full" _diff_snap="$PAGENT_RUN_DIR/diff.snapshot"
+    git_diff_full >"$_diff_full" 2>/dev/null || true
+    head -n 500 "$_diff_full" >"$_diff_snap"
+    if (( $(wc -l <"$_diff_full") > 500 )); then
+      warn "git diff > 500 dòng → cắt còn 500 cho auditor/reviewer (token cap; bản đầy đủ: $_diff_full)"
+    fi
+
+    #────── 3·PHA 1. Review diff (auditor SONG SONG) → Leader Code cân đối verdict ──────
+    # Auditor enabled review diff SONG SONG (mỗi cái ra VERDICT + FINDINGS), rồi Leader
+    # Code (reviewer) tổng hợp thành MỘT verdict cuối, áp CODE_RULES từ PHA 0.
+    if (( ${#ENABLED_AUDITORS[@]} > 0 )); then
+      log "$(c_cyan "[3/4]") pha1 review diff SONG SONG: ${ENABLED_AUDITORS[*]}"
+      local _a _focus _p; local -a _pids=()
+      for _a in "${ENABLED_AUDITORS[@]}"; do
+        _focus="$(jq -r --arg k "$_a" '.audit_focus[$k] // ""' <<<"$plan_json" 2>/dev/null || true)"
+        ( {
+            echo "## PHASE"; echo 1; echo
+            echo "## MODE"; echo "$mode"; echo
+            echo "## ORIGINAL_TASK"; echo "$task"; echo
+            [[ -n "$_focus" ]] && { echo "## AUDIT_FOCUS"; echo "$_focus"; echo; }
+            [[ -s "$PAGENT_RUN_DIR/code_rules.txt" ]] && { cat "$PAGENT_RUN_DIR/code_rules.txt"; echo; }
+            echo "## CODER_OUTPUT"; cat "$PAGENT_RUN_DIR/coder.txt"; echo
+            echo "## GIT_DIFF"; cat "$_diff_snap"
+          } | call_agent "$_a" >/dev/null 2>>"$PAGENT_RUN_DIR/$_a.err" ) &
+        _pids+=($!)
+      done
+      for _p in "${_pids[@]}"; do wait "$_p" || warn "auditor review (pid $_p) fail (tiếp tục)"; done
+    fi
+
+    log "$(c_cyan "[3/4]") Leader Code (reviewer) cân đối verdict (focus: $reviewer_focus)"
     {
+      echo "## PHASE"; echo 1; echo
       echo "## MODE"; echo "$mode"; echo
       echo "## ORIGINAL_TASK"; echo "$task"; echo
       echo "## REVIEWER_FOCUS"; echo "$reviewer_focus"; echo
-      echo "## CODER_OUTPUT"; cat "$PAGENT_RUN_DIR/coder.txt"; echo
-      echo "## GIT_DIFF"; git_diff_full | head -500
+      [[ -s "$PAGENT_RUN_DIR/code_rules.txt" ]] && { cat "$PAGENT_RUN_DIR/code_rules.txt"; echo; }
+      if (( ${#ENABLED_AUDITORS[@]} > 0 )); then
+        for _a in "${ENABLED_AUDITORS[@]}"; do
+          case "$_a" in
+            architecture) echo "## ARCHITECTURE_REPORT" ;;
+            performance)  echo "## PERFORMANCE_REPORT" ;;
+            security)     echo "## SECURITY_REPORT" ;;
+          esac
+          [[ -s "$PAGENT_RUN_DIR/$_a.txt" ]] && cat "$PAGENT_RUN_DIR/$_a.txt" || echo "(auditor $_a không review)"
+          echo
+        done
+      else
+        # Không auditor → Leader Code review một mình trên diff (task nhỏ).
+        echo "## CODER_OUTPUT"; cat "$PAGENT_RUN_DIR/coder.txt"; echo
+        echo "## GIT_DIFF"; cat "$_diff_snap"
+      fi
     } | call_agent reviewer >/dev/null || die "reviewer fail"
 
-    verdict="$(grep -oE 'APPROVED|CHANGES_REQUESTED' "$PAGENT_RUN_DIR/reviewer.txt" | head -1 || echo CHANGES_REQUESTED)"
+    # Verdict parse NEO vào block "## VERDICT" — đọc token trên chính dòng header (dạng
+    # "## VERDICT: APPROVED") hoặc dòng non-empty đầu tiên ngay sau nó. KHÔNG grep toàn file:
+    # một chữ APPROVED lạc trong CODE_RULES/FINDINGS sẽ tạo verdict PASS giả cho code chưa an
+    # toàn. Fail-closed: thiếu block/token → CHANGES_REQUESTED.
+    verdict="$(awk '
+      /^##[[:space:]]*VERDICT/ { h=$0; sub(/^##[[:space:]]*VERDICT[[:space:]]*:?[[:space:]]*/,"",h);
+                                 if (h ~ /(APPROVED|CHANGES_REQUESTED)/) { print h; exit } f=1; next }
+      f && NF { print; exit }
+    ' "$PAGENT_RUN_DIR/reviewer.txt" | grep -oE 'CHANGES_REQUESTED|APPROVED' | head -1)"
+    [[ -n "$verdict" ]] || verdict="CHANGES_REQUESTED"
     log "  verdict round $round: $(c_yellow "$verdict")"
     coder_input="$coder_task"  # giữ task gốc, review sẽ được inject
     round=$((round+1))
   done
 
-  if [[ "$verdict" != "APPROVED" && "$verdict" != "SKIPPED" ]] && (( PAGENT_MAX_REVIEW_ROUND > 0 )); then
+  if [[ "$verdict" != "APPROVED" && "$verdict" != "SKIPPED" ]] && (( eff_max_round > 0 )); then
     warn "reviewer chưa APPROVE sau $((round-1)) vòng — vẫn tiếp tục để tester verify"
   fi
   fi  # end mode != find
@@ -1205,6 +1384,35 @@ cmd_pipeline() {
       log "  root cause: $(c_green "$root_cause_summary")"
     else
       warn "không trích được root_cause_summary từ orchestrator tổng hợp"
+    fi
+  fi
+
+  #────── 4d. Docs (CUỐI — sau code merged, khi task thêm/sửa API) ──────
+  # Cập nhật swagger/OpenAPI + config setup admin page cho khớp code vừa merged. Scope HẸP:
+  # chỉ vùng doc, KHÔNG sửa code sản phẩm. Gating: plan có required_agents → theo list
+  # (mirror ENABLED_AUDITORS); gate off → fallback keyword-detect task đụng API. Skip mode=find.
+  if [[ "$mode" != "find" && -s "$PAGENT_RUN_DIR/coder.txt" ]]; then
+    local want_docs=0
+    if [[ "${PAGENT_GATE}" == "1" ]]; then
+      agent_enabled docs && want_docs=1
+    elif printf '%s\n%s' "$task" "$coder_task" \
+           | grep -qiE 'api|endpoint|route|swagger|openapi|rest|admin page|admin config'; then
+      want_docs=1
+    fi
+    if [[ "${PAGENT_GATE}" == "1" && $want_docs -eq 0 ]]; then
+      log_skip "docs — không nằm trong required_agents"
+    fi
+    if (( want_docs )); then
+      log "$(c_cyan '[+]') docs → swagger/OpenAPI + admin config"
+      local _src_summary=""
+      [[ -f "$PAGENT_SOURCE/.pagent/source-summary.md" ]] && _src_summary="$(cat "$PAGENT_SOURCE/.pagent/source-summary.md")"
+      {
+        echo "## MODE"; echo "$mode"; echo
+        echo "## TASK"; echo "$task"; echo
+        echo "## CODER_CHANGES"; cat "$PAGENT_RUN_DIR/coder.txt"; echo
+        echo "## GIT_DIFF"; git_diff_full; echo
+        [[ -n "$_src_summary" ]] && { echo "## SOURCE_SUMMARY"; echo "$_src_summary"; }
+      } | call_agent docs >/dev/null || warn "docs fail (tiếp tục không cập nhật swagger/admin)"
     fi
   fi
 
@@ -1551,14 +1759,14 @@ EOF
 
 cmd_help() {
   cat <<'EOF'
-pagent — claude-cli orchestrator (coder + reviewer + tester)
+pagent — claude-cli orchestrator (coder + architecture‖performance‖security + Leader Code + tester)
 
 USAGE
   pagent init                          Quét source folder, sinh .pagent/source-summary.md
-  pagent feature "task..."             Build feature (alias: feat): orchestrator→coder→reviewer→tester→workflow
-  pagent fix     "task..."             Hotfix bug:   orchestrator→coder→reviewer→tester regression
-  pagent chore   "task..."             Chore (refactor/bổ sung nhỏ): orchestrator→coder→reviewer
-  pagent find    "question..."         Đọc source trả lời câu hỏi (alias: query): orchestrator→reviewer (read-only)
+  pagent feature "task..."             Build feature (alias: feat): orchestrator→[audit‖→CODE_RULES]→coder→[audit‖→verdict]→tester→workflow
+  pagent fix     "task..."             Hotfix bug:   orchestrator→[audit‖→CODE_RULES]→coder→[audit‖→verdict+root cause]→tester regression
+  pagent chore   "task..."             Chore (refactor/bổ sung nhỏ): orchestrator→coder→Leader Code review
+  pagent find    "question..."         Đọc source trả lời câu hỏi (alias: query): orchestrator→Leader Code (read-only)
   pagent report  [project]             Tóm tắt features/bugs + cost theo ngày
   pagent workflow [show|list|run|new|file]   Quản lý workflow.md (xem 'pagent workflow' để biết)
   pagent knowledge [refresh|show]      Rebuild/xem .pagent/knowledge/{workflow,domain,decisions}.md
@@ -1589,7 +1797,8 @@ ENVIRONMENT (đặt trong .env.pagent hoặc shell)
   PAGENT_MODEL              claude model (mặc định claude-sonnet-4-6)
   PAGENT_MODE               feature | hotfix | chore | find (override subcommand)
   PAGENT_CLAUDE_BIN         path tới claude CLI (mặc định "claude")
-  PAGENT_MAX_REVIEW_ROUND   số vòng coder↔reviewer (mặc định 2)
+  PAGENT_MAX_REVIEW_ROUND   số vòng coder↔review DÙNG CHUNG (mặc định 2); reviewer.md có thể
+                            override qua frontmatter max_review_round (Leader Code giữ ngân sách chung)
   PAGENT_MAX_TURNS          override max_turns mọi agent (repo lớn → tăng để tránh max_turns fail)
   PAGENT_MAX_TURNS_<AGENT>  override riêng 1 agent, vd PAGENT_MAX_TURNS_ORCHESTRATOR=40
   PAGENT_CONFIRM            1 → bắt buộc xác nhận plan trước khi chạy agent (web tự bật)
@@ -1603,10 +1812,17 @@ ENVIRONMENT (đặt trong .env.pagent hoặc shell)
   PAGENT_KIT_DIR            override kit/ folder
 
 PIPELINE
-  feature: context-planning[0] → orchestrator → (designer) → coder → reviewer (loop) → tester → workflow-extractor → decision-log
-  hotfix:  context-planning[0] → orchestrator → coder → reviewer (loop) → tester regression → orchestrator (root cause) → decision-log
-  chore:   orchestrator → coder → reviewer (loop)  [tester nếu plan yêu cầu; KHÔNG workflow-extractor]
-  find:    orchestrator → reviewer (read-only, đọc source trả lời câu hỏi — KHÔNG coder/tester)
+  Tầng review = architecture‖performance‖security chạy SONG SONG (2 pha) + Leader Code (reviewer):
+    PHA 0 (trước coder): auditor audit baseline SONG SONG → Leader Code chưng CODE_RULES thống nhất → inject vào coder
+    PHA 1 (trên diff):   auditor review diff SONG SONG → Leader Code cân đối 3 verdict → 1 verdict cuối
+  Orchestrator điều phối QUA Leader Code — không gọi trực tiếp coder/auditor.
+  Auditor nào chạy = required_agents (orchestrator chọn theo bản chất task); auditor bất kỳ → luôn kèm reviewer.
+  DevOps (devops): chạy SỚM (init/thiếu file Dockerfile/compose/.gitlab-ci) — sinh hạ tầng + chốt env .env.pagent/.env.pagent.example, TRƯỚC coder.
+  Docs (docs): chạy CUỐI (sau code merged, gần workflow-extractor) — cập nhật swagger/OpenAPI + admin config khi task thêm/sửa API. Scope hẹp, KHÔNG sửa code.
+  feature: context-planning[0] → orchestrator → (designer) → (devops) → [PHA0 audit‖ → CODE_RULES] → coder → [PHA1 audit‖ → verdict] (loop) → tester → (docs) → workflow-extractor → decision-log
+  hotfix:  context-planning[0] → orchestrator → (devops) → [PHA0 audit‖ → CODE_RULES] → coder → [PHA1 audit‖ → verdict+root cause] (loop) → tester regression → (docs) → orchestrator (root cause) → decision-log
+  chore:   orchestrator → coder → [PHA1 audit‖ →] Leader Code review (loop)  [tester nếu plan yêu cầu; KHÔNG workflow-extractor]
+  find:    orchestrator → Leader Code (read-only, đọc source trả lời câu hỏi — KHÔNG coder/auditor/tester)
   Pre/post hook → ghi token+cost vào tokens/<date>.jsonl
   Auto-compact run dir → bundle.tar.gz
 

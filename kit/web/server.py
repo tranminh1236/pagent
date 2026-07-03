@@ -243,6 +243,31 @@ def read_workflow(proj):
                     in_flow = False
     return {"exists": True, "path": path, "workflows": workflows}
 
+def read_agent_workflow(proj):
+    """Đọc + parse REPORTS/<proj>/agent-workflow.md — spec điều phối AI (pseudo-spec
+    framework-agnostic do workflow-extractor sinh). Nguồn RIÊNG với read_workflow
+    (workflow.md log); KHÔNG chia sẻ parser/schema.
+    Trả {exists, path, content, blocks:[{heading, body}]}. File thiếu / proj traversal
+    → exists=False. Parser chịu file rỗng/format lệch (không heading) không vỡ: blocks=[]
+    nhưng content raw giữ nguyên. Chỉ đọc + hiển thị (read-only, không exec)."""
+    path = _safe_join(REPORTS, proj, "agent-workflow.md")
+    if not path or not os.path.isfile(path):
+        return {"exists": False, "path": path or "", "content": "", "blocks": []}
+    with open(path, encoding="utf-8") as f:
+        content = f.read()
+    blocks, cur = [], None
+    for line in content.splitlines():
+        h = re.match(r"^##\s+(.*)$", line)
+        if h:
+            cur = {"heading": h.group(1).strip(), "body": []}
+            blocks.append(cur)
+            continue
+        if cur is not None:
+            cur["body"].append(line)
+    for b in blocks:
+        b["body"] = "\n".join(b["body"]).strip("\n")
+    return {"exists": True, "path": path, "content": content, "blocks": blocks}
+
 def read_chat_log(proj, tid, offset=0):
     """Đọc tail log per-task (REPORTS/<proj>/logs/<tid>.log) kể từ byte `offset`.
     Trả {data, offset}: offset mới = vị trí đọc tiếp theo để client tail incremental."""
@@ -530,6 +555,58 @@ def agent_stats(proj):
                     "by_model": by_model})
     return out
 
+def _spawn_pagent(proj, source, mode, full_task, tid, env_extra=None):
+    """Dựng env + spawn pagent (Popen, start_new_session, log per-task). DÙNG CHUNG cho
+    _chat và retry để KHÔNG nhân bản 2 đường spawn (chống drift). env_extra bổ sung/ghi
+    đè lên env base. Trả (err_dict, status): err_dict=None khi spawn OK."""
+    pbin = _pagent_bin()
+    if not pbin:
+        return {"error": "không tìm thấy pagent binary (set env PAGENT_BIN)"}, 500
+    env = dict(os.environ)
+    env["PAGENT_PROJECT"] = proj
+    env["PAGENT_REPORT_DIR"] = REPORTS
+    env["PAGENT_SOURCE"] = source
+    env["PAGENT_TASK_ID"] = tid
+    for k, v in (env_extra or {}).items():
+        env[k] = v
+    logdir = _safe_join(REPORTS, proj, "logs")
+    if not logdir:
+        return {"error": "đường dẫn log không hợp lệ"}, 400
+    os.makedirs(logdir, exist_ok=True)
+    logpath = _safe_join(logdir, tid + ".log")   # per-task: 1 file/task để tail riêng
+    if not logpath:
+        return {"error": "đường dẫn log không hợp lệ"}, 400
+    try:
+        with open(logpath, "ab") as logf:
+            subprocess.Popen([pbin, mode, full_task], cwd=source, env=env,
+                             stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
+                             start_new_session=True)
+    except Exception as e:
+        return {"error": f"không spawn được pagent: {e}"}, 500
+    return None, None
+
+def _died_of_max_turns(proj, tid):
+    """True nếu run đã KẾT THÚC vì chạm max_turns (đọc terminal_reason từ timeline tokens
+    — cùng nguồn Live card). Run đang live / xong bình thường → False → chống spawn
+    trùng & DoS. `.run.lock` của pagent là hàng rào bổ trợ, không thay bước này."""
+    for step in _task_timeline(proj, tid):
+        if "max_turns" in (step.get("terminal_reason") or ""):
+            return True
+        for sub in step.get("subagents") or []:
+            if "max_turns" in (sub.get("terminal_reason") or ""):
+                return True
+    return False
+
+def _retry_wants_design(task_text):
+    """Re-derive cờ design khi retry (PAGENT_DESIGN không persist): task.txt còn ảnh
+    (đã upload trong REPORTS) hoặc URL figma → bật lại gate design cho agent design-gated."""
+    if "figma.com" in task_text.lower():
+        return True
+    for tok in task_text.split():
+        if _is_image(tok) and _within_reports(tok) and os.path.isfile(tok):
+            return True
+    return False
+
 # ───────── HTTP handler ─────────
 
 class H(BaseHTTPRequestHandler):
@@ -580,6 +657,12 @@ class H(BaseHTTPRequestHandler):
                 if not _valid_proj(proj):
                     return self._j({"error": "invalid or unknown project"}, 400)
                 return self._j(cancel_task(proj, unquote(mc.group(2))))
+            mr = re.match(r"^/api/projects/([^/]+)/retry/(.+)$", path)
+            if mr:
+                proj = unquote(mr.group(1))
+                if not _valid_proj(proj):
+                    return self._j({"error": "invalid or unknown project"}, 400)
+                return self._retry(proj, unquote(mr.group(2)))
             m = re.match(r"^/api/projects/([^/]+)/(chat|upload)$", path)
             if not m:
                 return self._j({"error": "not found"}, 404)
@@ -621,6 +704,97 @@ class H(BaseHTTPRequestHandler):
         os.replace(tmp, decpath)   # atomic — pagent không bao giờ đọc file ghi dở
         return self._j({"ok": True, "action": action})
 
+    def _retry(self, proj, tid):
+        """Retry 1 run chết vì max_turns: đọc task+mode TỪ ĐĨA (runs/<tid>/), clamp
+        max_turns server-side, spawn tid MỚI qua _spawn_pagent. Client chỉ gửi max_turns
+        (task/mode KHÔNG tin client — chống biến retry thành spawn tuỳ ý)."""
+        if not _valid_rawtid(tid):
+            return self._j({"error": "task id không hợp lệ"}, 400)
+        rundir = _safe_join(REPORTS, proj, "runs", tid)
+        if not rundir or not os.path.isdir(rundir):
+            return self._j({"error": "run dir không tồn tại"}, 400)
+        # Chỉ retry run THỰC SỰ chết vì max_turns (không đụng run live / xong bình thường).
+        if not _died_of_max_turns(proj, tid):
+            return self._j({"error": "run không kết thúc vì max_turns — từ chối retry"}, 400)
+        raw = self._read_body()
+        if raw is None:
+            return self._j({"error": "body quá lớn"}, 413)
+        try:
+            data = json.loads(raw or b"{}")
+        except Exception:
+            return self._j({"error": "JSON không hợp lệ"}, 400)
+        # Clamp max_turns server-side vào [1, CEILING] (vá CWE-400 cost/DoS). Không gửi →
+        # bump = CEILING (cho retry cơ hội chạy xong, vẫn trong trần cost).
+        ceiling = int(os.environ.get("PAGENT_MAX_TURNS_CEILING", "60"))
+        if ceiling < 1:
+            ceiling = 1
+        if data.get("max_turns") is None:
+            max_turns = ceiling
+        else:
+            try:
+                max_turns = int(data["max_turns"])
+            except (ValueError, TypeError):
+                return self._j({"error": "max_turns phải là số nguyên"}, 400)
+        max_turns = max(1, min(max_turns, ceiling))
+        # Tái dựng task + mode ĐỌC TỪ ĐĨA qua _safe_join (không tin client).
+        taskf = _safe_join(rundir, "task.txt")
+        modef = _safe_join(rundir, "mode.txt")
+        if not taskf or not os.path.isfile(taskf):
+            return self._j({"error": "task.txt không tồn tại — không thể retry"}, 400)
+        if not modef or not os.path.isfile(modef):
+            return self._j({"error": "mode.txt không tồn tại (run cũ trước khi hỗ trợ retry)"}, 400)
+        try:
+            with open(taskf) as f:
+                full_task = f.read().rstrip("\n")
+            with open(modef) as f:
+                mode = f.readline().strip()
+        except Exception as e:
+            return self._j({"error": f"đọc run cũ thất bại: {e}"}, 500)
+        if not full_task:
+            return self._j({"error": "task rỗng"}, 400)
+        # Validate mode theo từ vựng ĐÃ-DISPATCH pagent thực ghi vào mode.txt
+        # (feature|hotfix|chore|find — `fix`/`bug` đã đổi→`hotfix` TRƯỚC khi set PAGENT_MODE).
+        # KHÔNG theo whitelist _chat (sẽ reject oan 'hotfix').
+        if not re.fullmatch(r"feature|hotfix|chore|find", mode):
+            return self._j({"error": f"mode không hợp lệ trên đĩa: {mode}"}, 400)
+        source = _project_source(proj)
+        if not source or not os.path.isdir(source):
+            return self._j({"error": f"chưa biết source path của '{proj}'"}, 409)
+        # Dedup re-retry: `_died_of_max_turns` là thuộc tính VĨNH VIỄN của run cũ → rapid-click
+        # / nhiều tab / concurrent POST đều qua gate → mỗi lần spawn 1 pipeline tới ceiling.
+        # Marker exclusive `runs/<old_tid>/retried` cho phép retry ĐÚNG MỘT lần; O_EXCL atomic
+        # (create-if-not-exists) đóng race concurrent — mẫu marker `cancelled`. (CWE-400 cost.)
+        retried = _safe_join(rundir, "retried")
+        if not retried:
+            return self._j({"error": "đường dẫn không hợp lệ"}, 400)
+        # tid MỚI cho lần retry — tránh trộn 2 run trong cùng runs/<tid> + aggregation.
+        new_tid = _new_task_id()
+        try:
+            fd = os.open(retried, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            try:
+                os.write(fd, (new_tid + "\n").encode())
+            finally:
+                os.close(fd)
+        except FileExistsError:
+            return self._j({"error": "run này đã được retry — từ chối spawn trùng"}, 409)
+        except OSError as e:
+            return self._j({"error": f"không ghi được marker retry: {e}"}, 500)
+        env_extra = {
+            "PAGENT_MAX_TURNS": str(max_turns),
+            "PAGENT_CONFIRM": "0",     # user đã chủ động bấm Retry → không handshake lại
+            "PAGENT_PARENT": tid,      # lineage: liên kết run cũ (cơ chế @<tid> sẵn có)
+        }
+        if _retry_wants_design(full_task):
+            env_extra["PAGENT_DESIGN"] = "1"
+        err, status = _spawn_pagent(proj, source, mode, full_task, new_tid, env_extra)
+        if err:
+            try:
+                os.unlink(retried)   # spawn hỏng → gỡ marker để run cũ retry lại được
+            except OSError:
+                pass
+            return self._j(err, status)
+        return self._j({"ok": True, "task_id": new_tid, "mode": mode})
+
     def _chat(self, proj):
         raw = self._read_body()
         if raw is None:
@@ -655,37 +829,17 @@ class H(BaseHTTPRequestHandler):
                 safe_atts.append(p)
                 has_image = has_image or _is_image(p)
 
-        pbin = _pagent_bin()
-        if not pbin:
-            return self._j({"error": "không tìm thấy pagent binary (set env PAGENT_BIN)"}, 500)
-
         tid = _new_task_id()
         design = has_image or bool(figma_url)
-        env = dict(os.environ)
-        env["PAGENT_PROJECT"] = proj
-        env["PAGENT_REPORT_DIR"] = REPORTS
-        env["PAGENT_SOURCE"] = source
-        env["PAGENT_TASK_ID"] = tid
         # Web LUÔN bắt xác nhận plan (handshake qua file) — trừ khi client tắt rõ ràng.
-        env["PAGENT_CONFIRM"] = "0" if data.get("no_confirm") is True else "1"
+        env_extra = {"PAGENT_CONFIRM": "0" if data.get("no_confirm") is True else "1"}
         if design:
-            env["PAGENT_DESIGN"] = "1"   # gate figma/canvas MCP (xem pagent call_agent)
+            env_extra["PAGENT_DESIGN"] = "1"   # gate figma/canvas MCP (xem pagent call_agent)
 
         full_task = _compose_task(task, safe_atts, figma_url)
-        logdir = _safe_join(REPORTS, proj, "logs")
-        if not logdir:
-            return self._j({"error": "đường dẫn log không hợp lệ"}, 400)
-        os.makedirs(logdir, exist_ok=True)
-        logpath = _safe_join(logdir, tid + ".log")   # per-task: 1 file/task để tail riêng
-        if not logpath:
-            return self._j({"error": "đường dẫn log không hợp lệ"}, 400)
-        try:
-            with open(logpath, "ab") as logf:
-                subprocess.Popen([pbin, mode, full_task], cwd=source, env=env,
-                                 stdin=subprocess.DEVNULL, stdout=logf, stderr=logf,
-                                 start_new_session=True)
-        except Exception as e:
-            return self._j({"error": f"không spawn được pagent: {e}"}, 500)
+        err, status = _spawn_pagent(proj, source, mode, full_task, tid, env_extra)
+        if err:
+            return self._j(err, status)
         return self._j({"ok": True, "task_id": tid, "mode": mode, "design": design})
 
     def _upload(self, proj):
@@ -755,6 +909,7 @@ class H(BaseHTTPRequestHandler):
                 (r"/live",         lambda p:    self._j(live_tasks(p))),
                 (r"/agents",       lambda p:    self._j(agent_stats(p))),
                 (r"/workflow",     lambda p:    self._j(read_workflow(p))),
+                (r"/agent-workflow", lambda p:  self._j(read_agent_workflow(p))),
             ):
                 if with_proj(fn): return
             self._j({"error": "not found"}, 404)
