@@ -1137,6 +1137,24 @@ cmd_pipeline() {
       [[ -n "$prev_plan_json" ]] || die "orchestrator fail"
       warn "orchestrator re-run fail (reason đã log ở trên) — giữ plan vòng trước, tự tiếp tục"
       plan_json="$prev_plan_json"
+    elif [[ "$mode" == "find" ]]; then
+      # find: orchestrator THƯỜNG trả lời câu hỏi bằng văn xuôi (curl/giải thích) thay vì
+      # xuất plan JSON — vì task find BẢN THÂN là câu hỏi, model (nhất là qua opencode/9router,
+      # frontmatter model bị bỏ qua) nhảy thẳng vào trả lời như reviewer. Ta KHÔNG parse output
+      # nó thành plan: extract_json hay chộp nhầm cái `{}` ĐẦU TIÊN trong prose (vd body curl
+      # `-d '{…}'`) — object hợp lệ nhưng KHÔNG có .title → "orchestrator JSON parse fail" giả.
+      # Plan find chỉ cần giao câu hỏi cho reviewer nên tổng hợp THẲNG bằng bash (deterministic).
+      # Prose vẫn nằm ở orchestrator.txt → đưa reviewer làm context (## ORCHESTRATOR_PLAN).
+      plan_json="$(jq -n --arg task "$task" '{
+        title: ("Find: " + ($task | .[0:70])),
+        summary: "find — reviewer đọc source trả lời câu hỏi",
+        coder_task: "",
+        reviewer_focus: $task,
+        tester_task: "",
+        risk: "low",
+        required_agents: ["reviewer"],
+        affected_paths: []
+      }')"
     else
       plan_json="$(echo "$plan_text" | extract_json 2>/dev/null || true)"
       if ! jq -e '.title' <<<"$plan_json" >/dev/null 2>&1; then
