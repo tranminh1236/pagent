@@ -770,6 +770,12 @@ class H(BaseHTTPRequestHandler):
                 if not _valid_proj(proj):
                     return self._j({"error": "invalid or unknown project"}, 400)
                 return self._settings_post(proj)
+            mdel = re.match(r"^/api/projects/([^/]+)/delete$", path)
+            if mdel:
+                proj = unquote(mdel.group(1))
+                if not _valid_proj(proj):
+                    return self._j({"error": "invalid or unknown project"}, 400)
+                return self._delete_project(proj)
             m = re.match(r"^/api/projects/([^/]+)/(chat|upload)$", path)
             if not m:
                 return self._j({"error": "not found"}, 404)
@@ -781,6 +787,26 @@ class H(BaseHTTPRequestHandler):
             return self._upload(proj)
         except Exception as e:
             self._safe_error(e)
+
+    def _delete_project(self, proj):
+        """Soft-delete: mv REPORTS/<proj> → REPORTS/.trash/<proj>-<UTC-ts>.
+
+        Chỉ đụng thư mục reports của project (KHÔNG đụng source code thật). Từ chối khi
+        project đang có run live (tránh xoá giữa chừng). .trash bị list_projects() ẩn (dir
+        bắt đầu bằng '.') nên project biến khỏi dashboard; muốn sạch đĩa thì xoá .trash tay.
+        """
+        if live_tasks(proj):
+            return self._j({"error": "project đang có run chạy — dừng trước khi xoá"}, 409)
+        src = _safe_join(REPORTS, proj)
+        if not src or not os.path.isdir(src):
+            return self._j({"error": "invalid or unknown project"}, 400)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        dest = _safe_join(REPORTS, ".trash", f"{proj}-{ts}")
+        if not dest:
+            return self._j({"error": "đường dẫn thùng rác không hợp lệ"}, 400)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.move(src, dest)
+        return self._j({"ok": True, "trashed_to": dest})
 
     def _decision(self, proj, tid):
         """Web POST quyết định plan → ghi runs/<tid>/decision.json để pagent đọc (atomic)."""

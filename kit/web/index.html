@@ -16,6 +16,7 @@
   <div class="controls">
     <label>Project</label>
     <select id="project"></select>
+    <button id="delete-project-btn" title="Xoá project khỏi dashboard" aria-label="Xoá project">🗑</button>
     <button id="refresh-btn" title="Refresh ngay">↻</button>
     <span id="refresh-info" class="dim"></span>
   </div>
@@ -122,6 +123,21 @@
     <div id="modal-timeline"></div>
     <h3 class="modal-section-title">Report</h3>
     <pre id="modal-report"></pre>
+  </div>
+</div>
+
+<div id="delete-modal" class="hidden" aria-hidden="true">
+  <div class="modal-shell delete-shell">
+    <button id="delete-close" title="Đóng">×</button>
+    <h3 class="modal-section-title">Xoá project</h3>
+    <p class="delete-warn">Chuyển <b id="delete-proj-name"></b> vào thùng rác (<code>.trash/</code>) — biến khỏi dashboard. Khôi phục hoặc xoá hẳn bằng tay sau. <b>KHÔNG</b> đụng source code thật.</p>
+    <p class="delete-hint">Gõ lại đúng tên project để xác nhận:</p>
+    <input type="text" id="delete-confirm-input" autocomplete="off" spellcheck="false" placeholder="tên project" aria-label="Xác nhận tên project">
+    <div id="delete-error" class="delete-error hidden"></div>
+    <div class="delete-actions">
+      <button id="delete-cancel">Huỷ</button>
+      <button id="delete-confirm" class="delete-danger" disabled>Xoá vĩnh viễn</button>
+    </div>
   </div>
 </div>
 

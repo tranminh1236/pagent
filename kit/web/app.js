@@ -1045,7 +1045,49 @@ $('#workflow-list').addEventListener('click', (e) => {
 $('#modal-timeline').addEventListener('click', onSubagentToggle);
 $('#modal-close').addEventListener('click', () => $('#modal').classList.add('hidden'));
 $('#modal').addEventListener('click', (e) => { if (e.target.id === 'modal') $('#modal').classList.add('hidden'); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('#modal').classList.add('hidden'); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { $('#modal').classList.add('hidden'); $('#delete-modal').classList.add('hidden'); }
+});
+
+// ── Delete-project modal: type-to-confirm → soft-delete vào .trash server-side ──
+function openDeleteModal() {
+  if (!project) return;
+  $('#delete-proj-name').textContent = project;
+  const inp = $('#delete-confirm-input');
+  inp.value = '';
+  $('#delete-confirm').disabled = true;
+  const err = $('#delete-error'); err.classList.add('hidden'); err.textContent = '';
+  $('#delete-modal').classList.remove('hidden');
+  inp.focus();
+}
+function closeDeleteModal() { $('#delete-modal').classList.add('hidden'); }
+function showDeleteError(msg) {
+  const err = $('#delete-error'); err.textContent = msg; err.classList.remove('hidden');
+}
+async function confirmDeleteProject() {
+  const proj = project;
+  // Guard: nút chỉ bật khi input trùng — vẫn re-check phòng gọi qua Enter.
+  if (!proj || $('#delete-confirm-input').value !== proj) return;
+  const btn = $('#delete-confirm'); btn.disabled = true;
+  try {
+    const r = await parseJson(await fetch(`/api/projects/${encodeURIComponent(proj)}/delete`, { method: 'POST' }));
+    if (r && r.ok) { closeDeleteModal(); await loadProjects(); return; }
+    showDeleteError((r && r.error) || 'Xoá thất bại');
+  } catch (e) {
+    showDeleteError(e.message || 'Lỗi khi xoá project');
+  }
+  // Fail → cho thử lại nếu input vẫn khớp.
+  btn.disabled = $('#delete-confirm-input').value !== proj;
+}
+$('#delete-project-btn').addEventListener('click', openDeleteModal);
+$('#delete-close').addEventListener('click', closeDeleteModal);
+$('#delete-cancel').addEventListener('click', closeDeleteModal);
+$('#delete-modal').addEventListener('click', (e) => { if (e.target.id === 'delete-modal') closeDeleteModal(); });
+$('#delete-confirm-input').addEventListener('input', (e) => { $('#delete-confirm').disabled = e.target.value !== project; });
+$('#delete-confirm-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !$('#delete-confirm').disabled) confirmDeleteProject();
+});
+$('#delete-confirm').addEventListener('click', confirmDeleteProject);
 
 loadProjects();
 setInterval(refresh, 3000);
