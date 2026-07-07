@@ -777,6 +777,13 @@ async function onPlanGateClick(e) {
 function startChatPoll() { stopChatPoll(); pollTicks = 0; pollChat(); chatPoll = setInterval(pollChat, 2500); }
 function stopChatPoll() { if (chatPoll) clearInterval(chatPoll); chatPoll = null; }
 
+// 1 nhịp poll có "tiến triển" không → dùng để reset đồng hồ idle safety-stop.
+// Chờ confirm / đang chạy / có log mới / đã xong đều là tiến triển → KHÔNG tính vào timeout.
+// Chỉ nhịp im lặng hoàn toàn (poll mồ côi / task chết) mới đếm về mốc dừng ~25'.
+function pollTickHasActivity(plan, isLive, newLog, isDone) {
+  return !!(isDone || isLive || newLog || (plan && plan.pending));
+}
+
 async function pollChat() {
   // Snapshot project/task ở đầu hàm: pollChat là async, đọc globals sau mỗi await.
   // stopChatPoll() chỉ huỷ interval — KHÔNG cancel promise đang in-flight. Nếu switchProject
@@ -788,22 +795,23 @@ async function pollChat() {
   // làm thay đổi scrollHeight, nên phải đo trước khi gọi chúng.
   const pinned = isPinnedToBottom($('#chat-stream'));
   const stale = () => proj !== project || tid !== activeTaskId;
-  if (++pollTicks > 600) {   // ~25 min safety stop
-    const meta = ensureAgentBubble(tid).querySelector('.msg-meta');
-    if (meta) meta.textContent = 'timeout — reload để xem kết quả';
-    return stopChatPoll();
-  }
   const bubble = ensureAgentBubble(tid);
+  // Idle safety-stop chỉ để bắt poll mồ côi (task chết). Đo "tiến triển" trong tick này rồi
+  // reset/đếm ở CUỐI — KHÔNG chốt cứng 25' cho run khoẻ hay lúc đang chờ user confirm.
+  let plan = null, isLive = false, newLog = false, isDone = false;
   try {
     // Plan chờ xác nhận? (PAGENT_CONFIRM) — dựng gate Run/Edit/Cancel trước khi agent sửa file.
-    const plan = await j(`/api/projects/${encodeURIComponent(proj)}/plan/${encodeURIComponent(tid)}`);
+    plan = await j(`/api/projects/${encodeURIComponent(proj)}/plan/${encodeURIComponent(tid)}`);
     if (stale()) return;
     renderPlanGate(bubble, tid, plan, pinned);
     const live = await j(`/api/projects/${encodeURIComponent(proj)}/live`);
     if (stale()) return;
     const hit = live.find(t => t.task_id === tid);
+    isLive = !!hit;
+    const beforeOff = logOffset;
     await fetchChatLog(bubble, proj, tid);
     if (stale()) return;
+    newLog = logOffset > beforeOff;   // fetchChatLog đẩy logOffset khi có data mới
     if (hit) {
       const running = (hit.active || []).map(a => a.agent).join(', ');
       bubble.querySelector('.msg-meta').textContent = `${hit.mode} · ${running || '…'} đang chạy`;
@@ -812,6 +820,7 @@ async function pollChat() {
       if (stale()) return;
       const done = tasks.find(t => t.task_id === tid);
       if (done) {
+        isDone = true;
         // Timeline đầy đủ + subagent xem ở Live / report modal — chat chỉ cần link report.
         bubble.querySelector('.msg-meta').innerHTML =
           `✓ hoàn thành · <a href="#" class="open-report" data-report-id="${esc(done.id)}">xem report</a>`;
@@ -820,9 +829,18 @@ async function pollChat() {
         stopChatPoll();
         refresh();
       }
-      // chưa có trong live và chưa done → pagent đang khởi chạy, tiếp tục poll
+      // chưa có trong live và chưa done → pagent đang khởi chạy, tiếp tục poll (im lặng → đếm idle)
     }
   } catch (e) { /* transient; keep polling */ }
+  // Có tiến triển → reset đồng hồ idle. Im lặng hoàn toàn → đếm; quá ~25' mới ngừng theo dõi
+  // (run có thể vẫn chạy server-side — reload/nhấn xác nhận vẫn hoạt động).
+  if (pollTickHasActivity(plan, isLive, newLog, isDone)) {
+    pollTicks = 0;
+  } else if (++pollTicks > 600) {
+    const meta = bubble.querySelector('.msg-meta');
+    if (meta) meta.textContent = '⏸ ngừng theo dõi (im ~25′) — run có thể vẫn chạy; reload để xem lại';
+    return stopChatPoll();
+  }
   if (!stale() && pinned) scrollStream(true);   // pinned đã chốt ở đầu tick → force, đừng để recheck post-append vô hiệu hoá
 }
 
@@ -1094,4 +1112,4 @@ setInterval(refresh, 3000);
 }
 
 // Export cho test node (browser bỏ qua).
-if (typeof module !== 'undefined' && module.exports) module.exports = { paginate, PAGE_SIZE, fmtCompact, fmtSpend, computeStats, aiWorkflowModel, renderAgentWorkflow, liveMaxTurnsHit, retryControlHtml, resumeControlHtml, liveSignature, backendSelectorHtml };
+if (typeof module !== 'undefined' && module.exports) module.exports = { paginate, PAGE_SIZE, fmtCompact, fmtSpend, computeStats, aiWorkflowModel, renderAgentWorkflow, liveMaxTurnsHit, retryControlHtml, resumeControlHtml, liveSignature, backendSelectorHtml, pollTickHasActivity };
