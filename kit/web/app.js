@@ -222,19 +222,32 @@ function retryControlHtml(t) {
 // Selector backend (công tắc việc nhỏ/lớn — settings per-project, persist server-side):
 // opencode·9router cho việc nhỏ, claude·subscription (direct) cho việc lớn. Đổi ở đây
 // áp cho MỌI run kế tiếp của project — không phải chọn lại mỗi message.
-function backendSelectorHtml(s) {
+const OPENCODE_MODELS_DEFAULT = ['9router/FREE', '9router/Claude'];
+
+function backendSelectorHtml(s, opencodeModels) {
   const st = s || {};
   const prov = st.provider === 'claude' ? 'claude' : 'opencode';
   const curModel = String(st.claude_model || 'sonnet');
   const models = ['sonnet', 'opus'].includes(curModel) ? ['sonnet', 'opus'] : ['sonnet', 'opus', curModel];
   const modelOpts = models.map(m =>
     `<option value="${esc(m)}"${m === curModel ? ' selected' : ''}>${esc(m)}</option>`).join('');
+  // opencode combo (global list) — chèn giá trị đang chọn nếu không có trong list
+  const curOc = String(st.opencode_model || '9router/FREE');
+  let ocList = Array.isArray(opencodeModels) && opencodeModels.length ? opencodeModels.slice() : OPENCODE_MODELS_DEFAULT.slice();
+  if (!ocList.includes(curOc)) ocList = [curOc, ...ocList];
+  const ocOpts = ocList.map(m =>
+    `<option value="${esc(m)}"${m === curOc ? ' selected' : ''}>${esc(m)}</option>`).join('');
   return `
     <select id="backend-select" title="Backend cho MỌI run kế tiếp của project này (persist server-side)">
       <option value="opencode"${prov === 'opencode' ? ' selected' : ''}>⚡ opencode · 9router (việc nhỏ)</option>
       <option value="claude"${prov === 'claude' ? ' selected' : ''}>🧠 claude · subscription (việc lớn)</option>
     </select>
-    <select id="backend-claude-model" class="${prov === 'claude' ? '' : 'hidden'}" title="Model claude (tên trần — direct subscription)">${modelOpts}</select>`;
+    <select id="backend-claude-model" class="${prov === 'claude' ? '' : 'hidden'}" title="Model claude (tên trần — direct subscription)">${modelOpts}</select>
+    <span id="backend-opencode-wrap" class="${prov === 'opencode' ? '' : 'hidden'}">
+      <select id="backend-opencode-model" title="Combo model 9router cho backend opencode">${ocOpts}</select>
+      <button type="button" id="backend-opencode-add" title="Thêm combo (provider/model)">+</button>
+      <button type="button" id="backend-opencode-del" title="Xóa combo đang chọn">×</button>
+    </span>`;
 }
 
 async function loadBackendSettings() {

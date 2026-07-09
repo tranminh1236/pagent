@@ -7,11 +7,28 @@ const { backendSelectorHtml } = require('../kit/web/app.js');
 let pass = 0;
 const t = (name, fn) => { fn(); pass++; console.log('  ok - ' + name); };
 
-t('opencode selected mặc định, không hiện model select', () => {
-  const html = backendSelectorHtml({ provider: 'opencode', claude_model: 'sonnet' });
+t('opencode selected → hiện combo select + nút add/del, default 9router/FREE', () => {
+  const html = backendSelectorHtml({ provider: 'opencode' });
   assert.ok(/value="opencode"[^>]*selected/.test(html), 'opencode selected');
-  assert.ok(!/backend-claude-model/.test(html) || /hidden/.test(html),
-    'model select ẩn khi opencode');
+  const wrap = html.match(/<span[^>]*backend-opencode-wrap[^>]*>/)?.[0] || '';
+  assert.ok(/backend-opencode-wrap/.test(html) && !/hidden/.test(wrap), 'wrap opencode hiện');
+  assert.ok(/backend-opencode-add/.test(html) && /backend-opencode-del/.test(html), 'có nút add/del');
+  assert.ok(/value="9router\/FREE"[^>]*selected/.test(html), 'default 9router/FREE selected');
+  const cm = html.match(/<select[^>]*backend-claude-model[^>]*>/)?.[0] || '';
+  assert.ok(/hidden/.test(cm), 'claude model select ẩn khi opencode');
+});
+
+t('opencode: list truyền vào render đúng + chèn combo custom đang chọn', () => {
+  const html = backendSelectorHtml(
+    { provider: 'opencode', opencode_model: '9router/Custom' },
+    ['9router/FREE', '9router/Claude']);
+  assert.ok(/value="9router\/Custom"[^>]*selected/.test(html), 'custom được chèn & selected');
+  assert.ok(/value="9router\/Claude"/.test(html), 'list item render');
+});
+
+t('escape combo opencode_model lạ (XSS)', () => {
+  const html = backendSelectorHtml({ provider: 'opencode', opencode_model: '"><img>' });
+  assert.ok(!/"><img>/.test(html), 'phải escape');
 });
 
 t('claude selected → hiện model select với claude_model hiện tại', () => {
@@ -20,6 +37,8 @@ t('claude selected → hiện model select với claude_model hiện tại', () 
   assert.ok(/backend-claude-model/.test(html) && !/backend-claude-model[^>]*hidden/.test(html.match(/<select[^>]*backend-claude-model[^>]*>/)?.[0] || 'hidden'),
     'model select hiện khi claude');
   assert.ok(/value="opus"[^>]*selected|selected[^>]*value="opus"/.test(html), 'opus selected');
+  const ocWrap = html.match(/<span[^>]*backend-opencode-wrap[^>]*>/)?.[0] || '';
+  assert.ok(/hidden/.test(ocWrap), 'wrap opencode ẩn khi claude');
 });
 
 t('nhãn nêu rõ mục đích: opencode việc nhỏ, claude việc lớn', () => {
