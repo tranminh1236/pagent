@@ -370,6 +370,36 @@ _CLAUDE_MODEL_RE = re.compile(r"^[A-Za-z0-9.-]{1,64}$")   # tên trần, KHÔNG 
 # opencode dùng model dạng provider/model (vd "9router/FREE"); rỗng = không override.
 _OPENCODE_MODEL_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
+# ───────── Settings global (combo list opencode model — dùng chung mọi project) ─────────
+_GLOBAL_DEFAULTS = {"opencode_models": ["9router/FREE", "9router/Claude"]}
+_OPENCODE_MODELS_MAX = 30
+
+def _global_settings_path():
+    return os.path.join(REPORTS, "opencode-models.json")
+
+def read_global_settings():
+    """Combo list global (dùng chung mọi project). Thiếu/hỏng → default êm."""
+    out = dict(_GLOBAL_DEFAULTS)
+    p = _global_settings_path()
+    if os.path.isfile(p):
+        try:
+            with open(p) as f:
+                d = json.load(f)
+            v = d.get("opencode_models")
+            if isinstance(v, list) and v:
+                out["opencode_models"] = v
+        except Exception:
+            pass
+    return out
+
+def write_global_settings(models):
+    p = _global_settings_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"opencode_models": models}, f)
+    os.replace(tmp, p)
+
 def _settings_path(proj):
     return _safe_join(REPORTS, proj, "settings.json")
 
@@ -745,6 +775,8 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             path = urlparse(self.path).path
+            if path == "/api/settings/opencode-models":
+                return self._opencode_models_post()
             md = re.match(r"^/api/projects/([^/]+)/plan/(.+)$", path)
             if md:
                 proj = unquote(md.group(1))
@@ -877,6 +909,30 @@ class H(BaseHTTPRequestHandler):
             json.dump(cur, f)
         os.replace(tmp, path)
         return self._j(cur)
+
+    def _opencode_models_post(self):
+        """POST {opencode_models: [...]} → ghi đè list global (atomic). Mỗi phần tử phải
+        dạng provider/model; dedup giữ thứ tự; 1..MAX phần tử. Sai → 400 không ghi."""
+        raw = self._read_body()
+        if raw is None:
+            return self._j({"error": "body quá lớn"}, 413)
+        try:
+            data = json.loads(raw or b"{}")
+        except Exception:
+            return self._j({"error": "JSON không hợp lệ"}, 400)
+        lst = data.get("opencode_models")
+        if not isinstance(lst, list):
+            return self._j({"error": "opencode_models phải là mảng"}, 400)
+        seen, out = set(), []
+        for m in lst:
+            if not isinstance(m, str) or m == "" or len(m) > 128 or not _OPENCODE_MODEL_RE.fullmatch(m):
+                return self._j({"error": f"combo không hợp lệ: {m!r} (cần provider/model)"}, 400)
+            if m not in seen:
+                seen.add(m); out.append(m)
+        if not (1 <= len(out) <= _OPENCODE_MODELS_MAX):
+            return self._j({"error": f"list phải có 1..{_OPENCODE_MODELS_MAX} combo"}, 400)
+        write_global_settings(out)
+        return self._j({"opencode_models": out})
 
     def _resume_decision(self, proj, tid):
         """POST {agent, extra_turns?, action?} → ghi runs/<tid>/resume.decision.<agent>.json
@@ -1110,6 +1166,7 @@ class H(BaseHTTPRequestHandler):
             if path == "/app.js":         return self._f("app.js", "application/javascript")
             if path == "/style.css":      return self._f("style.css", "text/css")
             if path == "/api/projects":   return self._j(list_projects())
+            if path == "/api/settings/opencode-models": return self._j(read_global_settings())
 
             def with_proj(handler):
                 m = re.match(rf"^/api/projects/([^/]+){suffix}$", path)

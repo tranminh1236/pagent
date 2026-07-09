@@ -188,5 +188,41 @@ class TestSpawnInjectsSettings(unittest.TestCase):
         self.assertEqual(env.get("PAGENT_MODEL"), "9router/Claude")        # không đụng
 
 
+class TestOpencodeModelsGlobal(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="pagent_ocmodels_")
+        cls.server, cls.port = _start_server(cls.tmp)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        import shutil; shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _get(self):
+        return _req(self.port, "GET", "/api/settings/opencode-models")
+
+    def _post(self, payload):
+        return _req(self.port, "POST", "/api/settings/opencode-models", payload)
+
+    def test_get_default_list(self):
+        status, data = self._get()
+        self.assertEqual(status, 200)
+        self.assertEqual(data.get("opencode_models"), ["9router/FREE", "9router/Claude"])
+
+    def test_post_persists_and_dedups(self):
+        status, data = self._post({"opencode_models": ["9router/FREE", "9router/Claude", "9router/FREE"]})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["opencode_models"], ["9router/FREE", "9router/Claude"])  # dedup giữ thứ tự
+        status, data = self._get()
+        self.assertEqual(data["opencode_models"], ["9router/FREE", "9router/Claude"])
+
+    def test_post_rejects_bad(self):
+        for bad in ([], "notarray", ["Claude"], [""], ["a/b", 5],
+                    [f"9router/m{i}" for i in range(31)]):
+            status, data = self._post({"opencode_models": bad})
+            self.assertEqual(status, 400, f"list={bad!r}: {data}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
