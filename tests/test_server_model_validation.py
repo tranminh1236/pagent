@@ -76,14 +76,24 @@ class TestModelPassthroughOnSpawn(unittest.TestCase):
             status, data = self._chat()
             return status, data, mock_popen
 
-    # ── provider/model (chuẩn opencode) PHẢI spawn được — đây là format đúng ──
-    def test_chat_accepts_9router_provider_model(self):
-        status, data, mock_popen = self._spawn_with_model("9router/Claude")
-        self.assertEqual(status, 200, data)
-        self.assertEqual(mock_popen.call_count, 1)
-        env = mock_popen.call_args[1]["env"]
-        self.assertEqual(env["PAGENT_MODEL"], "9router/Claude",
-                         "model truyền nguyên vẹn tới pagent — không sanitize")
+    # ── provider/model (chuẩn opencode) PHẢI tới pagent NGUYÊN VẸN — không sanitize ──
+    # Nguồn model giờ là web settings (opencode_model), KHÔNG phải env passthrough:
+    # _spawn_pagent đè PAGENT_MODEL bằng opencode_model → "web là nguồn sự thật".
+    # Test này giữ bảo đảm cốt lõi: prefix "9router/" không bị gỡ (sanitizer claude cũ đã biến mất).
+    # Spec: docs/superpowers/specs/2026-07-09-web-opencode-model-select-design.md
+    def test_9router_provider_model_from_settings_not_sanitized(self):
+        settings_path = os.path.join(self.tmp, self.proj, "settings.json")
+        with open(settings_path, "w") as f:
+            json.dump({"provider": "opencode", "opencode_model": "9router/Claude"}, f)
+        try:
+            status, data, mock_popen = self._spawn_with_model(None)
+            self.assertEqual(status, 200, data)
+            self.assertEqual(mock_popen.call_count, 1)
+            env = mock_popen.call_args[1]["env"]
+            self.assertEqual(env["PAGENT_MODEL"], "9router/Claude",
+                             "opencode_model tới pagent nguyên vẹn — không sanitize prefix")
+        finally:
+            os.remove(settings_path)
 
     def test_chat_accepts_any_provider_model_form(self):
         for m in ("cc/claude-opus-4-8", "gemini/gemini-3-flash-preview", "Claude"):
