@@ -363,9 +363,12 @@ def plan_pending(proj, tid):
 _AGENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # ───────── Settings per-project (công tắc backend web: opencode ↔ claude direct) ─────────
-_SETTINGS_DEFAULTS = {"provider": "opencode", "claude_model": "sonnet"}
+_SETTINGS_DEFAULTS = {"provider": "opencode", "claude_model": "sonnet",
+                      "opencode_model": "9router/FREE"}
 _PROVIDER_WHITELIST = {"opencode", "claude"}
 _CLAUDE_MODEL_RE = re.compile(r"^[A-Za-z0-9.-]{1,64}$")   # tên trần, KHÔNG provider/model
+# opencode dùng model dạng provider/model (vd "9router/FREE"); rỗng = không override.
+_OPENCODE_MODEL_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 
 def _settings_path(proj):
     return _safe_join(REPORTS, proj, "settings.json")
@@ -650,6 +653,8 @@ def _spawn_pagent(proj, source, mode, full_task, tid, env_extra=None):
         st = read_settings(proj)
         env["PAGENT_PROVIDER"] = st["provider"]
         env["PAGENT_CLAUDE_MODEL"] = st["claude_model"]
+        if st.get("opencode_model"):
+            env["PAGENT_MODEL"] = st["opencode_model"]   # web đè giá trị leak từ shell
     for k, v in (env_extra or {}).items():
         env[k] = v
     # Web spawn luôn bật resume gate (max_turns → chờ user cấp thêm lượt qua button
@@ -858,6 +863,11 @@ class H(BaseHTTPRequestHandler):
             if not isinstance(m, str) or not _CLAUDE_MODEL_RE.fullmatch(m):
                 return self._j({"error": "claude_model phải là tên trần (vd sonnet, opus) — không phải provider/model"}, 400)
             cur["claude_model"] = m
+        if "opencode_model" in data:
+            m = data["opencode_model"]
+            if not isinstance(m, str) or (m != "" and (len(m) > 128 or not _OPENCODE_MODEL_RE.fullmatch(m))):
+                return self._j({"error": "opencode_model phải dạng provider/model (vd 9router/FREE) hoặc rỗng"}, 400)
+            cur["opencode_model"] = m
         path = _settings_path(proj)
         if not path:
             return self._j({"error": "đường dẫn không hợp lệ"}, 400)

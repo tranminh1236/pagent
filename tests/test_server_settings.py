@@ -106,6 +106,25 @@ class TestSettingsEndpoints(unittest.TestCase):
         with open(os.path.join(self.tmp, self.proj, "settings.json")) as f:
             self.assertNotIn("hacker", json.load(f))
 
+    def test_get_defaults_has_opencode_model(self):
+        status, data = self._get()
+        self.assertEqual(status, 200)
+        self.assertEqual(data.get("opencode_model"), "9router/FREE")
+
+    def test_post_opencode_model_valid_and_empty(self):
+        status, data = self._post({"opencode_model": "9router/Claude"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["opencode_model"], "9router/Claude")
+        status, data = self._post({"opencode_model": ""})   # rỗng = không override
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["opencode_model"], "")
+        self._post({"opencode_model": "9router/FREE"})       # reset cho test sau
+
+    def test_post_rejects_bad_opencode_model(self):
+        for bad in ("Claude", "9router/", "/Claude", "a b/c", "x" * 200, 5):
+            status, data = self._post({"opencode_model": bad})
+            self.assertEqual(status, 400, f"opencode_model={bad!r}: {data}")
+
 
 class TestSpawnInjectsSettings(unittest.TestCase):
     def setUp(self):
@@ -155,6 +174,18 @@ class TestSpawnInjectsSettings(unittest.TestCase):
         with patch.dict(os.environ, env_clean, clear=True):
             env = self._spawn()
         self.assertNotIn("PAGENT_PROVIDER", env)
+
+    def test_spawn_sets_pagent_model_from_opencode_model(self):
+        self._write_settings({"provider": "opencode", "opencode_model": "9router/FREE"})
+        with patch.dict(os.environ, {"PAGENT_MODEL": "9router/Claude"}):   # leak từ shell
+            env = self._spawn()
+        self.assertEqual(env.get("PAGENT_MODEL"), "9router/FREE")          # web đè leak
+
+    def test_spawn_empty_opencode_model_leaves_env(self):
+        self._write_settings({"provider": "opencode", "opencode_model": ""})
+        with patch.dict(os.environ, {"PAGENT_MODEL": "9router/Claude"}):
+            env = self._spawn()
+        self.assertEqual(env.get("PAGENT_MODEL"), "9router/Claude")        # không đụng
 
 
 if __name__ == "__main__":
