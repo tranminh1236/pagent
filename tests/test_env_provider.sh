@@ -21,6 +21,14 @@ else
   bad "PAGENT_MODEL phải là provider/model (vd 9router/Claude) hoặc rỗng cho backend opencode" "got: PAGENT_MODEL=$model"
 fi
 
+# ── 1b. Source .env.pagent KHÔNG được clobber PAGENT_MODEL đã set sẵn (web/shell) ─────
+preset="$(bash -c "export PAGENT_MODEL='9router/FREE'; set -a; . '$ENV_FILE' 2>/dev/null; set +a; printf '%s' \"\$PAGENT_MODEL\"")"
+if [[ "$preset" == "9router/FREE" ]]; then
+  ok "PAGENT_MODEL set sẵn được giữ nguyên qua source (không clobber)"
+else
+  bad "source .env.pagent clobber PAGENT_MODEL đã set sẵn" "got: '$preset' (mong '9router/FREE')"
+fi
+
 # ── 2. pagent PHẢI tham chiếu PAGENT_OPENCODE_BIN (backend mặc định là opencode) ──────
 if grep -q 'PAGENT_OPENCODE_BIN' "$ROOT/pagent"; then
   ok "pagent script tham chiếu PAGENT_OPENCODE_BIN (backend opencode)"
