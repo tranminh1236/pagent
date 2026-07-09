@@ -2,7 +2,7 @@
 // Tests cho selector backend (opencode ↔ claude direct) trong composer — pure helper.
 // Spec: docs/superpowers/specs/2026-07-04-backend-switch-design.md
 const assert = require('assert');
-const { backendSelectorHtml } = require('../kit/web/app.js');
+const { backendSelectorHtml, addOpencodeModel, removeOpencodeModel } = require('../kit/web/app.js');
 
 let pass = 0;
 const t = (name, fn) => { fn(); pass++; console.log('  ok - ' + name); };
@@ -55,6 +55,21 @@ t('settings null/undefined → không throw, mặc định opencode', () => {
 t('escape giá trị claude_model lạ (an toàn XSS)', () => {
   const html = backendSelectorHtml({ provider: 'claude', claude_model: '"><img>' });
   assert.ok(!/"><img>/.test(html), 'phải escape');
+});
+
+t('addOpencodeModel: hợp lệ thì append, dedup, chặn dạng sai', () => {
+  assert.deepStrictEqual(addOpencodeModel(['9router/FREE'], '9router/Claude').list,
+    ['9router/FREE', '9router/Claude']);
+  assert.deepStrictEqual(addOpencodeModel(['9router/FREE'], '9router/FREE').list,
+    ['9router/FREE'], 'không nhân đôi');
+  assert.ok(addOpencodeModel(['9router/FREE'], 'Claude').error, 'thiếu / → error');
+  assert.ok(addOpencodeModel(['9router/FREE'], '  ').error, 'rỗng → error');
+});
+
+t('removeOpencodeModel: xóa combo, giữ ≥1', () => {
+  assert.deepStrictEqual(removeOpencodeModel(['9router/FREE', '9router/Claude'], '9router/Claude').list,
+    ['9router/FREE']);
+  assert.ok(removeOpencodeModel(['9router/FREE'], '9router/FREE').error, 'không xóa phần tử cuối');
 });
 
 console.log(`\n${pass} tests passed`);

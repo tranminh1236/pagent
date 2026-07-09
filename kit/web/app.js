@@ -223,6 +223,7 @@ function retryControlHtml(t) {
 // opencode·9router cho việc nhỏ, claude·subscription (direct) cho việc lớn. Đổi ở đây
 // áp cho MỌI run kế tiếp của project — không phải chọn lại mỗi message.
 const OPENCODE_MODELS_DEFAULT = ['9router/FREE', '9router/Claude'];
+let opencodeModels = OPENCODE_MODELS_DEFAULT.slice();  // list global, nạp ở loadBackendSettings
 
 function backendSelectorHtml(s, opencodeModels) {
   const st = s || {};
@@ -250,12 +251,34 @@ function backendSelectorHtml(s, opencodeModels) {
     </span>`;
 }
 
+// Thêm combo vào list (validate provider/model, dedup). Trả {list, added?} hoặc {list, error}.
+function addOpencodeModel(list, value) {
+  const v = String(value || '').trim();
+  if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(v) || v.length > 128) {
+    return { list: Array.isArray(list) ? list : [], error: 'combo phải dạng provider/model (vd 9router/Claude)' };
+  }
+  const base = Array.isArray(list) ? list.slice() : [];
+  if (base.includes(v)) return { list: base, added: v };
+  return { list: [...base, v], added: v };
+}
+// Xóa combo khỏi list, luôn giữ ≥1. Trả {list, removed?} hoặc {list, error}.
+function removeOpencodeModel(list, value) {
+  const base = Array.isArray(list) ? list.slice() : [];
+  if (base.length <= 1) return { list: base, error: 'phải giữ ít nhất 1 combo' };
+  return { list: base.filter(m => m !== value), removed: value };
+}
+
 async function loadBackendSettings() {
   if (!project) return;
   try {
-    const s = await j(`/api/projects/${encodeURIComponent(project)}/settings`);
+    const [s, g] = await Promise.all([
+      j(`/api/projects/${encodeURIComponent(project)}/settings`),
+      j(`/api/settings/opencode-models`).catch(() => ({ opencode_models: OPENCODE_MODELS_DEFAULT })),
+    ]);
+    opencodeModels = (g && Array.isArray(g.opencode_models) && g.opencode_models.length)
+      ? g.opencode_models : OPENCODE_MODELS_DEFAULT.slice();
     const wrap = $('#backend-wrap');
-    if (wrap) wrap.innerHTML = backendSelectorHtml(s);
+    if (wrap) wrap.innerHTML = backendSelectorHtml(s, opencodeModels);
   } catch { /* endpoint lỗi → giữ UI cũ, không chặn composer */ }
 }
 
@@ -265,14 +288,48 @@ async function saveBackendSettings() {
   const body = { provider: sel.value };
   const ms = $('#backend-claude-model');
   if (ms && sel.value === 'claude') body.claude_model = ms.value;
+  const oms = $('#backend-opencode-model');
+  if (oms && sel.value === 'opencode') body.opencode_model = oms.value;
   try {
     const r = await parseJson(await fetch(
       `/api/projects/${encodeURIComponent(project)}/settings`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }));
     if (r.error) { alert(r.error); return; }
     const wrap = $('#backend-wrap');
-    if (wrap) wrap.innerHTML = backendSelectorHtml(r);   // đồng bộ hiện model select khi đổi sang claude
+    if (wrap) wrap.innerHTML = backendSelectorHtml(r, opencodeModels);   // đồng bộ hiện model select khi đổi sang claude
   } catch (e) { alert(String(e)); }
+}
+// POST list global rồi cập nhật cache. Trả true nếu OK.
+async function saveOpencodeModels(list) {
+  try {
+    const r = await parseJson(await fetch('/api/settings/opencode-models',
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ opencode_models: list }) }));
+    if (r.error) { alert(r.error); return false; }
+    opencodeModels = r.opencode_models || list;
+    return true;
+  } catch (e) { alert(String(e)); return false; }
+}
+// Chọn combo cho project hiện tại (persist opencode_model).
+async function selectOpencodeModel(value) {
+  try {
+    const r = await parseJson(await fetch(`/api/projects/${encodeURIComponent(project)}/settings`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ opencode_model: value }) }));
+    if (r.error) { alert(r.error); return; }
+  } catch (e) { alert(String(e)); }
+}
+async function onOpencodeAdd() {
+  const v = prompt('Thêm combo 9router (dạng provider/model, vd 9router/Claude):');
+  if (v == null) return;
+  const res = addOpencodeModel(opencodeModels, v);
+  if (res.error) { alert(res.error); return; }
+  if (await saveOpencodeModels(res.list)) { await selectOpencodeModel(res.added); await loadBackendSettings(); }
+}
+async function onOpencodeDel() {
+  const cur = $('#backend-opencode-model');
+  if (!cur) return;
+  const res = removeOpencodeModel(opencodeModels, cur.value);
+  if (res.error) { alert(res.error); return; }
+  if (await saveOpencodeModels(res.list)) { await selectOpencodeModel(res.list[0]); await loadBackendSettings(); }
 }
 
 // Khối Resume cho agent đang DỪNG CHỜ vì cạn max_turns (run còn sống — pagent poll
@@ -1062,7 +1119,12 @@ $('#live-list').addEventListener('click', (e) => {
 });
 // Delegation: đổi backend / model claude trong composer → persist settings server-side.
 document.addEventListener('change', (e) => {
-  if (e.target.id === 'backend-select' || e.target.id === 'backend-claude-model') saveBackendSettings();
+  if (e.target.id === 'backend-select' || e.target.id === 'backend-claude-model'
+      || e.target.id === 'backend-opencode-model') saveBackendSettings();
+});
+document.addEventListener('click', (e) => {
+  if (e.target.id === 'backend-opencode-add') { onOpencodeAdd(); return; }
+  if (e.target.id === 'backend-opencode-del') onOpencodeDel();
 });
 $('#workflow-list').addEventListener('click', (e) => {
   const reuse = e.target.closest('.wf-reuse');
@@ -1125,4 +1187,4 @@ setInterval(refresh, 3000);
 }
 
 // Export cho test node (browser bỏ qua).
-if (typeof module !== 'undefined' && module.exports) module.exports = { paginate, PAGE_SIZE, fmtCompact, fmtSpend, computeStats, aiWorkflowModel, renderAgentWorkflow, liveMaxTurnsHit, retryControlHtml, resumeControlHtml, liveSignature, backendSelectorHtml, pollTickHasActivity };
+if (typeof module !== 'undefined' && module.exports) module.exports = { paginate, PAGE_SIZE, fmtCompact, fmtSpend, computeStats, aiWorkflowModel, renderAgentWorkflow, liveMaxTurnsHit, retryControlHtml, resumeControlHtml, liveSignature, backendSelectorHtml, addOpencodeModel, removeOpencodeModel, pollTickHasActivity };
