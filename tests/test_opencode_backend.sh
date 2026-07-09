@@ -104,16 +104,15 @@ else
 fi
 rm -rf "$SB"
 
-echo "=== frontmatter model (dành cho claude-cli) bị BỎ QUA hoàn toàn ở opencode ==="
-# Quy ước: model trong md = tên trần cho claude-cli; opencode để 9router combo tự
-# phân phối → KHÔNG BAO GIỜ lấy model từ frontmatter, kể cả dạng provider/model.
+echo "=== opencode dùng PAGENT_MODEL, KHÔNG lấy model từ frontmatter ==="
+# kit/agents KHÔNG khai model (opencode để 9router combo tự phân phối) → -m luôn là PAGENT_MODEL,
+# không bao giờ dính tên model claude-cli.
 SB="$(make_sandbox)"
-_orch_model="$(awk '/^model:/{print $2; exit}' kit/agents/orchestrator.md)"
 out="$(run_find "$SB" "PAGENT_MODEL=9router/Claude")"
 args="$(cat "$SB/args.txt" 2>/dev/null)"
-if grep -q "^9router/Claude$" <<<"$args" && ! grep -qx -- "${_orch_model:-__none__}" <<<"$args"; then
-  ok "model frontmatter ($_orch_model) bị bỏ, dùng PAGENT_MODEL (combo)"
-else bad "frontmatter model phải bị bỏ qua ở opencode" "$args"; fi
+if grep -q "^9router/Claude$" <<<"$args" && ! grep -qE "claude-(opus|sonnet|haiku)" <<<"$args"; then
+  ok "opencode -m dùng PAGENT_MODEL (9router/Claude), không dính model claude-cli"
+else bad "opencode phải dùng PAGENT_MODEL, không frontmatter model" "$args"; fi
 rm -rf "$SB"
 
 SB="$(make_sandbox)"

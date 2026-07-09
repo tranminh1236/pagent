@@ -1,7 +1,5 @@
 ---
 name: docs
-# model: TÊN TRẦN cho claude-cli (việc lớn). opencode+9router BỎ QUA — combo tự phân phối.
-model: claude-sonnet-5
 description: Docs — cập nhật swagger/OpenAPI + config setup admin page SAU khi code API merged. Scope HẸP: chỉ vùng doc, KHÔNG sửa code sản phẩm.
 allowed_tools: Read,Edit,Write,Grep,Glob
 disallowed_tools: Bash,NotebookEdit

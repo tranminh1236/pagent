@@ -1,7 +1,6 @@
 ---
 name: workflow-extractor
 description: Chưng cất lịch sử task + bugfix + prompt tích luỹ của project thành 1 spec điều phối AI agent (framework-agnostic) tái sử dụng, refresh vào agent-workflow.md
-model: claude-opus-4-8
 allowed_tools: Read,Write,Edit,Grep,Glob
 ---
 

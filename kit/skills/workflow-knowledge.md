@@ -1,7 +1,6 @@
 ---
 name: workflow-knowledge
 description: Đọc agent-workflow.md (spec điều phối) + source-summary.md + report cũ → sinh/refresh .pagent/knowledge/workflow.md mô tả luồng nghiệp vụ end-to-end (entrypoint→handler→side-effect, ai gọi ai) phục vụ Planner. Idempotent, không append vô hạn.
-model: claude-opus-4-8
 allowed_tools: Read,Glob,Grep,Write
 ---
 

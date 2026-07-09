@@ -24,7 +24,12 @@ ORCH="kit/agents/orchestrator.md"
 echo "=== context-planning.md — file + frontmatter ==="
 if [[ -f "$SKILL" ]]; then ok "skill file exists"; else fail "skill file missing: $SKILL"; fi
 assert_grep "name: context-planning" "$SKILL" '^name:[[:space:]]*context-planning'
-assert_grep "model: claude-opus-4-8" "$SKILL" '^model:[[:space:]]*claude-opus-4-8'
+# model: kit/skills KHÔNG khai model — opencode+9router combo tự chọn; claude fallback PAGENT_CLAUDE_MODEL
+if grep -qE '^model:' "$SKILL"; then
+  fail "context-planning KHÔNG được khai model (opencode combo tự chọn) — got: $(grep -E '^model:' "$SKILL")"
+else
+  ok "context-planning không khai model (opencode combo / claude PAGENT_CLAUDE_MODEL)"
+fi
 assert_grep "allowed_tools has Read" "$SKILL" '^allowed_tools:.*Read'
 assert_grep "allowed_tools has Grep" "$SKILL" '^allowed_tools:.*Grep'
 assert_grep "allowed_tools has Glob" "$SKILL" '^allowed_tools:.*Glob'

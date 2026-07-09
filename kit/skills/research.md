@@ -1,7 +1,6 @@
 ---
 name: research
 description: Tra cứu doc thư viện/framework version mới nhất qua context7 trước khi đề xuất API/usage
-model: claude-opus-4-8
 allowed_tools: mcp__plugin_context7_context7__resolve-library-id mcp__plugin_context7_context7__query-docs Read Grep Glob WebSearch
 disallowed_tools: Write,Edit,NotebookEdit
 mcp_servers: context7

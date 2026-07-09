@@ -181,9 +181,9 @@ for _a in architecture performance security; do
   [[ "$(md_meta "$_md" name)" == "$_a" ]] \
     && ok "$_a: name khớp file (frontmatter parse được)" \
     || fail "$_a: name không parse ra '$_a'"
-  # model = tên trần cho claude-cli; opencode/9router bỏ qua (combo tự phân phối)
+  # model: kit/agents KHÔNG khai (opencode combo tự chọn); nếu khai phải tên trần (không provider/model)
   _mdl="$(md_meta "$_md" model)"
-  [[ -n "$_mdl" && "$_mdl" != */* ]]        && ok "$_a: model tên trần claude ($_mdl)" || fail "$_a: model phải là tên trần claude (got '${_mdl:-<unset>}')"
+  [[ -z "$_mdl" || "$_mdl" != */* ]]        && ok "$_a: không khai model (opencode combo) hoặc tên trần (${_mdl:-<unset>})" || fail "$_a: nếu khai model phải tên trần (không provider/model) — got '$_mdl'"
   _tools="$(md_meta "$_md" allowed_tools)"
   [[ -n "$_tools" ]]                        && ok "$_a: allowed_tools parse được" || fail "$_a: allowed_tools rỗng"
   # (2) read-only: allowed_tools KHÔNG chứa công cụ ghi

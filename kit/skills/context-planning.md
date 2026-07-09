@@ -1,7 +1,6 @@
 ---
 name: context-planning
 description: Đọc context theo TẦNG (knowledge → feature reports → bug reports → git diff), dừng sớm khi đủ, xuất "Relevant Context Bundle" gọn + gợi ý subtask cho orchestrator. Read-only, không sửa file.
-model: claude-opus-4-8
 allowed_tools: Read,Grep,Glob,Bash(git diff:*),Bash(ls *),Bash(cat *),Bash(head *)
 disallowed_tools: Write,Edit,NotebookEdit
 max_turns: 15

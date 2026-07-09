@@ -52,13 +52,14 @@ echo "=== coder.md — Coding Standards verification ==="
 
 # --- YAML frontmatter fields intact ---
 assert_meta "name = coder" "name" "coder"
-# Quy ước model (2026-07-04): frontmatter model = TÊN TRẦN cho claude-cli (việc lớn);
-# opencode/9router BỎ QUA field này — combo tự phân phối model tối ưu.
+# Quy ước model (2026-07-09): kit/agents KHÔNG khai model — opencode+9router combo tự phân
+# phối; claude backend fallback PAGENT_CLAUDE_MODEL. Nếu lỡ khai thì phải TÊN TRẦN, không
+# phải provider/model (dạng đó vô nghĩa với claude → 404).
 _m=$(awk -v k="model" '/^---$/{p++; next} p==1 && $1==k":"{sub("^[^:]+:[[:space:]]*",""); print; exit}' "$FILE")
-if [[ -n "$_m" && "$_m" != */* ]]; then
-  echo "PASS: model là tên trần claude-cli (got '$_m')"; ((PASS++))
+if [[ -z "$_m" || "$_m" != */* ]]; then
+  echo "PASS: coder không khai model (opencode combo) hoặc tên trần (got '${_m:-<unset>}')"; ((PASS++))
 else
-  echo "FAIL: model phải là tên trần claude (vd opus, sonnet) — got '${_m:-<unset>}'"; ((FAIL++))
+  echo "FAIL: nếu khai model phải là tên trần claude (không provider/model) — got '$_m'"; ((FAIL++))
 fi
 assert_meta "caveman = lite" "caveman" "lite"
 assert_meta "mcp_servers = context7" "mcp_servers" "context7"
