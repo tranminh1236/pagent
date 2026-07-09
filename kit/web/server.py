@@ -679,12 +679,12 @@ def _spawn_pagent(proj, source, mode, full_task, tid, env_extra=None):
     # Công tắc backend từ web (settings.json) — ý định user ĐÈ env kế thừa của shell
     # (bài học PAGENT_MODEL=9router/Claude rơi rớt); env_extra nội bộ vẫn đè được ở dưới.
     sp = _settings_path(proj)
+    st = read_settings(proj)                 # luôn merge default (opencode_model=9router/FREE)
     if sp and os.path.isfile(sp):
-        st = read_settings(proj)
         env["PAGENT_PROVIDER"] = st["provider"]
         env["PAGENT_CLAUDE_MODEL"] = st["claude_model"]
-        if st.get("opencode_model"):
-            env["PAGENT_MODEL"] = st["opencode_model"]   # web đè giá trị leak từ shell
+    if st.get("opencode_model"):
+        env["PAGENT_MODEL"] = st["opencode_model"]   # web default đè leak kể cả khi chưa có settings.json
     for k, v in (env_extra or {}).items():
         env[k] = v
     # Web spawn luôn bật resume gate (max_turns → chờ user cấp thêm lượt qua button

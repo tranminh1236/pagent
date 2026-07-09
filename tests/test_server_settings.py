@@ -187,6 +187,12 @@ class TestSpawnInjectsSettings(unittest.TestCase):
             env = self._spawn()
         self.assertEqual(env.get("PAGENT_MODEL"), "9router/Claude")        # không đụng
 
+    def test_spawn_injects_default_opencode_model_without_settings_file(self):
+        # KHÔNG có settings.json → default merge 9router/FREE vẫn override PAGENT_MODEL leak
+        with patch.dict(os.environ, {"PAGENT_MODEL": "9router/Claude"}):
+            env = self._spawn()
+        self.assertEqual(env.get("PAGENT_MODEL"), "9router/FREE")
+
 
 class TestOpencodeModelsGlobal(unittest.TestCase):
     @classmethod

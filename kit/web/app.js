@@ -273,7 +273,7 @@ async function loadBackendSettings() {
   try {
     const [s, g] = await Promise.all([
       j(`/api/projects/${encodeURIComponent(project)}/settings`),
-      j(`/api/settings/opencode-models`).catch(() => ({ opencode_models: OPENCODE_MODELS_DEFAULT })),
+      j(`/api/settings/opencode-models`).catch(() => ({ opencode_models: OPENCODE_MODELS_DEFAULT.slice() })),
     ]);
     opencodeModels = (g && Array.isArray(g.opencode_models) && g.opencode_models.length)
       ? g.opencode_models : OPENCODE_MODELS_DEFAULT.slice();
