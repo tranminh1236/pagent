@@ -387,7 +387,7 @@ tr.row:hover { background: var(--panel-2); }
   cursor: pointer; max-width: 240px;
 }
 .backend-wrap select:focus { outline: none; border-color: var(--accent); }
-.backend-wrap select.hidden { display: none; }
+.backend-wrap .hidden { display: none; }   /* ẩn cả <select> claude-model lẫn <span> opencode-wrap khi khác backend */
 
 /* ───────── Workflows ───────── */
 #workflow-list { display: flex; flex-direction: column; gap: 8px; max-height: 60vh; overflow-y: auto; }
