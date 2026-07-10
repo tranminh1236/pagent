@@ -93,10 +93,15 @@ jq -e 'select(.agent=="orchestrator" and .event=="end") | .provider == "opencode
 af="$SB/src/.opencode/agents/pagent-orchestrator.md"
 if [[ -f "$af" ]]; then
   ok "sinh .opencode/agents/pagent-orchestrator.md"
-  grep -q "mode: primary" "$af"        && ok "agent file: mode primary"        || bad "thiếu mode primary" "$(head -12 "$af")"
-  # orchestrator: allowed có Bash(ls *)… → bash allow; disallowed Write,Edit → edit deny
-  grep -q "bash: allow" "$af"          && ok "orchestrator: bash allow"        || bad "bash phải allow" "$(head -12 "$af")"
-  grep -q "edit: deny" "$af"           && ok "orchestrator: edit deny"         || bad "edit phải deny" "$(head -12 "$af")"
+  grep -q "mode: primary" "$af"        && ok "agent file: mode primary"        || bad "thiếu mode primary" "$(head -20 "$af")"
+  # #1 description = mô tả THẬT của agent (không phải generic auto-gen)
+  grep -q 'description: "Lead agent' "$af" && ok "orchestrator: description thật (kit)" || bad "description phải là mô tả thật của agent" "$(head -20 "$af")"
+  if grep -q "auto-generated" "$af"; then bad "vẫn dùng description generic" "$(head -20 "$af")"; else ok "orchestrator: bỏ description generic"; fi
+  # #2 orchestrator có Bash(ls *)… → permission.bash MAP least-privilege (KHÔNG full allow)
+  if grep -qE '^  bash: allow' "$af"; then bad "orchestrator KHÔNG được full bash (mất least-privilege)" "$(head -20 "$af")"; else ok "orchestrator: không full bash"; fi
+  grep -q '"\*": deny' "$af"           && ok "orchestrator: bash map default deny"    || bad "thiếu default deny trong bash map" "$(head -20 "$af")"
+  grep -q '"git diff' "$af"            && ok "orchestrator: giữ scoped git diff allow" || bad "mất scoped bash allow" "$(head -20 "$af")"
+  grep -q "edit: deny" "$af"           && ok "orchestrator: edit deny"         || bad "edit phải deny" "$(head -20 "$af")"
   # body phải chứa system prompt thật của orchestrator
   grep -qi "orchestrator\|điều phối\|plan" "$af" && ok "agent file body = system prompt" || bad "body rỗng/sai"
 else
