@@ -467,7 +467,7 @@ call_agent() {
   # MCP config: nạp config server cho từng MCP mà agent khai báo dùng
   # (mcp_servers chứa tên server, hoặc allowed_tools tham chiếu tool server đó).
   # Nhiều server → truyền --mcp-config nhiều lần. context7 gate qua PAGENT_CONTEXT7;
-  # figma/canvas (design) gate qua PAGENT_DESIGN.
+  # figma/canvas (design) gate qua PAGENT_DESIGN; jira/gitlab (đọc task) gate qua PAGENT_TASKS.
   local mcp_configs=()
   if [[ "${PAGENT_CONTEXT7:-0}" == "1" || "${PAGENT_CONTEXT7:-}" == "true" ]]; then
     if [[ "$mcp_servers" == *context7* || "$allowed" == *context7* ]]; then
@@ -480,6 +480,15 @@ call_agent() {
     fi
     if [[ "$mcp_servers" == *canvas* || "$allowed" == *canvas* ]]; then
       [[ -f "$KIT_DIR/mcp/canvas.json" ]] && mcp_configs+=("$KIT_DIR/mcp/canvas.json")
+    fi
+  fi
+  # jira/gitlab (đọc task/issue) gate qua PAGENT_TASKS. Token/URL đọc từ env (.env.pagent).
+  if [[ "${PAGENT_TASKS:-0}" == "1" || "${PAGENT_TASKS:-}" == "true" ]]; then
+    if [[ "$mcp_servers" == *jira* || "$allowed" == *jira* ]]; then
+      [[ -f "$KIT_DIR/mcp/jira.json" ]] && mcp_configs+=("$KIT_DIR/mcp/jira.json")
+    fi
+    if [[ "$mcp_servers" == *gitlab* || "$allowed" == *gitlab* ]]; then
+      [[ -f "$KIT_DIR/mcp/gitlab.json" ]] && mcp_configs+=("$KIT_DIR/mcp/gitlab.json")
     fi
   fi
   local model;              model="$(md_meta "$md" model)"
