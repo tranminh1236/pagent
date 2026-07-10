@@ -1,7 +1,5 @@
 ---
 name: coder
-# model: TÊN TRẦN cho claude-cli (việc lớn). opencode+9router BỎ QUA — combo tự phân phối.
-model: claude-sonnet-5
 description: Implement feature hoặc fix bug — edit code thật trong source folder
 allowed_tools: Read,Write,Edit,Bash,Grep,Glob,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs
 mcp_servers: context7

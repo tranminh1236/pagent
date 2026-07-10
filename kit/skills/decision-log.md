@@ -1,7 +1,6 @@
 ---
 name: decision-log
 description: Chưng cất 1 quyết định thiết kế của lần chạy hiện tại thành MỘT mục ADR ngắn (ngày, context, quyết định, hệ quả, ref bug/PR) rồi APPEND vào cuối .pagent/knowledge/decisions.md. Append-only — chỉ thêm mục mới, KHÔNG sửa/xoá mục cũ.
-model: claude-opus-4-8
 allowed_tools: Read,Write
 ---
 

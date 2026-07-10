@@ -45,7 +45,7 @@ fi
 echo ""
 echo "=== YAML frontmatter ==="
 assert_meta "name = domain-knowledge" "name" "domain-knowledge"
-assert_meta "model = claude-opus-4-8" "model" "claude-opus-4-8"
+assert_meta "model unset (opencode combo tự chọn; claude fallback PAGENT_CLAUDE_MODEL)" "model" ""
 assert_contains "allowed_tools has Read"  "Read"
 assert_contains "allowed_tools has Write" "Write"
 

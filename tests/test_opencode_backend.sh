@@ -93,10 +93,15 @@ jq -e 'select(.agent=="orchestrator" and .event=="end") | .provider == "opencode
 af="$SB/src/.opencode/agents/pagent-orchestrator.md"
 if [[ -f "$af" ]]; then
   ok "sinh .opencode/agents/pagent-orchestrator.md"
-  grep -q "mode: primary" "$af"        && ok "agent file: mode primary"        || bad "thiếu mode primary" "$(head -12 "$af")"
-  # orchestrator: allowed có Bash(ls *)… → bash allow; disallowed Write,Edit → edit deny
-  grep -q "bash: allow" "$af"          && ok "orchestrator: bash allow"        || bad "bash phải allow" "$(head -12 "$af")"
-  grep -q "edit: deny" "$af"           && ok "orchestrator: edit deny"         || bad "edit phải deny" "$(head -12 "$af")"
+  grep -q "mode: primary" "$af"        && ok "agent file: mode primary"        || bad "thiếu mode primary" "$(head -20 "$af")"
+  # #1 description = mô tả THẬT của agent (không phải generic auto-gen)
+  grep -q 'description: "Lead agent' "$af" && ok "orchestrator: description thật (kit)" || bad "description phải là mô tả thật của agent" "$(head -20 "$af")"
+  if grep -q "auto-generated" "$af"; then bad "vẫn dùng description generic" "$(head -20 "$af")"; else ok "orchestrator: bỏ description generic"; fi
+  # #2 orchestrator có Bash(ls *)… → permission.bash MAP least-privilege (KHÔNG full allow)
+  if grep -qE '^  bash: allow' "$af"; then bad "orchestrator KHÔNG được full bash (mất least-privilege)" "$(head -20 "$af")"; else ok "orchestrator: không full bash"; fi
+  grep -q '"\*": deny' "$af"           && ok "orchestrator: bash map default deny"    || bad "thiếu default deny trong bash map" "$(head -20 "$af")"
+  grep -q '"git diff' "$af"            && ok "orchestrator: giữ scoped git diff allow" || bad "mất scoped bash allow" "$(head -20 "$af")"
+  grep -q "edit: deny" "$af"           && ok "orchestrator: edit deny"         || bad "edit phải deny" "$(head -20 "$af")"
   # body phải chứa system prompt thật của orchestrator
   grep -qi "orchestrator\|điều phối\|plan" "$af" && ok "agent file body = system prompt" || bad "body rỗng/sai"
 else
@@ -104,16 +109,15 @@ else
 fi
 rm -rf "$SB"
 
-echo "=== frontmatter model (dành cho claude-cli) bị BỎ QUA hoàn toàn ở opencode ==="
-# Quy ước: model trong md = tên trần cho claude-cli; opencode để 9router combo tự
-# phân phối → KHÔNG BAO GIỜ lấy model từ frontmatter, kể cả dạng provider/model.
+echo "=== opencode dùng PAGENT_MODEL, KHÔNG lấy model từ frontmatter ==="
+# kit/agents KHÔNG khai model (opencode để 9router combo tự phân phối) → -m luôn là PAGENT_MODEL,
+# không bao giờ dính tên model claude-cli.
 SB="$(make_sandbox)"
-_orch_model="$(awk '/^model:/{print $2; exit}' kit/agents/orchestrator.md)"
 out="$(run_find "$SB" "PAGENT_MODEL=9router/Claude")"
 args="$(cat "$SB/args.txt" 2>/dev/null)"
-if grep -q "^9router/Claude$" <<<"$args" && ! grep -qx -- "${_orch_model:-__none__}" <<<"$args"; then
-  ok "model frontmatter ($_orch_model) bị bỏ, dùng PAGENT_MODEL (combo)"
-else bad "frontmatter model phải bị bỏ qua ở opencode" "$args"; fi
+if grep -q "^9router/Claude$" <<<"$args" && ! grep -qE "claude-(opus|sonnet|haiku)" <<<"$args"; then
+  ok "opencode -m dùng PAGENT_MODEL (9router/Claude), không dính model claude-cli"
+else bad "opencode phải dùng PAGENT_MODEL, không frontmatter model" "$args"; fi
 rm -rf "$SB"
 
 SB="$(make_sandbox)"

@@ -1,7 +1,6 @@
 ---
 name: domain-knowledge
 description: Đọc source-summary.md + report cũ → sinh/refresh .pagent/knowledge/domain.md mô tả tri thức MIỀN (khái niệm, business rule, thuật ngữ, ràng buộc) phục vụ Planner. Merge idempotent, không nhân đôi mục, không append vô hạn.
-model: claude-opus-4-8
 allowed_tools: Read,Glob,Grep,Write
 ---
 

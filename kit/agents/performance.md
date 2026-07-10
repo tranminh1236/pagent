@@ -1,7 +1,5 @@
 ---
 name: performance
-# model: TÊN TRẦN cho claude-cli (việc lớn). opencode+9router BỎ QUA — combo tự phân phối.
-model: claude-sonnet-5
 description: Audit hiệu năng — memory leak + disk I/O limit + CPU/RAM limit + request spam. Read-only, 2 pha.
 allowed_tools: Read,Grep,Glob,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs
 disallowed_tools: Write,Edit,NotebookEdit,Bash

@@ -1,7 +1,5 @@
 ---
 name: architecture
-# model: TÊN TRẦN cho claude-cli (việc lớn). opencode+9router BỎ QUA — combo tự phân phối.
-model: claude-opus-4-8
 description: Audit kiến trúc — cấu trúc thư mục/design pattern + database schema + redis cache-key. Read-only, 2 pha.
 allowed_tools: Read,Grep,Glob,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs
 disallowed_tools: Write,Edit,NotebookEdit,Bash

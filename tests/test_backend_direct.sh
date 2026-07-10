@@ -52,10 +52,18 @@ run_find "$SB" ""
 m="$(cat "$SB/marker.txt" 2>/dev/null)"
 grep -q "BASE_URL=<unset>" <<<"$m" && ok "ANTHROPIC_BASE_URL bị unset (direct sub)" || bad "BASE_URL vẫn còn" "$m"
 grep -q "API_KEY=<unset>" <<<"$m"  && ok "ANTHROPIC_API_KEY bị unset"               || bad "API_KEY vẫn còn" "$m"
-# orchestrator.md khai model tên trần cho claude-cli → phải được dùng
-_orch_model="$(awk '/^model:/{print $2; exit}' kit/agents/orchestrator.md)"
-grep -q -- "$_orch_model" <<<"$m"  && ok "claude dùng model frontmatter ($_orch_model)" || bad "model frontmatter không được dùng" "$m"
 rm -rf "$SB"
+
+echo "=== claude backend dùng model TÊN TRẦN khai trong frontmatter (override sandbox) ==="
+# kit/agents giờ KHÔNG khai model (opencode combo tự chọn); nhánh claude vẫn tôn trọng model
+# tên trần khi agent CÓ khai. Default PAGENT_CLAUDE_MODEL=sonnet → "opus" chỉ có thể từ frontmatter.
+SBM="$(make_sandbox)"
+mkdir -p "$SBM/src/.pagent/agents"
+printf -- '---\nname: orchestrator\ndescription: override khai model tên trần\nmodel: opus\n---\nRa JSON plan theo yêu cầu.\n' >"$SBM/src/.pagent/agents/orchestrator.md"
+run_find "$SBM" ""
+mm="$(cat "$SBM/marker.txt" 2>/dev/null)"
+grep -q -- "opus" <<<"$mm" && ok "claude dùng model tên trần frontmatter (opus)" || bad "model frontmatter không được dùng" "$mm"
+rm -rf "$SBM"
 
 echo "=== agent KHÔNG khai model → fallback PAGENT_CLAUDE_MODEL ==="
 SB="$(make_sandbox)"

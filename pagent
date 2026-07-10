@@ -219,28 +219,46 @@ call_openrouter() {
   ' >"$resp_file"
 }
 
+# Map allow-list Bash của claude-cli → khối permission.bash opencode (đã thụt 2 space).
+# disallow Bash → deny; bare 'Bash' (full) → allow; chỉ có Bash(pattern) → GIỮ least-privilege
+# thành map {"*": deny, "<pat>": allow,...}; không Bash → deny. claude ':*' → glob '*'.
+oc_bash_perm() {
+  local allowed="$1" disallowed="$2" pats p
+  [[ "$disallowed" == *Bash* ]] && { printf '  bash: deny\n'; return; }
+  grep -qE '(^|[[:space:],])Bash([[:space:],]|$)' <<<"$allowed" && { printf '  bash: allow\n'; return; }
+  pats="$(grep -oE 'Bash\([^)]*\)' <<<"$allowed")"
+  [[ -z "$pats" ]] && { printf '  bash: deny\n'; return; }
+  printf '  bash:\n    "*": deny\n'
+  while IFS= read -r p; do
+    p="${p#Bash\(}"; p="${p%\)}"; p="${p//:\*/*}"; p="${p//\\/\\\\}"; p="${p//\"/\\\"}"
+    printf '    "%s": allow\n' "$p"
+  done <<<"$pats"
+}
+
 # Sinh agent file opencode từ agent md của kit — .opencode/agents/pagent-<agent>.md
 # (opencode đọc theo project dir). Body = system prompt SAU mọi injection (caveman/TDD).
-# permission map thô từ allowed/disallowed_tools: Write|Edit → edit, Bash → bash,
-# WebFetch → webfetch (mất allow-list chi tiết kiểu `Bash(cat *)` — chấp nhận theo spec).
-# Args: $1=agent $2=system_prompt $3=allowed $4=disallowed
+# permission: Write|Edit → edit, WebFetch → webfetch; Bash GIỮ allow-list chi tiết →
+# permission.bash map (least-privilege, vd orchestrator chỉ ls/cat/git status…). description
+# = mô tả THẬT của agent (fallback generic) — dùng cho router/định danh harness.
+# Args: $1=agent $2=system_prompt $3=allowed $4=disallowed $5=description
 oc_agent_file() {
-  local agent="$1" system_prompt="$2" allowed="$3" disallowed="$4"
+  local agent="$1" system_prompt="$2" allowed="$3" disallowed="$4" desc="$5"
   local dir="$PAGENT_SOURCE/.opencode/agents"
   mkdir -p "$dir"
-  local p_edit=deny p_bash=deny p_webfetch=deny
+  local p_edit=deny p_webfetch=deny
   [[ "$allowed" == *Write* || "$allowed" == *Edit* ]] && p_edit=allow
   [[ "$disallowed" == *Write* || "$disallowed" == *Edit* ]] && p_edit=deny
-  [[ "$allowed" == *Bash* ]] && p_bash=allow
-  [[ "$disallowed" == *Bash* ]] && p_bash=deny
   [[ "$allowed" == *WebFetch* || "$allowed" == *webfetch* ]] && p_webfetch=allow
+  local bash_block; bash_block="$(oc_bash_perm "$allowed" "$disallowed")"
+  local d="${desc:-pagent agent '$agent' (auto-generated)}"
+  d="${d//\\/\\\\}"; d="${d//\"/\\\"}"   # escape cho YAML double-quote
   cat >"$dir/pagent-$agent.md" <<EOF
 ---
-description: pagent agent '$agent' (auto-generated mỗi run — đừng sửa tay, thêm .opencode/agents/pagent-*.md vào .gitignore)
+description: "$d"
 mode: primary
 permission:
   edit: $p_edit
-  bash: $p_bash
+$bash_block
   webfetch: $p_webfetch
 ---
 $system_prompt
@@ -430,6 +448,7 @@ call_agent() {
   local system_prompt;      system_prompt="$(md_body "$md")"
   local allowed;            allowed="$(md_meta "$md" allowed_tools)"
   local disallowed;         disallowed="$(md_meta "$md" disallowed_tools)"
+  local desc;               desc="$(md_meta "$md" description)"                # mô tả thật → opencode agent file
   local sp_mode;            sp_mode="$(md_meta "$md" system_prompt_mode)"   # append | replace
   local max_turns;          max_turns="$(md_meta "$md" max_turns)"
   # Env override cho max_turns — repo lớn cần nhiều lượt khám phá hơn mà không phải sửa md.
@@ -542,7 +561,7 @@ $tdd_body"
     local oc_model="$PAGENT_MODEL"
     [[ "$oc_model" == */* ]] || oc_model=""
     label="$(c_cyan "[$agent]") via opencode (${oc_model:-config-default})…"
-    oc_agent_file "$agent" "$system_prompt" "$allowed" "$disallowed"
+    oc_agent_file "$agent" "$system_prompt" "$allowed" "$disallowed" "$desc"
     [[ ${#mcp_configs[@]} -gt 0 ]] && oc_mcp_config "${mcp_configs[@]}"
     ( printf '%s' "$prompt" | call_opencode "$agent" "$oc_model" "$resp_file"
     ) 2>>"$PAGENT_RUN_DIR/$agent.err" &

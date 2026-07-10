@@ -1,7 +1,5 @@
 ---
 name: reviewer
-# model: TÊN TRẦN cho claude-cli (việc lớn). opencode+9router BỎ QUA — combo tự phân phối.
-model: claude-opus-4-8
 description: Leader Code — senior full-task + Project business owner. Chưng RULE (pha 0) & cân đối verdict (pha 1) từ architecture/performance/security. Read-only.
 allowed_tools: Read,Grep,Glob,mcp__plugin_context7_context7__resolve-library-id,mcp__plugin_context7_context7__query-docs
 disallowed_tools: Write,Edit,NotebookEdit,Bash

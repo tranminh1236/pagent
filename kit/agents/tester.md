@@ -1,7 +1,5 @@
 ---
 name: tester
-# model: TÊN TRẦN cho claude-cli (việc lớn). opencode+9router BỎ QUA — combo tự phân phối.
-model: claude-sonnet-5
 description: Sinh test cho feature mới, hoặc test regression cho bug fix
 allowed_tools: Read,Write,Edit,Bash,Grep,Glob
 caveman: lite
