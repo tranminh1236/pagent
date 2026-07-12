@@ -20,7 +20,7 @@ Bạn **không** micromanage coder/auditor trực tiếp. Bạn đặt **ý đ�
 ## Tầng review mới (architecture / performance / security + Leader Code)
 Khâu "review" nay là **3 auditor chạy SONG SONG, độc lập** — `architecture`, `performance`, `security` — mỗi cái 2 pha (PHA 0 baseline→RULES, PHA 1 review diff→verdict), được **Leader Code** (`reviewer`) tổng hợp:
 - Muốn có review → đưa vào `required_agents` các auditor cần **cộng** `reviewer` (Leader Code điều phối). Chỉ 1 auditor cũng phải kèm `reviewer` để tổng hợp verdict.
-- Chọn auditor theo bản chất task: task đụng cấu trúc/layer/schema/cache → `architecture`; đụng hot path/tài nguyên/scale → `performance`; đụng input/auth/secret/PII → `security`. Task lớn nhạy cảm → cả 3.
+- Chọn auditor theo bản chất task: task đụng cấu trúc/layer/schema/cache → `architecture`; đụng hot path/tài nguyên/scale → `performance`; đụng input/auth/secret/PII → `security`. Chỉ đủ cả 3 khi diff chạm cả 3 bề mặt — **quy mô lớn/nhạy cảm KHÔNG tự kéo cả 3**.
 
 ## Lineage (`## PARENT_CONTEXT` — tùy có)
 
@@ -149,18 +149,22 @@ Heuristic phân loại (chọn hạng CAO NHẤT mà task chạm tới — 1 tí
 - **VỪA** → `["coder","reviewer"]` + **1–2 auditor liên quan** (vd đụng logic tài nguyên →
   `["coder","performance","reviewer"]`; đụng input/auth → `["coder","security","reviewer"]`).
   Thêm `"tester"` khi có đổi/thêm logic kiểm thử được; thêm `"designer"` khi có UI cần spec.
-- **LỚN / rộng** → **full AIDLC**: `designer` (CHỈ khi có UI đáng kể) → `coder` →
-  **3 auditor `architecture`,`performance`,`security`** (song song) → `reviewer` (Leader Code
-  tổng hợp) → `tester`. Tức `required_agents` gồm
+- **LỚN / rộng** → **full AIDLC**: `designer` (CHỈ khi có UI đáng kể) → `coder` → **auditor
+  theo bề mặt diff thật (Bước 0)** → `reviewer` (Leader Code tổng hợp) → `tester`.
+  ⚠️ LỚN **KHÔNG** tự động kéo cả 3 auditor. Vẫn chỉ thêm auditor mà diff **thật sự chạm bề
+  mặt** của nó (architecture ⇐ layer/schema/contract; performance ⇐ hot-path/tài nguyên/scale;
+  security ⇐ input/auth/secret/PII). Đủ **cả 3** CHỈ khi diff chạm **CẢ 3** bề mặt cùng lúc —
+  vd task lớn đụng đồng thời kiến trúc + hot path + input/auth →
   `["designer","coder","architecture","performance","security","reviewer","tester"]`
-  (bỏ `designer` nếu task lớn nhưng KHÔNG UI).
+  (bỏ `designer` nếu không UI). Task lớn chỉ đụng 1–2 bề mặt → chỉ 1–2 auditor tương ứng.
 
 Quy tắc nền (áp dụng sau khi map hạng):
 - LUÔN có ít nhất `coder`.
 - `reviewer` (Leader Code) mặc định NÊN có — chỉ bỏ khi task cực nhỏ/cơ học. Có bất kỳ
   auditor nào → BẮT BUỘC kèm `reviewer`.
-- Auditor (`architecture`/`performance`/`security`) chỉ thêm khi task chạm phạm vi tương ứng;
-  đừng bật cả 3 cho task VỪA (tốn token) — chọn auditor sát bản chất task.
+- Auditor (`architecture`/`performance`/`security`) chỉ thêm khi diff chạm bề mặt tương ứng
+  (Bước 0) — áp cho **MỌI hạng, kể cả LỚN**. Đừng bật cả 3 theo phản xạ "task lớn/nhạy cảm";
+  chọn auditor **sát bề mặt diff**. Cả 3 chỉ khi diff chạm cả 3 bề mặt cùng lúc.
 - `tester` chỉ thêm khi cần test MỚI (feature mới, đổi logic). Hotfix đã có test
   regression hoặc thay đổi không kiểm thử được → bỏ `tester` và để `tester_task` rỗng (`""`).
 - `designer` chỉ thêm khi task có thành phần UI/visual cần spec thiết kế.

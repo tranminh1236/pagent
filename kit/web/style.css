@@ -42,6 +42,14 @@ section {
   background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
   padding: 16px 20px; margin-bottom: 16px;
 }
+/* 3 cột: workflow (trái) │ <main> (giữa) │ ai-workflow (phải). Màn hẹp → xếp dọc, main lên đầu. */
+.app-columns { display: grid; grid-template-columns: minmax(240px, 300px) minmax(0, 1fr) minmax(240px, 300px); gap: 16px; align-items: start; max-width: 1700px; margin: 0 auto; padding: 20px 24px; }
+.app-columns > main { max-width: none; margin: 0; padding: 0; }
+.side-col { align-self: start; }
+@media (max-width: 1100px) {
+  .app-columns { grid-template-columns: 1fr; }
+  .app-columns > main { order: -1; }
+}
 .section-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 section h2 {
   margin: 0 0 12px; font-size: 11px; text-transform: uppercase;
