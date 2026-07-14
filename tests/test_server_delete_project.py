@@ -122,6 +122,27 @@ class TestDeleteProject(unittest.TestCase):
         # nothing should have been created under .trash
         self.assertFalse(os.path.isdir(os.path.join(self.tmp, ".trash")))
 
+    def test_delete_dotted_name_project(self):
+        # Regression: bug screenshot — project có dấu '.' trong tên (tmp.a2ULCJDEBF)
+        # từng trả '404/not found' vì tiến trình web chạy bản stale thiếu route delete.
+        # Với server hiện tại: _PROJ_RE cho phép '.', route match → xoá thật (200 ok:true),
+        # project biến khỏi list_projects(). Test này fail nếu regression tái hiện.
+        proj = "tmp.a2ULCJDEBF"
+        _make_proj(self.tmp, proj)
+        self.assertIn(proj, self.srv.list_projects())
+
+        status, data = self._delete(proj)
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data.get("ok"), data)
+        # cũ: 404 {"error":"not found"} — phải KHÔNG còn
+        self.assertNotEqual(status, 404, data)
+        self.assertNotIn("not found", json.dumps(data))
+
+        self.assertNotIn(proj, self.srv.list_projects())
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, proj)))
+        entries = os.listdir(os.path.join(self.tmp, ".trash"))
+        self.assertTrue(any(e.startswith(proj + "-") for e in entries), entries)
+
     def test_delete_rejects_traversal_name(self):
         _make_proj(self.tmp, "victim")
         # url-encoded traversal must not escape REPORTS nor match a real project

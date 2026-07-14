@@ -66,6 +66,10 @@ PAGENT_AGENT_TIMEOUT="${PAGENT_AGENT_TIMEOUT:-3600}"
 PAGENT_MAX_REVIEW_ROUND="${PAGENT_MAX_REVIEW_ROUND:-2}"
 PAGENT_OPENROUTER_BASE="${PAGENT_OPENROUTER_BASE:-https://openrouter.ai/api/v1}"
 PAGENT_OPENROUTER_KEY="${PAGENT_OPENROUTER_KEY:-${OPENROUTER_API_KEY:-}}"
+# Save-token opt-in (mặc định TẮT). =1 → siết token 2 trục: (1) dispatch gán model RẺ
+# (list từ gateway) cho agent 'đơn giản'; (2) báo orchestrator nới guard (bỏ auditor cho
+# nhiều task hơn). =0 → hành vi Y HỆT hiện tại (0 regression). Xem savetoken_* + orchestrator.md.
+PAGENT_SAVE_TOKEN="${PAGENT_SAVE_TOKEN:-0}"
 
 #─────────────────────────────────────────────
 # Utils
@@ -107,6 +111,66 @@ agent_enabled() {
 }
 # Log skip rõ ràng: prefix text "[skip]" là tín hiệu chính, màu chỉ phụ trợ.
 log_skip() { printf '%s %s\n' "$(c_yellow '[skip]')" "$*" >&2; }
+
+#─────────────────────────────────────────────
+# Save-token (PAGENT_SAVE_TOKEN=1) — gán model RẺ ở RUNTIME cho agent 'đơn giản'.
+# KHÔNG đụng frontmatter kit/agents (tôn trọng commit kit-agents-drop-model): model rẻ
+# được chọn tại DISPATCH từ list model của gateway rồi truyền per lần gọi backend.
+#─────────────────────────────────────────────
+# Agent 'đơn giản' → được hạ model rẻ. Agent 'mạnh' (coder/reviewer/auditor/tester/devops)
+# GIỮ model đầy đủ để không hạ chất lượng thực thi/review.
+savetoken_is_simple() {
+  case "$1" in
+    orchestrator|docs|workflow-extractor|designer) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+_PAGENT_ST_RESOLVED=""   # "1" sau lần thử đầu (query gateway 1 lần/run)
+_PAGENT_ST_CHEAP=""      # cache id model rẻ ("" = không có → fallback im)
+# List model id từ gateway (1 id/dòng). Seam test/manual: PAGENT_SAVE_TOKEN_MODELS (list
+# phân tách khoảng trắng) — set → dùng thẳng, bỏ curl. Không có base/curl/parse lỗi → rỗng.
+savetoken_list_models() {
+  if [[ -n "${PAGENT_SAVE_TOKEN_MODELS:-}" ]]; then
+    printf '%s\n' $PAGENT_SAVE_TOKEN_MODELS   # word-split CỐ Ý
+    return 0
+  fi
+  local base="${ANTHROPIC_BASE_URL:-}"
+  [[ -n "$base" ]] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local -a hdr=()
+  [[ -n "${ANTHROPIC_API_KEY:-}" ]] && hdr=(-H "x-api-key: $ANTHROPIC_API_KEY")
+  curl -fsS --max-time 5 "${hdr[@]}" "${base%/}/v1/models" 2>/dev/null \
+    | jq -r '.data[]?.id // empty' 2>/dev/null || true
+}
+# Chọn 1 model RẺ (ưu tiên free → haiku/mini/flash/lite/small/nano/8b/cheap). Cache kết
+# quả (kể cả rỗng) — query gateway đúng 1 lần/run. Rỗng = không tìm được → caller fallback im.
+savetoken_cheap_model() {
+  if [[ -n "$_PAGENT_ST_RESOLVED" ]]; then printf '%s' "$_PAGENT_ST_CHEAP"; return 0; fi
+  _PAGENT_ST_RESOLVED=1
+  local models m=""
+  models="$(savetoken_list_models)" || true
+  if [[ -n "$models" ]]; then
+    m="$(grep -iE 'free' <<<"$models" | head -1 || true)"
+    [[ -z "$m" ]] && m="$(grep -iE 'haiku|mini|flash|lite|small|nano|8b|cheap' <<<"$models" | head -1 || true)"
+    _PAGENT_ST_CHEAP="$m"
+  fi
+  printf '%s' "$_PAGENT_ST_CHEAP"
+}
+# Format model rẻ theo provider. opencode CẦN dạng provider/model — giữ prefix của
+# PAGENT_MODEL (vd 9router/) khi id trần; không suy ra prefix được → rỗng (fallback im).
+# claude/openrouter dùng tên trần.
+savetoken_model_for() {
+  local provider="$1" raw
+  raw="$(savetoken_cheap_model)"
+  [[ -n "$raw" ]] || return 0
+  if [[ "$provider" == "opencode" ]]; then
+    if [[ "$raw" == */* ]]; then printf '%s' "$raw"; return 0; fi
+    [[ "$PAGENT_MODEL" == */* ]] || return 0
+    printf '%s/%s' "${PAGENT_MODEL%%/*}" "$raw"
+  else
+    printf '%s' "${raw##*/}"
+  fi
+}
 
 # Resolve md path của 1 agent (project-local override global — cùng thứ tự call_agent).
 # Stdout: path. Exit 1 nếu không tìm thấy.
@@ -493,6 +557,13 @@ call_agent() {
   fi
   local model;              model="$(md_meta "$md" model)"
   model="${model:-$PAGENT_MODEL}"
+  # Save-token (opt-in): gán model RẺ cho agent 'đơn giản' tại DISPATCH — KHÔNG đụng
+  # frontmatter (tôn trọng kit-agents-drop-model). Không lấy được model rẻ → giữ nguyên.
+  local _st_model=""
+  if _is_truthy "${PAGENT_SAVE_TOKEN:-0}" && savetoken_is_simple "$agent"; then
+    _st_model="$(savetoken_model_for "$provider")"
+    [[ -n "$_st_model" ]] && model="$_st_model"
+  fi
   sp_mode="${sp_mode:-append}"
   caveman="${caveman:-${PAGENT_CAVEMAN:-off}}"
 
@@ -516,7 +587,8 @@ $system_prompt" ;;
     export PAGENT_SUPERPOWERS
     system_prompt="$system_prompt
 
-[RUNTIME] PAGENT_SUPERPOWERS=$PAGENT_SUPERPOWERS"
+[RUNTIME] PAGENT_SUPERPOWERS=$PAGENT_SUPERPOWERS
+[RUNTIME] PAGENT_SAVE_TOKEN=${PAGENT_SAVE_TOKEN:-0}"
   fi
 
   # TDD gating — CHỈ coder. Inject directive TDD bắt buộc (RED→GREEN→REFACTOR) vào
@@ -569,6 +641,8 @@ $tdd_body"
     # hoặc rỗng → default config opencode.
     local oc_model="$PAGENT_MODEL"
     [[ "$oc_model" == */* ]] || oc_model=""
+    # Save-token: model rẻ đã resolve theo provider opencode (provider/model) → đè oc_model.
+    [[ -n "$_st_model" && "$_st_model" == */* ]] && oc_model="$_st_model"
     label="$(c_cyan "[$agent]") via opencode (${oc_model:-config-default})…"
     oc_agent_file "$agent" "$system_prompt" "$allowed" "$disallowed" "$desc"
     [[ ${#mcp_configs[@]} -gt 0 ]] && oc_mcp_config "${mcp_configs[@]}"
@@ -2025,6 +2099,8 @@ USAGE
   pagent env                           In biến môi trường đang dùng
   pagent gain [-w|--watch]             Xem rtk savings cho project hiện tại (-w = live)
   pagent web [port] [host]             Bật web dashboard (mặc định http://127.0.0.1:8765)
+                                       Auto-reload BẬT mặc định: server.py đổi → tự restart
+                                       (hết phục vụ bản stale). TẮT: PAGENT_WEB_RELOAD=0
   pagent help                          Trợ giúp
 
 LINEAGE (nối tiếp report cũ)
@@ -2062,6 +2138,10 @@ ENVIRONMENT (đặt trong .env.pagent hoặc shell)
                             override qua frontmatter max_review_round (Leader Code giữ ngân sách chung)
   PAGENT_MAX_TURNS          override max_turns mọi agent (repo lớn → tăng để tránh max_turns fail)
   PAGENT_MAX_TURNS_<AGENT>  override riêng 1 agent, vd PAGENT_MAX_TURNS_ORCHESTRATOR=40
+  PAGENT_SAVE_TOKEN         opt-in save token (mặc định 0=TẮT). 1 → gán model RẺ (list từ
+                            gateway) cho agent 'đơn giản' + báo orchestrator nới guard (bỏ
+                            auditor cho nhiều task hơn). 0 → hành vi y hệt cũ (0 regression)
+  PAGENT_SAVE_TOKEN_MODELS  override list model rẻ (bỏ qua query gateway); vd "9router/FREE"
   PAGENT_CONFIRM            1 → bắt buộc xác nhận plan trước khi chạy agent (web tự bật)
   PAGENT_CONFIRM_TIMEOUT    giây chờ xác nhận qua web rồi hủy (mặc định 1800)
   PAGENT_RESUME             1 → agent cạn max_turns thì DỪNG CHỜ cấp thêm lượt (button Resume
@@ -2076,6 +2156,12 @@ ENVIRONMENT (đặt trong .env.pagent hoặc shell)
   PAGENT_OPENROUTER_BASE    default: https://openrouter.ai/api/v1
   PAGENT_PROVIDER           claude|openrouter — ép provider toàn pipeline
   PAGENT_KIT_DIR            override kit/ folder
+  PAGENT_WEB_RELOAD         1 (mặc định) → `pagent web` chạy supervisor tự restart web
+                            server khi kit/web/server.py đổi (né phục vụ bản stale → 404).
+                            0 → serve single-process trực tiếp, không watcher (production)
+  PAGENT_WEB_RELOAD_POLL    giây giữa 2 lần poll mtime khi reload BẬT (mặc định 1)
+  PAGENT_WEB_RELOAD_GRACE   giây chờ child thoát (SIGTERM) trước khi SIGKILL khi restart
+                            (mặc định 5); cũng là ngưỡng phân biệt crash sớm → backoff
 
 PIPELINE
   Tầng review = architecture‖performance‖security chạy SONG SONG (2 pha) + Leader Code (reviewer):
@@ -2123,7 +2209,17 @@ case "$cmd" in
     [[ -f "$KIT_DIR/web/server.py" ]] || die "kit/web/server.py missing"
     need python3
     log "$(c_cyan 'dashboard:') http://$host:$port  (reports: $PAGENT_REPORT_DIR)"
+    # Auto-reload BẬT mặc định: server.py chạy supervisor tự restart child web khi
+    # kit/web/server.py đổi → hết phục vụ bản stale (thiếu route → 404 'not found').
+    # TẮT bằng PAGENT_WEB_RELOAD=0 → server.py serve single-process trực tiếp (production).
+    # Thin dispatcher: chỉ chọn nhánh QUA env rồi exec — lifecycle thuộc server.py.
+    if [[ "${PAGENT_WEB_RELOAD:-1}" == "0" ]]; then
+      log "$(c_dim 'auto-reload: TẮT (PAGENT_WEB_RELOAD=0)')"
+    else
+      log "$(c_dim 'auto-reload: BẬT (PAGENT_WEB_RELOAD=0 để tắt)')"
+    fi
     PORT="$port" HOST="$host" PAGENT_REPORT_DIR="$PAGENT_REPORT_DIR" \
+    PAGENT_WEB_RELOAD="${PAGENT_WEB_RELOAD:-1}" \
       exec python3 "$KIT_DIR/web/server.py"
     ;;
   gain)

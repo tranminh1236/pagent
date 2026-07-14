@@ -1196,7 +1196,9 @@ class H(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args): pass  # silent
 
-if __name__ == "__main__":
+def _serve():
+    """Chạy web server trong tiến trình hiện tại (single process, không watcher).
+    Đường này dùng cho: child do supervisor spawn, và opt-out PAGENT_WEB_RELOAD=0."""
     port = int(os.environ.get("PORT", "8765"))
     host = os.environ.get("HOST", "127.0.0.1")
     print(f"pagent dashboard → http://{host}:{port}", flush=True)
@@ -1206,3 +1208,117 @@ if __name__ == "__main__":
         ThreadingHTTPServer((host, port), H).serve_forever()
     except KeyboardInterrupt:
         print("\nbye"); sys.exit(0)
+
+
+def _web_reload_enabled():
+    """Auto-reload BẬT mặc định cho mọi `pagent web`; PAGENT_WEB_RELOAD=0 → TẮT
+    (rơi về _serve trực tiếp, không supervisor — dùng cho production)."""
+    return os.environ.get("PAGENT_WEB_RELOAD", "1") != "0"
+
+
+def _is_supervised_child():
+    """True khi tiến trình này là child do supervisor spawn (marker _PAGENT_WEB_CHILD=1)
+    → chạy _serve, KHÔNG tự làm supervisor lần nữa."""
+    return os.environ.get("_PAGENT_WEB_CHILD") == "1"
+
+
+def _reload_next_backoff(cur, cap=8.0):
+    """Backoff mũ có cap chống restart-loop khi child crash liên tục (0.5→1→2→4→8s)."""
+    return min(cur * 2.0, cap)
+
+
+def _supervise():
+    """Supervisor reload: spawn CHÍNH file này làm child web server; watch mtime của
+    kit/web/server.py (chỉ .py — asset js/html/css serve tươi mỗi request qua _f nên
+    không cần restart). File đổi → SIGTERM child → waitpid (BLOCK tới khi child thoát
+    hẳn + port free) → spawn child mới → hết phục vụ bản stale (root cause '404 not
+    found').
+
+    Bất biến: CHỈ quản child web server — KHÔNG đọc runs/<tid>/pagent.pid, không kill
+    run pipeline detached. Ctrl+C/SIGTERM → forward xuống child → waitpid → exit sạch
+    (không orphan). stdlib-only: os.stat mtime polling."""
+    watch_path = os.path.abspath(__file__)
+    child_env = dict(os.environ, _PAGENT_WEB_CHILD="1")  # giữ nguyên PORT/HOST/PAGENT_REPORT_DIR
+    grace = float(os.environ.get("PAGENT_WEB_RELOAD_GRACE", "5"))
+    poll = float(os.environ.get("PAGENT_WEB_RELOAD_POLL", "1"))
+    state = {"child": None, "stopping": False}
+
+    def _mtime():
+        try:
+            return os.stat(watch_path).st_mtime
+        except OSError:
+            return None
+
+    def _stop_child():
+        """SIGTERM child rồi BLOCK chờ thoát hẳn (port free) TRƯỚC khi trả về —
+        chống double-bind/EADDRINUSE khi spawn child kế; escalate SIGKILL nếu quá grace."""
+        p = state["child"]
+        if not p or p.poll() is not None:
+            return
+        try:
+            p.terminate()
+        except OSError:
+            pass
+        try:
+            p.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            try:
+                p.kill()
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _on_signal(signum, frame):
+        state["stopping"] = True
+        _stop_child()
+        print("\nbye", flush=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    print("pagent web: auto-reload BẬT (đặt PAGENT_WEB_RELOAD=0 để tắt)", flush=True)
+    backoff = 0.5
+    while not state["stopping"]:
+        last_mtime = _mtime()
+        state["child"] = subprocess.Popen([sys.executable, watch_path], env=child_env,
+                                           start_new_session=True)
+        started = time.monotonic()
+        reason = None
+        while not state["stopping"]:
+            if state["child"].poll() is not None:
+                reason = "crash"
+                break
+            if _mtime() != last_mtime:
+                reason = "change"
+                break
+            time.sleep(poll)
+        if state["stopping"]:
+            break
+        if reason == "change":
+            print("pagent web: server.py đổi → restart", flush=True)
+            _stop_child()  # BLOCK tới khi child cũ chết + port free rồi mới loop spawn
+            backoff = 0.5
+            continue
+        # child tự thoát: chạy đủ lâu → healthy, respawn ngay; crash sớm → backoff
+        rc = state["child"].poll()
+        alive = time.monotonic() - started
+        if alive < grace:
+            print(f"pagent web: child thoát (rc={rc}) sau {alive:.1f}s → backoff {backoff:.1f}s",
+                  flush=True)
+            time.sleep(backoff)
+            backoff = _reload_next_backoff(backoff)
+        else:
+            backoff = 0.5
+
+
+if __name__ == "__main__":
+    # Child do supervisor spawn, hoặc opt-out PAGENT_WEB_RELOAD=0 → serve trực tiếp.
+    # Mặc định (không child, reload BẬT) → supervisor tự restart child khi server.py đổi.
+    if _is_supervised_child() or not _web_reload_enabled():
+        _serve()
+    else:
+        _supervise()

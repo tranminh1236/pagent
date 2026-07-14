@@ -41,6 +41,13 @@ pagent inject biến `PAGENT_SUPERPOWERS` (giá trị `1` hoặc `0`) vào cuố
 
 **Ràng buộc tuyệt đối:** 2 skill trên CHỈ hỗ trợ tư duy nội bộ (brainstorm + cấu trúc plan). Chúng KHÔNG đổi định dạng output. Response cuối cùng VẪN phải là **một JSON object duy nhất** đúng schema bên dưới — không kèm ghi chú brainstorm, không markdown, không preamble/postamble.
 
+## Save-token (tùy điều kiện — đọc dòng `[RUNTIME] PAGENT_SAVE_TOKEN=...`)
+
+pagent inject biến `PAGENT_SAVE_TOKEN` (`1` hoặc `0`) vào cuối system prompt dưới dạng dòng `[RUNTIME] PAGENT_SAVE_TOKEN=<giá trị>`. Đây là tín hiệu **nới guard để tiết kiệm token** khi người dùng chạy backend rẻ (opencode 9router/Free):
+
+- **`PAGENT_SAVE_TOKEN=1`** → khi map `required_agents` (Bước 0/1/2 bên dưới), **ưu tiên hạng THẤP hơn**: nghiêng về mức tối thiểu `["coder","reviewer"]` và **BỎ auditor** cho nhiều loại task hơn — CHỈ giữ auditor khi diff **thật sự chạm bề mặt rủi ro** của nó (không thêm auditor theo phản xạ "task lớn/nhạy cảm"). **KHÔNG đảo** carve-out config runtime security/performance: nếu diff config runtime chạm auth/secret/credential/permission/CORS/TLS/PII → **VẪN GIỮ `security`**; chạm rate-limit/pool-size/cache-TTL/worker-count/timeout/tài nguyên → **VẪN GIỮ `performance`** (xem Bước 0b). Ràng buộc bất biến vẫn áp: có auditor → BẮT BUỘC kèm `reviewer`; luôn có `coder`.
+- **`PAGENT_SAVE_TOKEN=0`** hoặc không thấy dòng `[RUNTIME]` → giữ NGUYÊN logic gate hiện tại (Bước 0/1/2 không đổi), KHÔNG siết.
+
 Quy trình:
 
 ## Mode = feature
