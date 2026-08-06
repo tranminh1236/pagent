@@ -364,11 +364,35 @@ _AGENT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # ───────── Settings per-project (công tắc backend web: opencode ↔ claude direct) ─────────
 _SETTINGS_DEFAULTS = {"provider": "opencode", "claude_model": "sonnet",
-                      "opencode_model": "9router/FREE"}
+                      "opencode_model": "9router/FREE",
+                      "tasks": "0", "jira_url": "", "jira_personal_token": ""}
 _PROVIDER_WHITELIST = {"opencode", "claude"}
 _CLAUDE_MODEL_RE = re.compile(r"^[A-Za-z0-9.-]{1,64}$")   # tên trần, KHÔNG provider/model
 # opencode dùng model dạng provider/model (vd "9router/FREE"); rỗng = không override.
 _OPENCODE_MODEL_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+# Gate task-tracker (Jira Server/DC PAT) — 3 key này KHÔNG nằm ở settings.json mà ở
+# .env.pagent của source project: pagent tự source file đó (xem `pagent` auto-load), nên
+# đây là single source of truth và KHÔNG cần truyền qua env_extra của _spawn_pagent.
+_ENV_SETTINGS = {"tasks": "PAGENT_TASKS", "jira_url": "JIRA_URL",
+                 "jira_personal_token": "JIRA_PERSONAL_TOKEN"}
+_SECRET_SETTINGS = ("jira_personal_token",)
+_SETTINGS_MASK = "********"     # GET trả mask; client gửi lại mask = giữ nguyên giá trị cũ
+# URL GỐC của site Jira, https bắt buộc (PAT không đi qua http) — chỉ host, KHÔNG path.
+_JIRA_URL_RE = re.compile(r"^https://[A-Za-z0-9._-]+(:\d{1,5})?/?$")
+_JIRA_HOST_DENY_RE = re.compile(r"^([0-9]+\.)*[0-9]+$|^localhost$|\.localhost$")
+# PAT chỉ nhận charset an toàn cho shell: `pagent` chạy `set -a && . .env.pagent` nên ký tự
+# $ ` " ' ; | & \ ( ) trong value = thực thi lệnh. Charset này phủ mọi PAT Jira Server/DC.
+_JIRA_PAT_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{1,512}$")
+
+def _jira_url_ok(u):
+    """URL gốc Jira hợp lệ: https, chỉ host (+port tuỳ chọn), host là TÊN MIỀN — không IP
+    trần, không localhost. Host của JIRA_URL được `taskref_host_fetchable` miễn kiểm dải IP
+    nội bộ, nên IP trần ở đây = SSRF metadata service kèm PAT."""
+    if not _JIRA_URL_RE.fullmatch(u):
+        return False
+    host = u[len("https://"):].rstrip("/").split(":", 1)[0].lower()
+    return not _JIRA_HOST_DENY_RE.search(host)
 
 # ───────── Settings global (combo list opencode model — dùng chung mọi project) ─────────
 _GLOBAL_DEFAULTS = {"opencode_models": ["9router/FREE", "9router/Claude"]}
@@ -412,10 +436,106 @@ def read_settings(proj):
             with open(p) as f:
                 d = json.load(f)
             for k in _SETTINGS_DEFAULTS:
-                if k in d:
+                if k in d and k not in _ENV_SETTINGS:
                     out[k] = d[k]
         except Exception:
             pass
+    out.update(read_env_settings(proj))
+    return out
+
+def _env_pagent_path(proj):
+    """.env.pagent mà `pagent` THẬT SỰ nạp — walk-up từ source lên `/`, dừng ở file ĐẦU TIÊN,
+    cùng thuật toán `load_env` trong `pagent`. Ghi file mới ở source khi đang có file ở thư mục
+    cha sẽ CHE mất file cha (mất ANTHROPIC_BASE_URL/PAGENT_MODEL…) nên phải walk-up cả khi ghi.
+    Không tìm thấy file nào → path mặc định ngay tại source."""
+    src = _project_source(proj)
+    if not src or not os.path.isdir(src):
+        return None
+    src = os.path.realpath(src)
+    d = src
+    while d != os.path.dirname(d):
+        p = os.path.join(d, ".env.pagent")
+        if os.path.isfile(p):
+            return p
+        d = os.path.dirname(d)
+    return os.path.join(src, ".env.pagent")
+
+def _env_quote(val):
+    """Bọc single-quote (escape `'` thành `'\\''`) — `pagent` nạp file bằng
+    `set -a && . .env.pagent`, single-quote là dạng DUY NHẤT bash không expand."""
+    return "'" + val.replace("'", "'\\''") + "'"
+
+def _parse_env_line(line):
+    """'export FOO="bar"' → ('FOO', 'bar'). Comment/dòng lạ → (None, '')."""
+    s = line.strip()
+    if not s or s.startswith("#") or "=" not in s:
+        return None, ""
+    if s.startswith("export "):
+        s = s[7:].lstrip()
+    key, _, val = s.partition("=")
+    key = key.strip()
+    val = val.strip()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+        quote = val[0]
+        val = val[1:-1]
+        if quote == "'":
+            val = val.replace("'\\''", "'")
+    return key, val
+
+def read_env_settings(proj):
+    """3 key gate task-tracker đọc từ .env.pagent của source. Thiếu file/hỏng → default êm.
+    Giá trị trả về là PLAINTEXT — đường ra HTTP phải đi qua mask_settings()."""
+    out = {k: _SETTINGS_DEFAULTS[k] for k in _ENV_SETTINGS}
+    p = _env_pagent_path(proj)
+    if not p or not os.path.isfile(p):
+        return out
+    by_env = {v: k for k, v in _ENV_SETTINGS.items()}
+    try:
+        with open(p) as f:
+            for line in f:
+                key, val = _parse_env_line(line)
+                if key in by_env:
+                    out[by_env[key]] = val
+    except Exception:
+        pass
+    return out
+
+def write_env_settings(proj, updates):
+    """Merge {ENV_NAME: value} vào .env.pagent của source — giữ nguyên mọi dòng khác, atomic,
+    mode 0600 (file chứa PAT). Value rỗng → XOÁ dòng thay vì ghi key rỗng."""
+    p = _env_pagent_path(proj)
+    if not p:
+        return False
+    lines = []
+    if os.path.isfile(p):
+        with open(p) as f:
+            lines = f.read().splitlines()
+    kept, seen = [], set()
+    for line in lines:
+        key, _ = _parse_env_line(line)
+        if key not in updates:
+            kept.append(line)
+            continue
+        seen.add(key)
+        if updates[key]:
+            kept.append("%s=%s" % (key, _env_quote(updates[key])))
+    for key, val in updates.items():
+        if val and key not in seen:
+            kept.append("%s=%s" % (key, _env_quote(val)))
+    tmp = p + ".tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(kept) + "\n")
+    os.replace(tmp, p)
+    os.chmod(p, 0o600)
+    return True
+
+def mask_settings(st):
+    """Che secret trước khi ra HTTP — GET /settings KHÔNG BAO GIỜ trả PAT plaintext."""
+    out = dict(st)
+    for k in _SECRET_SETTINGS:
+        if out.get(k):
+            out[k] = _SETTINGS_MASK
     return out
 
 def resume_pending(proj, tid):
@@ -683,7 +803,10 @@ def _spawn_pagent(proj, source, mode, full_task, tid, env_extra=None):
     if sp and os.path.isfile(sp):
         env["PAGENT_PROVIDER"] = st["provider"]
         env["PAGENT_CLAUDE_MODEL"] = st["claude_model"]
-    if st.get("opencode_model"):
+    # Chỉ set PAGENT_MODEL (dạng provider/model) khi backend là opencode. Provider claude
+    # KHÔNG cần — set sẽ leak default '9router/FREE' xuống START event → badge in-flight
+    # hiện 'claude · FREE' dù provider=claude (badge END đã đúng nhờ post.sh).
+    if st["provider"] == "opencode" and st.get("opencode_model"):
         env["PAGENT_MODEL"] = st["opencode_model"]   # web default đè leak kể cả khi chưa có settings.json
     for k, v in (env_extra or {}).items():
         env[k] = v
@@ -875,8 +998,9 @@ class H(BaseHTTPRequestHandler):
         return self._j({"ok": True, "action": action})
 
     def _settings_post(self, proj):
-        """POST {provider?, claude_model?} → merge vào REPORTS/<proj>/settings.json
-        (atomic). Whitelist chặt — field lạ bị bỏ; giá trị sai → 400 không ghi gì."""
+        """POST {provider?, claude_model?, opencode_model?} → merge vào REPORTS/<proj>/
+        settings.json; {tasks?, jira_url?, jira_personal_token?} → merge vào .env.pagent của
+        source (cả hai atomic). Whitelist chặt — field lạ bị bỏ; sai → 400 không ghi gì."""
         raw = self._read_body()
         if raw is None:
             return self._j({"error": "body quá lớn"}, 413)
@@ -900,15 +1024,42 @@ class H(BaseHTTPRequestHandler):
             if not isinstance(m, str) or (m != "" and (len(m) > 128 or not _OPENCODE_MODEL_RE.fullmatch(m))):
                 return self._j({"error": "opencode_model phải dạng provider/model (vd 9router/FREE) hoặc rỗng"}, 400)
             cur["opencode_model"] = m
+        env_updates = {}
+        if "tasks" in data:
+            t = data["tasks"]
+            if not (t is True or t is False or t in ("0", "1")):
+                return self._j({"error": "tasks phải là true|false (hoặc \"0\"|\"1\")"}, 400)
+            on = t is True or t == "1"
+            cur["tasks"] = "1" if on else "0"
+            env_updates["PAGENT_TASKS"] = "1" if on else ""
+        if "jira_url" in data:
+            u = data["jira_url"]
+            if not isinstance(u, str) or (u != "" and (len(u) > 256 or not _jira_url_ok(u))):
+                return self._j({"error": "jira_url phải là URL gốc https theo tên miền "
+                                         "(vd https://jira.cty.vn) — không kèm /browse/<KEY>, "
+                                         "không IP trần, không localhost"}, 400)
+            cur["jira_url"] = u
+            env_updates["JIRA_URL"] = u
+        # PAT: mask = client echo lại giá trị đã che → no-op. Lỗi KHÔNG echo giá trị.
+        if "jira_personal_token" in data and data["jira_personal_token"] != _SETTINGS_MASK:
+            tok = data["jira_personal_token"]
+            if not isinstance(tok, str) or (tok != "" and not _JIRA_PAT_RE.fullmatch(tok)):
+                return self._j({"error": "jira_personal_token không hợp lệ (chuỗi in được, ≤512 ký tự)"}, 400)
+            cur["jira_personal_token"] = tok
+            env_updates["JIRA_PERSONAL_TOKEN"] = tok
+        # Validate CẢ hai đích TRƯỚC mọi write — .env.pagent và settings.json là 2 store riêng,
+        # ghi store đầu rồi mới phát hiện store sau hỏng sẽ để lại trạng thái nửa vời.
         path = _settings_path(proj)
         if not path:
             return self._j({"error": "đường dẫn không hợp lệ"}, 400)
+        if env_updates and not write_env_settings(proj, env_updates):
+            return self._j({"error": f"chưa biết source path của '{proj}' — không ghi được .env.pagent"}, 409)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(cur, f)
+            json.dump({k: v for k, v in cur.items() if k not in _ENV_SETTINGS}, f)
         os.replace(tmp, path)
-        return self._j(cur)
+        return self._j(mask_settings(cur))
 
     def _opencode_models_post(self):
         """POST {opencode_models: [...]} → ghi đè list global (atomic). Mỗi phần tử phải
@@ -1183,7 +1334,7 @@ class H(BaseHTTPRequestHandler):
                 (r"/chat-log/(.+)",lambda p, t: self._j(read_chat_log(p, t, (qs.get("offset") or ["0"])[0]))),
                 (r"/plan/(.+)",    lambda p, t: self._j(plan_pending(p, t))),
                 (r"/resume/(.+)",  lambda p, t: self._j(resume_pending(p, t))),
-                (r"/settings",     lambda p:    self._j(read_settings(p))),
+                (r"/settings",     lambda p:    self._j(mask_settings(read_settings(p)))),
                 (r"/live",         lambda p:    self._j(live_tasks(p))),
                 (r"/agents",       lambda p:    self._j(agent_stats(p))),
                 (r"/workflow",     lambda p:    self._j(read_workflow(p))),

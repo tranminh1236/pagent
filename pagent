@@ -15,6 +15,15 @@ set -euo pipefail
 _src="${BASH_SOURCE[0]}"; while [[ -L "$_src" ]]; do _src="$(readlink "$_src")"; done
 SCRIPT_DIR="$(cd "$(dirname "$_src")" && pwd)"
 KIT_DIR="${PAGENT_KIT_DIR:-$SCRIPT_DIR/kit}"
+export PAGENT_KIT_DIR="$KIT_DIR"
+
+# Nở placeholder {{KIT_DIR}} thành path TUYỆT ĐỐI của kit. Agent chạy `cd "$PAGENT_SOURCE"`
+# và kit KHÔNG được copy vào project target, nên mọi tham chiếu tới helper trong kit
+# (allowed_tools + system prompt) phải là path tuyệt đối: path tương đối vừa không tồn tại ở
+# project khác, vừa cho repo target đánh tráo script cùng tên vào allowlist.
+expand_kit_dir() {
+  printf '%s' "${1//\{\{KIT_DIR\}\}/$KIT_DIR}"
+}
 
 # Portable file lock (flock/mkdir) — chống interleave khi chạy song song
 if [[ -f "$KIT_DIR/lib/lock.sh" ]]; then . "$KIT_DIR/lib/lock.sh"; else with_lock() { shift; "$@"; }; fi
@@ -299,6 +308,20 @@ oc_bash_perm() {
   done <<<"$pats"
 }
 
+# .opencode/ là artefact pagent sinh vào repo TARGET → ignore ở đó (idempotent, CHỈ append).
+# Không phải repo git → bỏ qua, không tạo file lạ ngoài repo người dùng.
+oc_gitignore_guard() {
+  local root gi
+  root="$(git -C "$PAGENT_SOURCE" rev-parse --show-toplevel 2>/dev/null)" || return 0
+  [[ -n "$root" ]] || return 0
+  gi="$root/.gitignore"
+  if [[ -f "$gi" ]] && grep -qxF '.opencode/' "$gi"; then return 0; fi
+  # File user có thể không kết thúc bằng \n → append thô sẽ nối vào dòng cuối và làm
+  # mất pattern ignore đó (vd '.env' → '.env.opencode/'). Thêm \n trước, CHỈ append.
+  [[ -s "$gi" && -n "$(tail -c1 "$gi" 2>/dev/null)" ]] && printf '\n' >>"$gi" 2>/dev/null
+  printf '%s\n' '.opencode/' >>"$gi" 2>/dev/null || true
+}
+
 # Sinh agent file opencode từ agent md của kit — .opencode/agents/pagent-<agent>.md
 # (opencode đọc theo project dir). Body = system prompt SAU mọi injection (caveman/TDD).
 # permission: Write|Edit → edit, WebFetch → webfetch; Bash GIỮ allow-list chi tiết →
@@ -309,6 +332,7 @@ oc_agent_file() {
   local agent="$1" system_prompt="$2" allowed="$3" disallowed="$4" desc="$5"
   local dir="$PAGENT_SOURCE/.opencode/agents"
   mkdir -p "$dir"
+  oc_gitignore_guard
   local p_edit=deny p_webfetch=deny
   [[ "$allowed" == *Write* || "$allowed" == *Edit* ]] && p_edit=allow
   [[ "$disallowed" == *Write* || "$disallowed" == *Edit* ]] && p_edit=deny
@@ -340,24 +364,73 @@ oc_mcp_config() {
     return 0
   fi
   mkdir -p "$PAGENT_SOURCE/.opencode"
+  oc_gitignore_guard
   # claude http server → opencode remote {type:"remote",url}; stdio {command,args} →
-  # local {type:"local",command:[...]}
-  jq -s '
-    {_pagent_generated: true,
-     mcp: (map(.mcpServers | to_entries) | add | map({
-       key: .key,
-       value: (if .value.url then {type: "remote", url: .value.url}
-               else {type: "local",
-                     command: ([.value.command] + (.value.args // [])),
-                     environment: (.value.env // {})} end)
-     }) | from_entries)}
-  ' "$@" >"$out"
+  # local {type:"local",command:[...]}.
+  # `${VAR}` là cú pháp của claude-cli, opencode KHÔNG nở → giá trị dạng đó bị DROP khỏi
+  # `environment` để MCP kế thừa env đã export ở load_env (opencode spawn với
+  # env:{...process.env, ...environment} — merge, verify trên binary 1.17.13). Value
+  # literal (READ_ONLY_MODE=true) GIỮ: mất cờ = MCP mở quyền ghi ngược Jira/GitLab.
+  # TUYỆT ĐỐI không expand giá trị thật vào file — file này nằm trong repo user (umask 077).
+  ( umask 077
+    jq -s '
+      def inherited: (.value | tostring) | test("^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$");
+      {_pagent_generated: true,
+       mcp: (map(.mcpServers | to_entries) | add | map({
+         key: .key,
+         value: (if .value.url then {type: "remote", url: .value.url}
+                 else ({type: "local",
+                        command: ([.value.command] + (.value.args // []))}
+                       + (((.value.env // {}) | with_entries(select(inherited | not))) as $literal
+                          | if ($literal | length) > 0 then {environment: $literal} else {} end)) end)
+       }) | from_entries)}
+    ' "$@" >"$out" )
+  chmod 600 "$out" 2>/dev/null || true   # `>` truncate giữ mode cũ → umask 077 không áp file cũ
+}
+
+# Warn khi user ĐÃ khai một phần credential cho MCP nhưng biến `${VAR}` mà config tham
+# chiếu còn rỗng — im lặng khi user chưa khai gì (fallback cũ) và KHÔNG BAO GIỜ die: hợp
+# đồng "không fail vì bước đọc task" giữ nguyên. CHỈ in TÊN biến + tên file: run dir bị
+# tar czf và web dashboard phục vụ → cấm lộ giá trị/URL.
+# Args: các path config đã qua gate
+_mcp_env_warned=""
+mcp_env_preflight() {
+  local f refs v missing declared
+  for f in "$@"; do
+    [[ " $_mcp_env_warned " == *" $f "* ]] && continue
+    _mcp_env_warned="$_mcp_env_warned $f"
+    refs="$(jq -r '.mcpServers[]?.env // {} | to_entries[]
+      | select(.value | type == "string" and test("^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$"))
+      | .value[2:-1]' "$f" 2>/dev/null)" || continue
+    missing=""; declared=0
+    for v in $refs; do
+      if [[ -n "${!v:-}" ]]; then declared=1; else missing="${missing:+$missing }$v"; fi
+    done
+    [[ $declared -eq 1 && -n "$missing" ]] || continue
+    warn "$(basename "$f"): thiếu biến env ($missing) — MCP có thể không đọc được task"
+  done
 }
 
 # Gọi opencode CLI (backend MẶC ĐỊNH), transform NDJSON events → format claude CLI JSON
 # (post.sh/web/_resp_ok dùng chung 1 shape cho mọi provider).
 # Stdin: user prompt. Args: $1=agent $2=model ("" → default config opencode) $3=resp_file
 # Env: PAGENT_RUN_DIR (events + err ghi cạnh resp), PAGENT_OC_HOME, PAGENT_AGENT_TIMEOUT
+# Preflight opencode: cần ÍT NHẤT 1 nguồn để chạy — oc_model dạng provider/model,
+# gateway (ANTHROPIC_BASE_URL/API_KEY), opencode auth.json (đọc từ
+# XDG_DATA_HOME=$PAGENT_OC_HOME/data), hoặc opencode.json có provider.*.options.apiKey
+# (nguồn creds 9router khi chạy CLI tay, .env.pagent). Thiếu tất cả → opencode nhả raw
+# 'No active credentials for provider: claude' khó hiểu → die sớm với hướng dẫn.
+opencode_can_run() {
+  local oc_model="$1"
+  [[ "$oc_model" == */* ]] && return 0
+  [[ -n "${ANTHROPIC_BASE_URL:-}" ]] && return 0
+  [[ -n "${ANTHROPIC_API_KEY:-}" ]] && return 0
+  [[ -s "$PAGENT_OC_HOME/data/opencode/auth.json" ]] && return 0
+  local oc_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"
+  [[ -s "$oc_cfg" ]] && jq -e '(.provider // {}) | any(.[]?; (.options.apiKey // .options.key // "") != "")' "$oc_cfg" >/dev/null 2>&1 && return 0
+  return 1
+}
+
 call_opencode() {
   local agent="$1" model="$2" resp_file="$3"
   local prompt; prompt="$(cat)"
@@ -509,8 +582,8 @@ call_agent() {
   done
   [[ -n "$md" ]] || die "không tìm thấy agent/skill: $agent (đã check .pagent/ + kit/)"
 
-  local system_prompt;      system_prompt="$(md_body "$md")"
-  local allowed;            allowed="$(md_meta "$md" allowed_tools)"
+  local system_prompt;      system_prompt="$(expand_kit_dir "$(md_body "$md")")"
+  local allowed;            allowed="$(expand_kit_dir "$(md_meta "$md" allowed_tools)")"
   local disallowed;         disallowed="$(md_meta "$md" disallowed_tools)"
   local desc;               desc="$(md_meta "$md" description)"                # mô tả thật → opencode agent file
   local sp_mode;            sp_mode="$(md_meta "$md" system_prompt_mode)"   # append | replace
@@ -530,31 +603,29 @@ call_agent() {
 
   # MCP config: nạp config server cho từng MCP mà agent khai báo dùng
   # (mcp_servers chứa tên server, hoặc allowed_tools tham chiếu tool server đó).
-  # Nhiều server → truyền --mcp-config nhiều lần. context7 gate qua PAGENT_CONTEXT7;
-  # figma/canvas (design) gate qua PAGENT_DESIGN; jira/gitlab (đọc task) gate qua PAGENT_TASKS.
-  local mcp_configs=()
-  if [[ "${PAGENT_CONTEXT7:-0}" == "1" || "${PAGENT_CONTEXT7:-}" == "true" ]]; then
-    if [[ "$mcp_servers" == *context7* || "$allowed" == *context7* ]]; then
-      [[ -f "$KIT_DIR/mcp/context7.json" ]] && mcp_configs+=("$KIT_DIR/mcp/context7.json")
-    fi
-  fi
-  if [[ "${PAGENT_DESIGN:-0}" == "1" || "${PAGENT_DESIGN:-}" == "true" ]]; then
-    if [[ "$mcp_servers" == *figma* || "$allowed" == *figma* ]]; then
-      [[ -f "$KIT_DIR/mcp/figma.json" ]] && mcp_configs+=("$KIT_DIR/mcp/figma.json")
-    fi
-    if [[ "$mcp_servers" == *canvas* || "$allowed" == *canvas* ]]; then
-      [[ -f "$KIT_DIR/mcp/canvas.json" ]] && mcp_configs+=("$KIT_DIR/mcp/canvas.json")
-    fi
-  fi
-  # jira/gitlab (đọc task/issue) gate qua PAGENT_TASKS. Token/URL đọc từ env (.env.pagent).
-  if [[ "${PAGENT_TASKS:-0}" == "1" || "${PAGENT_TASKS:-}" == "true" ]]; then
-    if [[ "$mcp_servers" == *jira* || "$allowed" == *jira* ]]; then
-      [[ -f "$KIT_DIR/mcp/jira.json" ]] && mcp_configs+=("$KIT_DIR/mcp/jira.json")
-    fi
-    if [[ "$mcp_servers" == *gitlab* || "$allowed" == *gitlab* ]]; then
-      [[ -f "$KIT_DIR/mcp/gitlab.json" ]] && mcp_configs+=("$KIT_DIR/mcp/gitlab.json")
-    fi
-  fi
+  # Bảng "<server>|<FLAG>|<file>": context7 gate PAGENT_CONTEXT7; figma/canvas (design) gate
+  # PAGENT_DESIGN; jira/gitlab (đọc task/issue) gate PAGENT_TASKS — token/URL đọc từ env
+  # (.env.pagent). figma nằm dưới CẢ hai gate (task Jira có link figma) → dedupe theo path
+  # để không truyền trùng --mcp-config. Thiếu file config → bỏ qua im lặng, không fail run.
+  local mcp_configs=() _mcp_row _mcp_srv _mcp_flag _mcp_file _mcp_fval
+  for _mcp_row in \
+    "context7|PAGENT_CONTEXT7|context7.json" \
+    "figma|PAGENT_DESIGN|figma.json" \
+    "canvas|PAGENT_DESIGN|canvas.json" \
+    "figma|PAGENT_TASKS|figma.json" \
+    "jira|PAGENT_TASKS|jira.json" \
+    "gitlab|PAGENT_TASKS|gitlab.json"; do
+    _mcp_srv="${_mcp_row%%|*}"
+    _mcp_file="$KIT_DIR/mcp/${_mcp_row##*|}"
+    _mcp_flag="${_mcp_row#*|}"; _mcp_flag="${_mcp_flag%%|*}"
+    _mcp_fval="${!_mcp_flag:-0}"
+    _is_truthy "$_mcp_fval" || continue
+    [[ "$mcp_servers" == *"$_mcp_srv"* || "$allowed" == *"$_mcp_srv"* ]] || continue
+    [[ -f "$_mcp_file" ]] || continue
+    [[ ${#mcp_configs[@]} -gt 0 && " ${mcp_configs[*]:-} " == *" $_mcp_file "* ]] && continue
+    mcp_configs+=("$_mcp_file")
+  done
+  [[ ${#mcp_configs[@]} -gt 0 ]] && mcp_env_preflight "${mcp_configs[@]}"
   local model;              model="$(md_meta "$md" model)"
   model="${model:-$PAGENT_MODEL}"
   # Save-token (opt-in): gán model RẺ cho agent 'đơn giản' tại DISPATCH — KHÔNG đụng
@@ -621,6 +692,14 @@ $tdd_body"
   local resp_file="$PAGENT_RUN_DIR/$agent.json"
   local out_file="$PAGENT_RUN_DIR/$agent.txt"
 
+  # provider=claude: model dạng provider/model (opencode-form) vô nghĩa → strip TRƯỚC khi
+  # export PAGENT_AGENT_MODEL (pre.sh ghi START event dùng biến này). Nếu để strip ở nhánh
+  # claude bên dưới (~656) thì START event đã ghi '9router/FREE' → badge in-flight leak FREE.
+  if [[ "$provider" == "claude" ]]; then
+    [[ "$model" == */* ]] && model=""
+    model="${model:-$PAGENT_CLAUDE_MODEL}"
+  fi
+
   # Pre-hook
   export PAGENT_AGENT="$agent" PAGENT_AGENT_PROVIDER="$provider" PAGENT_AGENT_MODEL="$model"
   [[ -x "$KIT_DIR/hooks/pre.sh" ]] && "$KIT_DIR/hooks/pre.sh" "$prompt" || true
@@ -643,6 +722,11 @@ $tdd_body"
     [[ "$oc_model" == */* ]] || oc_model=""
     # Save-token: model rẻ đã resolve theo provider opencode (provider/model) → đè oc_model.
     [[ -n "$_st_model" && "$_st_model" == */* ]] && oc_model="$_st_model"
+    opencode_can_run "$oc_model" || die "opencode thiếu nguồn chạy: PAGENT_MODEL không phải provider/model, không có ANTHROPIC_BASE_URL và không có opencode creds.
+Cấu hình .env.pagent một trong các cách sau:
+  - ANTHROPIC_BASE_URL=<gateway-url> (+ ANTHROPIC_API_KEY nếu cần) — route qua gateway
+  - PAGENT_MODEL=<provider>/<model> (vd 9router/Claude) — chỉ định model trực tiếp
+  - hoặc đăng nhập opencode: opencode auth login"
     label="$(c_cyan "[$agent]") via opencode (${oc_model:-config-default})…"
     oc_agent_file "$agent" "$system_prompt" "$allowed" "$disallowed" "$desc"
     [[ ${#mcp_configs[@]} -gt 0 ]] && oc_mcp_config "${mcp_configs[@]}"
@@ -1002,7 +1086,15 @@ cmd_init() {
   local out_path="$PAGENT_SOURCE/.pagent/source-summary.md"
   local response
   response="$(echo "Quét folder $PAGENT_SOURCE và trả về markdown summary theo skill source-summary." \
-    | call_agent source-summary)" || die "agent fail"
+    | call_agent source-summary)" || {
+    local ss_json="$PAGENT_RUN_DIR/source-summary.json"
+    local ss_err="$PAGENT_RUN_DIR/source-summary.err"
+    local reason
+    reason="$(jq -r '(.terminal_reason | select(. != "completed")) // .error // (if .is_error == true then .result else null end) // empty' "$ss_json" 2>/dev/null)"
+    [[ -z "$reason" ]] && reason="$(tail -3 "$ss_err" 2>/dev/null | tr '\n' ' ')"
+    die "quét source thất bại: ${reason:-unknown (xem $ss_err)}
+Kiểm tra .env.pagent (ANTHROPIC_BASE_URL / PAGENT_MODEL provider/model / opencode creds) rồi chạy lại 'pagent init'. Log: $ss_err"
+  }
 
   # Strip code fence bao ngoài nếu agent vẫn cố bọc
   printf '%s\n' "$response" | sed -E '1{/^```/d;}; ${/^```$/d;}' >"$out_path"
@@ -1111,6 +1203,12 @@ confirm_plan_gate() {
 
   # In summary TRƯỚC mọi nhánh skip → PAGENT_NO_CONFIRM/PAGENT_YES/non-tty đều thấy plan.
   _print_plan_summary "$pj"
+
+  # mode=find read-only: auto-proceed, KHÔNG handshake dù PAGENT_CONFIRM/web/non-tty →
+  # không ghi plan.pending.json, không chờ decision.json. Vẫn in summary ở trên.
+  if [[ "$PAGENT_MODE" == "find" ]]; then
+    return 0
+  fi
 
   if _is_truthy "${PAGENT_NO_CONFIRM:-}" || _is_truthy "${PAGENT_YES:-}"; then
     return 0

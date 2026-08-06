@@ -130,13 +130,40 @@ if ! grep -q "^cc/claude-opus-4-8$" <<<"$args" && grep -q "^9router/Claude$" <<<
 else bad "provider/model frontmatter lọt vào opencode" "$args"; fi
 rm -rf "$SB"
 
-echo "=== PAGENT_MODEL rỗng → không truyền -m (dùng default opencode config) ==="
+echo "=== PAGENT_MODEL rỗng + có gateway → spawn nhưng không truyền -m (default opencode config) ==="
 SB="$(make_sandbox)"
-out="$(run_find "$SB" "PAGENT_MODEL=")"
+out="$(run_find "$SB" "PAGENT_MODEL= ANTHROPIC_BASE_URL=http://gw")"
 args="$(cat "$SB/args.txt" 2>/dev/null)"
-if ! grep -q "^-m$" <<<"$args" && ! grep -q "^--model$" <<<"$args"; then
-  ok "không có -m khi model rỗng"
-else bad "vẫn truyền -m khi model rỗng" "$args"; fi
+if [[ -n "$args" ]] && ! grep -q "^-m$" <<<"$args" && ! grep -q "^--model$" <<<"$args"; then
+  ok "spawn opencode, không có -m khi model rỗng"
+else bad "vẫn truyền -m khi model rỗng (hoặc không spawn)" "$args"; fi
+rm -rf "$SB"
+
+echo "=== preflight: opencode thiếu model+gateway+creds → die sớm, KHÔNG spawn ==="
+SB="$(make_sandbox)"
+out="$(run_find "$SB" "PAGENT_MODEL= ANTHROPIC_BASE_URL= ANTHROPIC_API_KEY= PAGENT_OC_HOME='$SB/ochome'")"; rc=$?
+if (( rc != 0 )); then ok "preflight fail sớm (rc=$rc)"; else bad "phải fail khi thiếu model+gateway+creds" "$(tail -5 <<<"$out")"; fi
+if [[ ! -f "$SB/args.txt" ]]; then ok "opencode KHÔNG bị spawn"; else bad "opencode vẫn spawn dù thiếu creds" "$(cat "$SB/args.txt")"; fi
+grep -qi 'ANTHROPIC_BASE_URL' <<<"$out" && grep -qi 'PAGENT_MODEL' <<<"$out" && ok "message actionable (hướng dẫn .env.pagent)" || bad "message không actionable" "$(tail -8 <<<"$out")"
+if grep -q 'No active credentials for provider' <<<"$out"; then bad "vẫn lộ raw 'No active credentials'" "$out"; else ok "không nhả raw opencode error"; fi
+rm -rf "$SB"
+
+echo "=== preflight: có ANTHROPIC_BASE_URL (không model) → cho chạy ==="
+SB="$(make_sandbox)"
+out="$(run_find "$SB" "PAGENT_MODEL= ANTHROPIC_API_KEY= ANTHROPIC_BASE_URL=http://gw PAGENT_OC_HOME='$SB/ochome'")"; rc=$?
+if (( rc == 0 )) && [[ -f "$SB/args.txt" ]]; then ok "gateway đủ điều kiện → spawn opencode"; else bad "gateway phải cho chạy" "$(tail -5 <<<"$out")"; fi
+rm -rf "$SB"
+
+echo "=== cmd_init: opencode fail → surface reason gốc (không die trơ 'agent fail') ==="
+SB="$(make_sandbox)"
+out="$( cd "$SB/src" && eval "PAGENT_PROJECT=srcproj PAGENT_REPORT_DIR='$SB/reports' \
+    PAGENT_OPENCODE_BIN='$SB/bin/opencode' PAGENT_MODEL=9router/Claude FAKE_OC_FAIL=1 \
+    PAGENT_KNOWLEDGE=0 FAKE_OC_ARGS_FILE='$SB/args.txt' \
+    perl -e 'alarm 40; exec @ARGV' -- '$OLDPWD/$PAGENT' init </dev/null" 2>&1 )"; rc=$?
+if (( rc != 0 )); then ok "init fail (rc=$rc)"; else bad "init phải fail khi source scan lỗi"; fi
+grep -q '401 Invalid authentication cred' <<<"$out" && ok "surface reason gốc từ terminal_reason" || bad "thiếu reason gốc" "$(tail -8 <<<"$out")"
+if grep -qE 'error:.*agent fail' <<<"$out"; then bad "vẫn die trơ 'agent fail' (nuốt reason)" "$(tail -8 <<<"$out")"; else ok "không die trơ 'agent fail'"; fi
+grep -q '.env.pagent' <<<"$out" && ok "gợi ý fix .env.pagent" || bad "thiếu gợi ý .env.pagent" "$(tail -8 <<<"$out")"
 rm -rf "$SB"
 
 echo "=== event error → pipeline fail + reason trong log ==="

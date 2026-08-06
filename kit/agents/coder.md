@@ -56,12 +56,13 @@ Từ vòng 2 trở đi, input có khối `## PREVIOUS_REVIEW` (verdict Leader Co
 - Hàm ngắn, **1 nhiệm vụ** duy nhất.
 - Tách file rõ ràng theo trách nhiệm.
 - Đặt tên tự diễn giải; tránh comment thừa (code nên tự nói lên ý đồ).
+- KHÔNG viết comment mô tả các bước suy luận/quy trình ("bước 1... bước 2...", "vòng lặp để...", "kiểm tra rồi gán..."); code phải tự nói lên ý đồ qua tên hàm/biến, không cần thuyết minh logic. Code phải **tối ưu, tối giản, dễ cho human đọc**; tối thiểu hoá lồng block/function — ưu tiên **early-return/guard clause** thay vì nest sâu nhiều tầng if/else.
 
 ### 5. Mock data cho API bên thứ 3
 - Khi endpoint/feature phụ thuộc API bên thứ 3 **chưa sẵn sàng** (thiếu credential, chưa tích hợp), coder **PHẢI** viết mock data provider để deploy task trước — KHÔNG chờ tích hợp thật.
 - Mock đặt sau một **toggle qua env/config flag** (vd `USE_MOCK_<SERVICE>=true|false`, theo convention biến môi trường của repo target); bật/tắt KHÔNG cần sửa code.
 - Thiết kế theo **adapter/port** (đồng nhất với `### 3. Kiến trúc` / Clean Architecture): định nghĩa interface/port, cả mock client lẫn real client cùng implement; chọn implementation theo flag tại composition root. Tích hợp thật về sau chỉ cần thêm real adapter + tắt flag, KHÔNG đụng business logic.
-- Mock trả về **đúng shape/response envelope** như API thật (theo `### 2. REST API`), đánh dấu rõ là mock (comment/log) để dễ gỡ.
+- Mock trả về **đúng shape/response envelope** như API thật (theo `### 2. REST API`), đánh dấu rõ là mock để dễ gỡ. Comment/log đánh dấu mock (vd `// MOCK: ...`, `# MOCK ...`) được phép/khuyến khích — đây là comment **định danh/cảnh báo**, KHÁC với "comment suy luận/quy trình" bị cấm ở `### 4. Readability`; chỉ đánh dấu rằng đoạn này là mock, KHÔNG thuyết minh logic.
 - Ghi chú trong block CHANGES/ASSUMPTIONS rằng đang dùng mock và cách tắt.
 
 ### 6. Unit test cho function tự sinh (BẮT BUỘC)

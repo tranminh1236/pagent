@@ -146,5 +146,42 @@ EOF
 fi
 
 echo ""
+echo "=== Scenario (5): PAGENT_MODE=find + PAGENT_CONFIRM=1 → auto-proceed, KHÔNG handshake ==="
+# find read-only: return 0, in summary, KHÔNG gọi confirm_plan_via_file (không ghi
+# plan.pending.json, không log 'PLAN chờ xác nhận') dù PAGENT_CONFIRM=1 + non-tty.
+ERR5="$(mktmp)"
+RUN5="$TMPDIR_T/run5"; mkdir -p "$RUN5"
+( unset PAGENT_NO_CONFIRM PAGENT_YES
+  export PAGENT_MODE=find PAGENT_CONFIRM=1 PAGENT_RUN_DIR="$RUN5" PAGENT_CONFIRM_TIMEOUT=2
+  confirm_plan_gate "$PLAN" ) </dev/null 2>"$ERR5" >/dev/null
+RC=$?
+[[ "$RC" -eq 0 ]] && ok "(5) return 0 (find auto-proceed)" || fail "(5) return phải =0 (got $RC)"
+assert_summary "$ERR5" "(5)"
+has "$ERR5" "PLAN chờ xác nhận" && fail "(5) KHÔNG được vào confirm_plan_via_file" \
+                               || ok "(5) không handshake (không log 'PLAN chờ xác nhận')"
+[[ -e "$RUN5/plan.pending.json" ]] && fail "(5) KHÔNG được ghi plan.pending.json" \
+                                   || ok "(5) không ghi plan.pending.json"
+
+echo ""
+echo "=== Scenario (6): PAGENT_MODE=feature|hotfix|chore + PAGENT_CONFIRM=1 non-tty → VẪN handshake ==="
+# regression guard: mọi mode KHÁC find KHÔNG được đổi hành vi — vẫn qua confirm_plan_via_file
+# (ghi plan.pending.json + log 'PLAN chờ xác nhận'). Seed decision.json{action:run} để
+# confirm_plan_via_file trả 0 NGAY vòng poll đầu (không chờ timeout). plan.pending.json là
+# ephemeral (bị rm sau action=run, pagent:1095) → dùng log line làm bằng chứng handshake.
+for m in feature hotfix chore; do
+  ERR6="$(mktmp)"
+  RUN6="$TMPDIR_T/run6_$m"; mkdir -p "$RUN6"
+  printf '{"action":"run"}\n' >"$RUN6/decision.json"
+  ( unset PAGENT_NO_CONFIRM PAGENT_YES
+    export PAGENT_MODE="$m" PAGENT_CONFIRM=1 PAGENT_RUN_DIR="$RUN6" PAGENT_CONFIRM_TIMEOUT=2
+    confirm_plan_gate "$PLAN" ) </dev/null 2>"$ERR6" >/dev/null
+  RC=$?
+  [[ "$RC" -eq 0 ]] && ok "(6:$m) return 0 (decision=run)" || fail "(6:$m) return phải =0 (got $RC)"
+  assert_summary "$ERR6" "(6:$m)"
+  has "$ERR6" "PLAN chờ xác nhận" && ok "(6:$m) VẪN handshake (log 'PLAN chờ xác nhận')" \
+                                 || fail "(6:$m) $m phải vào confirm_plan_via_file (regression!)"
+done
+
+echo ""
 echo "Results: $PASS passed, $FAIL failed, $SKIP skipped"
 [[ $FAIL -eq 0 ]]

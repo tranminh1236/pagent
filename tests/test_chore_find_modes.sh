@@ -122,6 +122,12 @@ echo "=== chore/find — coder không bị force-add vào required_agents khi fi
 assert_contains "coder force-add skipped khi mode=find" "$PAGENT" "find: read-only, không spawn coder"
 
 echo ""
+echo "=== find — confirm gate auto-proceed (không confirm từ client) ==="
+# confirm_plan_gate PHẢI early-return khi mode=find → không handshake, không ghi
+# plan.pending.json, không poll decision.json (auto-proceed dù PAGENT_CONFIRM=1/web/non-tty).
+assert_grep "confirm_plan_gate guard mode=find" "$PAGENT" '\[\[ "\$PAGENT_MODE" == "find" \]\]'
+
+echo ""
 echo "=== find — review_enabled log_skip guarded ==="
 # log_skip về 'coder chạy 1 vòng' chỉ áp dụng cho mode != find
 assert_grep "review_enabled gated by mode != find" "$PAGENT" 'mode.*!=.*find.*agent_enabled reviewer|mode != "find".*agent_enabled'

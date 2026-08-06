@@ -1,0 +1,12 @@
+# Env thật của từng máy — chứa PAT Jira / API key. Chỉ .env.pagent.example được commit.
+.env.pagent
+.env.pagent.local
+
+# Artefact runtime của pagent (report, run dir, token log)
+.pagent/reports/
+.pagent/runs/
+
+# Agent/MCP config opencode do pagent sinh vào repo target (kể cả repo này)
+.opencode/
+
+.DS_Store
